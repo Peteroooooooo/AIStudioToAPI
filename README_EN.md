@@ -276,6 +276,8 @@ Usage:
 | `HTTPS_PROXY`                   | HTTPS proxy address for accessing Google services.                                                                                                                                                                                                                    | None         |
 | `NO_PROXY`                      | Comma-separated list of addresses to bypass the proxy. The project automatically bypasses local addresses (localhost, 127.0.0.1, ::, ::1 and 0.0.0.0), so manual local bypass configuration is usually not required.                                                  | None         |
 
+> 📖 Not sure how to obtain `AI_STUDIO_APP_URL`? See: [Create an AI Studio App](docs/en/create-ai-studio-app.md)
+
 #### 🗒️ Other Configuration
 
 | Variable                    | Description                                                                                                                                                                           | Default       |

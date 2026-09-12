@@ -278,6 +278,8 @@ services:
 | `HTTPS_PROXY`                   | 用于访问 Google 服务的 HTTPS 代理地址。                                                                                                                             | 无        |
 | `NO_PROXY`                      | 不经过代理的地址列表（逗号分隔）。项目已内置自动绕过本地地址（localhost, 127.0.0.1, ::, ::1, 0.0.0.0），通常无需手动配置本地绕过。                                  | 无        |
 
+> 📖 不知道如何获得 `AI_STUDIO_APP_URL`？参阅：[新建 AI Studio App 教程](docs/zh/create-ai-studio-app.md)
+
 #### 🗒️ 其他配置
 
 | 变量名                      | 描述                                                                                                        | 默认值   |
