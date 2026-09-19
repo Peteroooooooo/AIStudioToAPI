@@ -9,7 +9,7 @@ const fs = require("fs");
 const path = require("path");
 const { getProxySummaryFromEnv } = require("./ProxyUtils");
 
-const DEFAULT_AI_STUDIO_APP_URL = "https://ai.studio/apps/cab9ab6c-44f9-4e7a-8972-037f8ae177ab";
+const DEFAULT_AI_STUDIO_APP_URL = "https://ai.studio/apps/d31dbffc-6199-4f09-9da5-45de7684ab8a";
 
 function parseAiStudioAppUrl(value) {
     const rawValue = String(value || "").trim();
