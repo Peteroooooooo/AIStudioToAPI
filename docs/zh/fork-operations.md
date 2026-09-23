@@ -1,6 +1,6 @@
 # 独立版运维说明
 
-本分支从正在使用的 v1.3.5 源码开始，包含 Cubie 容器中已验证的 `FormatConverter.js` 补丁。镜像由本仓库构建，仅发布 `linux/arm64` 到 `ghcr.io/peteroooooooo/aistudio-to-api`。使用版本标签或完整提交 SHA 标签，避免依赖 `latest`。
+本分支从正在使用的 v1.3.5 源码开始，包含 Cubie 容器中已验证的 `FormatConverter.js` 补丁。镜像由本仓库构建，仅发布 `linux/arm64` 到 `ghcr.io/peteroooooooo/aistudio-to-api`，使用 Docker v2 镜像清单格式兼容 Cubie 的 Docker 20.10。使用版本标签或完整提交 SHA 标签，避免依赖 `latest`。
 
 ## 账号健康规则
 
