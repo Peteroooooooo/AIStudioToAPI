@@ -1,6 +1,6 @@
 {
     "name": "aistudio-to-api",
-    "version": "1.3.5",
+    "version": "1.3.5-peter.1",
     "author": "Ellinav, iBenzene, bbbugg",
     "description": "Encapsulate Gemini models on AI Studio as API services.",
     "main": "main.js",
@@ -12,6 +12,7 @@
         "build:ui": "vite build",
         "preview:ui": "vite preview",
         "start": "cross-env NODE_ENV=production node main.js",
+        "test": "node --test test/*.test.js",
         "quick-start": "cross-env NODE_ENV=production node main.js",
         "prestart": "npm run build:ui",
         "save-auth": "node scripts/auth/saveAuth.js",

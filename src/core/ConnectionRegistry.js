@@ -270,6 +270,31 @@ class ConnectionRegistry extends EventEmitter {
                     );
                     return;
                 }
+                parsedMessage.authIndex = entry.authIndex;
+                // The queue owns the source account. Record outcomes here before a concurrent
+                // switch can change the global currentAuthIndex.
+                const status = Number(parsedMessage.status);
+                if (
+                    parsedMessage.event_type === "error" ||
+                    (parsedMessage.event_type === "response_headers" && status >= 400)
+                ) {
+                    entry.backendFailed = true;
+                    if (!entry.backendFailureReported) {
+                        entry.backendFailureReported = true;
+                        this.emit("backendOutcome", {
+                            authIndex: entry.authIndex,
+                            requestId,
+                            status: Number.isFinite(status) ? status : 500,
+                            success: false,
+                        });
+                    }
+                } else if (parsedMessage.event_type === "stream_close" && !entry.backendFailed) {
+                    this.emit("backendOutcome", {
+                        authIndex: entry.authIndex,
+                        requestId,
+                        success: true,
+                    });
+                }
                 this._routeMessage(parsedMessage, entry.queue);
             } else {
                 this.logger.warn(`[Server] Received message for unknown or outdated request ID: ${requestId}`);

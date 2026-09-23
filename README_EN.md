@@ -2,6 +2,8 @@
 
 [中文文档](README.md) | English
 
+> This `stable` branch is Peter's independently maintained fork, based on upstream v1.3.5 plus the format conversion patch already used on Cubie. It adds account cooldown, repeated 401 quarantine, manual recovery, and an arm64 image. Repository updates do not replace the running container. See the [fork operations guide](docs/zh/fork-operations.md).
+
 A tool that wraps the Google AI Studio Build App web interface to provide OpenAI API, Gemini API, and Anthropic API compatible endpoints. The service acts as a proxy, converting API requests into browser interactions with the AI Studio Build App interface.
 
 ## ✨ Features
@@ -20,7 +22,7 @@ A tool that wraps the Google AI Studio Build App web interface to provide OpenAI
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/iBUHub/AIStudioToAPI.git
+   git clone -b stable https://github.com/Peteroooooooo/AIStudioToAPI.git
    cd AIStudioToAPI
    ```
 
@@ -87,16 +89,14 @@ docker run -d \
   -e API_KEYS=your-api-key-1,your-api-key-2 \
   -e TZ=America/New_York \
   --restart unless-stopped \
-  ghcr.io/ibuhub/aistudio-to-api:latest
+  ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.1
 ```
-
-> 💡 **Tip:** If `ghcr.io` is slow or unavailable, you can use the Docker Hub image: `ibuhub/aistudio-to-api:latest`.
 
 Parameters:
 
 - `-p 7860:7860`: API server port (if using a reverse proxy, strongly consider `127.0.0.1:7860`)
 - `-v /path/to/auth:/app/configs/auth`: Mount directory containing auth files
-- `-v /path/to/data:/app/data`: Mount persistent data directory for usage statistics (`/app/data/usage-stats.jsonl`)
+- `-v /path/to/data:/app/data`: Mount persistent data directory for usage statistics and account health
 - `-e API_KEYS`: Comma-separated list of API keys for authentication
 - `-e TZ=America/New_York`: Timezone for logs (optional, defaults to system timezone)
 
@@ -109,7 +109,7 @@ name: aistudio-to-api
 
 services:
   app:
-    image: ghcr.io/ibuhub/aistudio-to-api:latest
+    image: ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.1
     container_name: aistudio-to-api
     ports:
       # API server port (if using a reverse proxy, strongly consider `127.0.0.1:7860`)

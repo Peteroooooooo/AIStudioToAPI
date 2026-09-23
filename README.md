@@ -2,6 +2,8 @@
 
 中文文档 | [English](README_EN.md)
 
+> 本分支是 Peter 的独立维护版，基于上游 v1.3.5 和已在 Cubie 使用的格式转换补丁。新增账号自动冷却、重复 401 隔离、手动恢复和独立的 arm64 镜像。运行中的旧容器不会因仓库更新而自动替换。部署细节见 [独立版运维说明](docs/zh/fork-operations.md)。
+
 一个将 Google AI Studio Build App 网页端封装为兼容 OpenAI API、Gemini API 和 Anthropic API 的工具。该服务将充当代理，将 API 请求转换为与 AI Studio Build App 应用界面的浏览器交互。
 
 ## ✨ 功能特性
@@ -20,7 +22,7 @@
 1. 克隆仓库：
 
    ```bash
-   git clone https://github.com/iBUHub/AIStudioToAPI.git
+   git clone -b stable https://github.com/Peteroooooooo/AIStudioToAPI.git
    cd AIStudioToAPI
    ```
 
@@ -87,16 +89,14 @@ docker run -d \
   -e API_KEYS=your-api-key-1,your-api-key-2 \
   -e TZ=Asia/Shanghai \
   --restart unless-stopped \
-  ghcr.io/ibuhub/aistudio-to-api:latest
+  ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.1
 ```
-
-> 💡 **提示：** 如果 `ghcr.io` 访问速度较慢或不可用，可以使用 Docker Hub 镜像：`ibuhub/aistudio-to-api:latest`。
 
 参数说明：
 
 - `-p 7860:7860`：API 服务器端口（如果使用反向代理，强烈建议改成 `127.0.0.1:7860`）
 - `-v /path/to/auth:/app/configs/auth`：挂载包含认证文件的目录
-- `-v /path/to/data:/app/data`：挂载统计数据持久化目录（`/app/data/usage-stats.jsonl`）
+- `-v /path/to/data:/app/data`：挂载统计和账号健康状态持久化目录
 - `-e API_KEYS`：用于身份验证的 API 密钥列表（使用逗号分隔）
 - `-e TZ=Asia/Shanghai`：时区设置（可选，默认使用系统时区）
 
@@ -109,7 +109,7 @@ name: aistudio-to-api
 
 services:
   app:
-    image: ghcr.io/ibuhub/aistudio-to-api:latest
+    image: ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.1
     container_name: aistudio-to-api
     ports:
       # API 服务器端口（如果使用反向代理，强烈建议改成 127.0.0.1:7860）
@@ -126,8 +126,6 @@ services:
       # 时区设置（可选，默认使用系统时区）
       TZ: Asia/Shanghai
 ```
-
-> 💡 **提示：** 如果 `ghcr.io` 访问速度较慢或不可用，可以将 `image` 改为 `ibuhub/aistudio-to-api:latest`。
 
 ##### 🛠️ 方式 3：从源码构建
 

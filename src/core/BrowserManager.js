@@ -1941,7 +1941,9 @@ class BrowserManager {
         let targets;
         if (isUnlimited) {
             // Filter out expired accounts from availableIndices
-            const nonExpiredAvailable = this.authSource.availableIndices.filter(idx => !this.authSource.isExpired(idx));
+            const nonExpiredAvailable = this.authSource.availableIndices.filter(
+                idx => !this.authSource.isExpired(idx) && this.authSource.health.isAvailable(idx)
+            );
             targets = new Set(nonExpiredAvailable);
         } else {
             targets = new Set(ordered.slice(0, maxContexts));

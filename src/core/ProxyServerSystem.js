@@ -95,6 +95,25 @@ class ProxyServerSystem extends EventEmitter {
             () => this.browserManager.currentAuthIndex,
             this.browserManager
         );
+        this.connectionRegistry.on("backendOutcome", outcome => {
+            if (outcome.success) {
+                this.authSource.health.recordSuccess(outcome.authIndex);
+            } else {
+                const wasAvailable = this.authSource.health.isAvailable(outcome.authIndex);
+                const status = this.authSource.health.recordFailure(
+                    outcome.authIndex,
+                    outcome.status,
+                    outcome.requestId
+                );
+                if (wasAvailable && status.mode !== "active") {
+                    setImmediate(() => {
+                        this.browserManager.rebalanceContextPool().catch(error => {
+                            this.logger.error(`[Auth] Could not rebalance after account quarantine: ${error.message}`);
+                        });
+                    });
+                }
+            }
+        });
 
         // Set ConnectionRegistry reference in BrowserManager to avoid circular dependency
         this.browserManager.setConnectionRegistry(this.connectionRegistry);
@@ -130,17 +149,16 @@ class ProxyServerSystem extends EventEmitter {
             }
         }, 300000); // Run every 5 minutes
 
-        const allAvailableIndices = this.authSource.availableIndices;
         const allRotationIndices = this.authSource.getRotationIndices();
 
-        if (allAvailableIndices.length === 0) {
-            this.logger.warn("[System] No available authentication source. Starting in account binding mode.");
+        if (allRotationIndices.length === 0) {
+            this.logger.warn("[System] No healthy authentication source. Starting without an active account.");
             this.emit("started");
             return; // Exit early
         }
 
         // Determine startup order
-        let startupOrder = allRotationIndices.length > 0 ? [...allRotationIndices] : [...allAvailableIndices];
+        let startupOrder = [...allRotationIndices];
         const hasInitialAuthIndex = Number.isInteger(initialAuthIndex);
         if (hasInitialAuthIndex) {
             const canonicalInitialIndex = this.authSource.getCanonicalIndex(initialAuthIndex);

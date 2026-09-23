@@ -90,6 +90,15 @@ class StatusRoutes {
             res.status(200).json(healthStatus);
         });
 
+        app.get("/health/ready", (req, res) => {
+            const index = this.serverSystem.requestHandler.currentAuthIndex;
+            const ready =
+                index >= 0 &&
+                this.serverSystem.authSource.getRotationIndices().includes(index) &&
+                Boolean(this.serverSystem.connectionRegistry.getConnectionByAuth(index, false));
+            res.status(ready ? 200 : 503).json({ activeAccount: ready ? index : null, ready });
+        });
+
         app.get("/", isAuthenticated, (req, res) => {
             res.status(200).sendFile(this.distIndexPath);
         });
@@ -245,6 +254,43 @@ class StatusRoutes {
                 this.logger.error(`[WebUI] Failed to import usage stats: ${error.message}`);
                 res.status(500).json({ error: error.message, message: "usageStatsImportFailed" });
             }
+        });
+
+        app.put("/api/accounts/:index/health", isAuthenticated, async (req, res) => {
+            if (this._rejectIfSystemBusy(res)) return;
+            const index = Number(req.params.index);
+            if (
+                !Number.isSafeInteger(index) ||
+                index < 0 ||
+                !this.serverSystem.authSource.availableIndices.includes(index)
+            ) {
+                return res.status(404).json({ error: "Account not found" });
+            }
+            const action = req.body?.action;
+            const health = this.serverSystem.authSource.health;
+            if (!["disable", "enable", "reset"].includes(action)) {
+                return res.status(400).json({ error: "Invalid health action" });
+            }
+            const result =
+                action === "disable"
+                    ? health.setDisabled(index, true)
+                    : action === "enable"
+                      ? health.setDisabled(index, false)
+                      : health.reset(index);
+            this.logger.info(`[Auth] Dashboard ${action} account #${index}`);
+            if (action === "disable" && this.serverSystem.requestHandler.currentAuthIndex === index) {
+                if (this.serverSystem.authSource.getRotationIndices().length > 0) {
+                    try {
+                        await this.serverSystem.requestHandler._switchToNextAuth();
+                    } catch (error) {
+                        this.logger.error(`[Auth] Could not switch after disabling #${index}: ${error.message}`);
+                        this.serverSystem.requestHandler.authSwitcher.currentAuthIndex = -1;
+                    }
+                } else {
+                    this.serverSystem.requestHandler.authSwitcher.currentAuthIndex = -1;
+                }
+            }
+            return res.json({ health: result, index });
         });
 
         app.put("/api/accounts/current", isAuthenticated, async (req, res) => {
@@ -983,7 +1029,8 @@ class StatusRoutes {
 
             const hasContext = browserManager.contexts.has(index);
 
-            return { canonicalIndex, hasContext, index, isDuplicate, isExpired, isInvalid, isRotation, name };
+            const health = authSource.health.getStatus(index);
+            return { canonicalIndex, hasContext, health, index, isDuplicate, isExpired, isInvalid, isRotation, name };
         });
 
         const currentAuthIndex = requestHandler.currentAuthIndex;

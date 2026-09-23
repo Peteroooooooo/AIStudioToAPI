@@ -222,6 +222,12 @@ class AuthSwitcher {
                 success: false,
             };
         }
+        if (!this.authSource.health.isAvailable(targetIndex)) {
+            return {
+                reason: `Account #${targetIndex} is unavailable. Reset its health status before switching.`,
+                success: false,
+            };
+        }
 
         this.isSystemBusy = true;
         try {
@@ -244,6 +250,17 @@ class AuthSwitcher {
     }
 
     async handleRequestFailureAndSwitch(errorDetails, sendErrorCallback) {
+        const sourceAuthIndex = Number.isInteger(errorDetails?.authIndex)
+            ? errorDetails.authIndex
+            : this.currentAuthIndex;
+        if (sourceAuthIndex !== this.currentAuthIndex) {
+            this.logger.info(
+                `[Auth] Failure from non-current account #${sourceAuthIndex}; current account remains #${this.currentAuthIndex}.`
+            );
+            return;
+        }
+        const status = Number(errorDetails?.status);
+        if ([400, 403, 404, 422].includes(status)) return;
         this.failureCount++;
         if (this.config.failureThreshold > 0) {
             this.logger.warn(
@@ -255,7 +272,9 @@ class AuthSwitcher {
             );
         }
 
-        const isImmediateSwitch = this.config.immediateSwitchStatusCodes.includes(errorDetails.status);
+        const isImmediateSwitch =
+            this.config.immediateSwitchStatusCodes.includes(status) ||
+            !this.authSource.health.isAvailable(sourceAuthIndex);
         const isThresholdReached =
             this.config.failureThreshold > 0 && this.failureCount >= this.config.failureThreshold;
 
