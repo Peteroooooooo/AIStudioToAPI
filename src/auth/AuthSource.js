@@ -8,6 +8,7 @@
 const fs = require("fs");
 const fsPromises = require("fs").promises;
 const path = require("path");
+const AccountHealth = require("./AccountHealth");
 
 /**
  * Authentication Source Management Module
@@ -16,6 +17,7 @@ const path = require("path");
 class AuthSource {
     constructor(logger) {
         this.logger = logger;
+        this.health = new AccountHealth(logger);
         this.authMode = "file";
         this.availableIndices = [];
         // Indices used for rotation/switching (deduplicated by email, keeping the latest index per account)
@@ -73,6 +75,7 @@ class AuthSource {
 
         try {
             fs.unlinkSync(authFilePath);
+            this.health.remove(index);
         } catch (error) {
             throw new Error(`Failed to delete auth file for account #${index}: ${error.message}`);
         }
@@ -266,7 +269,7 @@ class AuthSource {
     }
 
     getRotationIndices() {
-        return this.rotationIndices;
+        return this.rotationIndices.filter(index => this.health.isAvailable(index));
     }
 
     getCanonicalIndex(index) {

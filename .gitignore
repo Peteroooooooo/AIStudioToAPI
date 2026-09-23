@@ -13,7 +13,6 @@
 
 # Node.js dependencies
 node_modules/
-package-lock.json
 
 # Camoufox browser
 camoufox/
@@ -35,7 +34,6 @@ tmp/
 temp/
 ui/dist/
 *.css
-test/
 debug_*.png
 debug_*.html
 proxylist.txt

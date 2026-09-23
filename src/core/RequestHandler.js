@@ -586,6 +586,11 @@ class RequestHandler {
             return false;
         }
 
+        if (this.currentAuthIndex >= 0 && !this.authSource.health.isAvailable(this.currentAuthIndex)) {
+            sendError(503, "No healthy account is active. Check account health in the dashboard.");
+            return false;
+        }
+
         if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
             const connectionReady = await this._waitForConnection(connectionTimeoutMs);
             if (!connectionReady) {
@@ -606,6 +611,22 @@ class RequestHandler {
 
     async _ensureBrowserBackedRequestReady(res, options = {}) {
         const { logPrefix = "Request", waitErrorType = null, waitOptions } = options;
+
+        if (this.currentAuthIndex >= 0 && !this.authSource.health.isAvailable(this.currentAuthIndex)) {
+            if (this.authSource.getRotationIndices().length === 0) {
+                this._sendErrorResponse(res, 503, "All accounts are in cooldown, need reauthentication, or disabled.");
+                return false;
+            }
+            if (!this.authSwitcher.isSystemBusy) {
+                try {
+                    await this.authSwitcher.switchToNextAuth();
+                } catch (error) {
+                    this.logger.error(`[Auth] Could not leave unhealthy account: ${error.message}`);
+                    this._sendErrorResponse(res, 503, "No healthy account could be activated.");
+                    return false;
+                }
+            }
+        }
 
         // Check current account's browser connection
         if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
@@ -648,13 +669,25 @@ class RequestHandler {
         return { attemptedAuthIndices };
     }
 
+    _shouldSwitchImmediately(errorDetails) {
+        const status = Number(errorDetails?.status);
+        const sourceAuthIndex = Number.isInteger(errorDetails?.authIndex)
+            ? errorDetails.authIndex
+            : this.currentAuthIndex;
+        return (
+            this.config.immediateSwitchStatusCodes.includes(status) ||
+            (status === 401 && !this.authSource.health.isAvailable(sourceAuthIndex))
+        );
+    }
+
     _getImmediateStatusRetryCloseReason(status) {
         return `immediate_status_retry_${status}`;
     }
 
     async _performImmediateSwitchRetry(errorDetails, requestId, tracker) {
+        if (this.authSource.getRotationIndices().length === 0) return false;
         await this.authSwitcher.handleRequestFailureAndSwitch(
-            { message: errorDetails.message, status: Number(errorDetails.status) },
+            { authIndex: this.currentAuthIndex, message: errorDetails.message, status: Number(errorDetails.status) },
             null
         );
 
@@ -1231,7 +1264,7 @@ class RequestHandler {
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this.config?.immediateSwitchStatusCodes?.includes(initialStatus)
+                            this._shouldSwitchImmediately(initialMessage)
                         ) {
                             this.logger.warn(
                                 `[Request] OpenAI real stream received ${initialStatus}, preparing retry...`
@@ -1634,7 +1667,7 @@ class RequestHandler {
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this.config?.immediateSwitchStatusCodes?.includes(initialStatus)
+                            this._shouldSwitchImmediately(initialMessage)
                         ) {
                             this.logger.warn(
                                 `[Request] OpenAI Response API real stream received ${initialStatus}, preparing retry...`
@@ -2006,7 +2039,7 @@ class RequestHandler {
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this.config?.immediateSwitchStatusCodes?.includes(initialStatus)
+                            this._shouldSwitchImmediately(initialMessage)
                         ) {
                             this.logger.warn(
                                 `[Request] Claude real stream received ${initialStatus}, preparing retry...`
@@ -2955,7 +2988,7 @@ class RequestHandler {
                 proxyRequest.is_generative &&
                 !isUserAbortedError(headerMessage) &&
                 Number.isFinite(headerStatus) &&
-                this.config?.immediateSwitchStatusCodes?.includes(headerStatus)
+                this._shouldSwitchImmediately(headerMessage)
             ) {
                 this.logger.warn(`[Request] Gemini real stream received ${headerStatus}, preparing retry...`);
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
@@ -3362,13 +3395,13 @@ class RequestHandler {
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
                 const errorStatus = Number(errorPayload?.status);
-                const isNonRetryableEmbeddingClientError =
-                    (errorStatus === 400 || errorStatus === 404) &&
-                    this._categorizeRequest(proxyRequest?.path, "request") === "embedding";
-                if (isNonRetryableEmbeddingClientError) {
+                const isNonRetryableClientError =
+                    [400, 403, 404, 422].includes(errorStatus) ||
+                    (errorStatus === 401 && !this._shouldSwitchImmediately(errorPayload));
+                if (isNonRetryableClientError) {
                     lastError = { ...errorPayload, skipAccountSwitch: true };
                     this.logger.warn(
-                        `[Request] Embedding request failed with non-retryable status ${errorPayload.status}; skipping retries and account switching.`
+                        `[Request] Client or permission error ${errorPayload.status}; skipping retries and account switching.`
                     );
                     break;
                 }
@@ -3376,7 +3409,7 @@ class RequestHandler {
                 // Check if we should stop retrying immediately based on status code
                 if (
                     Number.isFinite(errorStatus) &&
-                    this.config?.immediateSwitchStatusCodes?.includes(errorStatus) &&
+                    this._shouldSwitchImmediately(errorPayload) &&
                     !isUserAbortedError(errorPayload)
                 ) {
                     this.logger.warn(`[Request] Received ${errorStatus}, preparing retry...`);

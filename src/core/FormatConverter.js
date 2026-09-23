@@ -397,19 +397,94 @@ class FormatConverter {
                 "enumDescriptions",
             ];
 
-            if (isResponseSchema) {
-                // For Structured Outputs: stricter filtering of metadata that causes 400 errors
-                unsupportedKeys.push("default", "examples", "$defs", "id");
-            }
+            // Tool schemas and response schemas both pass through Gemini's Schema parser.
+            // Claude Code and some OpenAI-compatible clients may send full JSON Schema
+            // metadata here; Gemini rejects several of those keywords with INVALID_ARGUMENT.
+            unsupportedKeys.push(
+                "default",
+                "examples",
+                "example",
+                "$defs",
+                "definitions",
+                "$id",
+                "id",
+                "not",
+                "if",
+                "then",
+                "else",
+                "dependentRequired",
+                "dependentSchemas",
+                "contains",
+                "minContains",
+                "maxContains",
+                "contentEncoding",
+                "contentMediaType",
+                "readOnly",
+                "writeOnly",
+                "deprecated",
+                "discriminator"
+            );
 
             // ONLY Filter metadata keywords if NOT a property name (isProperties is false)
             if (!isProperties && unsupportedKeys.includes(key)) {
                 continue;
             }
 
-            // Handle anyOf specially (only when it is a schema keyword),
+            // Merge allOf where possible. Leaving allOf in function declarations causes
+            // Gemini to reject otherwise valid Claude Code tool schemas.
+            if (key === "allOf" && !isProperties) {
+                if (Array.isArray(obj[key])) {
+                    for (const variant of obj[key]) {
+                        const converted = this._convertSchemaToGemini(variant, isResponseSchema, false);
+                        if (!converted || typeof converted !== "object" || Array.isArray(converted)) {
+                            continue;
+                        }
+
+                        for (const [variantKey, variantValue] of Object.entries(converted)) {
+                            if (
+                                variantKey === "properties" &&
+                                variantValue &&
+                                typeof variantValue === "object" &&
+                                !Array.isArray(variantValue)
+                            ) {
+                                result.properties = {
+                                    ...(result.properties || {}),
+                                    ...variantValue,
+                                };
+                            } else if (variantKey === "required" && Array.isArray(variantValue)) {
+                                result.required = Array.from(new Set([...(result.required || []), ...variantValue]));
+                            } else if (result[variantKey] === undefined) {
+                                result[variantKey] = variantValue;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if (key === "properties" && !isProperties) {
+                result.properties = {
+                    ...(result.properties || {}),
+                    ...this._convertSchemaToGemini(obj[key], isResponseSchema, true),
+                };
+                continue;
+            }
+            if (key === "required" && !isProperties && Array.isArray(obj[key])) {
+                result.required = Array.from(new Set([...(result.required || []), ...obj[key]]));
+                continue;
+            }
+
+            // Convert tuple-style array schemas to Gemini's single items schema.
+            if ((key === "items" || key === "prefixItems") && !isProperties && Array.isArray(obj[key])) {
+                if (obj[key].length > 0 && result.items === undefined) {
+                    result.items = this._convertSchemaToGemini(obj[key][0], isResponseSchema, false);
+                }
+                continue;
+            }
+
+            // Handle anyOf/oneOf specially (only when it is a schema keyword),
             // but `{"type":"OBJECT","properties":{"isNewTopic":{"type":"BOOLEAN"},"title":{"anyOf":[{"type":"STRING"},{"type":"NULL"}]}},"required":["isNewTopic","title"]}` is right, need to confirm
-            if (key === "anyOf" && !isProperties) {
+            if ((key === "anyOf" || key === "oneOf") && !isProperties) {
                 if (Array.isArray(obj[key])) {
                     const variants = obj[key];
                     const hasNull = variants.some(v => v.type === "null");
@@ -596,6 +671,13 @@ class FormatConverter {
         // Gemini requires alternating roles, so consecutive tool messages must be merged
         let pendingToolParts = [];
 
+        const ensureGeminiFunctionResponseObject = value => {
+            if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+                return value;
+            }
+            return { result: value ?? "" };
+        };
+
         // Helper function to flush pending tool parts as a single user message
         // Note: functionResponse does NOT need thoughtSignature per official docs
         const flushToolParts = () => {
@@ -673,6 +755,7 @@ class FormatConverter {
                     // If content is not valid JSON, wrap it
                     responseContent = { result: message.content };
                 }
+                responseContent = ensureGeminiFunctionResponseObject(responseContent);
 
                 // Use function name from tool message (OpenAI format always includes name)
                 const functionName = message.name || "unknown_function";
@@ -3191,10 +3274,15 @@ class FormatConverter {
                             item.name ||
                             (typeof item.call_id === "string" ? callIdToName[item.call_id] : undefined) ||
                             "unknown_function";
+                        const parsedOutput = safeParseJSON(item.output, "unparsed_output");
+                        const response =
+                            parsedOutput && typeof parsedOutput === "object" && !Array.isArray(parsedOutput)
+                                ? parsedOutput
+                                : { result: parsedOutput ?? "" };
                         const functionResponsePart = {
                             functionResponse: {
                                 name: functionName,
-                                response: safeParseJSON(item.output, "unparsed_output"),
+                                response,
                             },
                         };
                         googleContents.push({

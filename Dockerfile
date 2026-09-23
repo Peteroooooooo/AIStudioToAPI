@@ -38,7 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy package manifests and install all dependencies (including dev for build tools)
 # Layer is cached unless package.json changes
 COPY package*.json ./
-RUN npm install --no-audit --no-fund --ignore-scripts \
+RUN npm ci --no-audit --no-fund --ignore-scripts \
     && npm cache clean --force
 
 # Download and extract Camoufox browser binary

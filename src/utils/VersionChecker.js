@@ -14,7 +14,7 @@ const axios = require("axios");
 class VersionChecker {
     constructor(logger) {
         this.logger = logger;
-        this.repoOwner = "iBUHub";
+        this.repoOwner = "Peteroooooooo";
         this.repoName = "AIStudioToAPI";
     }
 
@@ -43,7 +43,8 @@ class VersionChecker {
     parseVersion(version) {
         const cleaned = version.replace(/^v/, "");
         const parts = cleaned.split(".").map(p => parseInt(p, 10) || 0);
-        return [parts[0] || 0, parts[1] || 0, parts[2] || 0];
+        const forkRevision = Number(cleaned.match(/-peter\.(\d+)$/)?.[1] || 0);
+        return [parts[0] || 0, parts[1] || 0, parts[2] || 0, forkRevision];
     }
 
     /**
@@ -51,12 +52,13 @@ class VersionChecker {
      * @returns {number} 1 if a > b, -1 if a < b, 0 if equal
      */
     compareVersions(a, b) {
-        const [aMajor, aMinor, aPatch] = this.parseVersion(a);
-        const [bMajor, bMinor, bPatch] = this.parseVersion(b);
+        const [aMajor, aMinor, aPatch, aRevision] = this.parseVersion(a);
+        const [bMajor, bMinor, bPatch, bRevision] = this.parseVersion(b);
 
         if (aMajor !== bMajor) return aMajor > bMajor ? 1 : -1;
         if (aMinor !== bMinor) return aMinor > bMinor ? 1 : -1;
         if (aPatch !== bPatch) return aPatch > bPatch ? 1 : -1;
+        if (aRevision !== bRevision) return aRevision > bRevision ? 1 : -1;
         return 0;
     }
 
@@ -66,7 +68,7 @@ class VersionChecker {
      * @returns {Promise<boolean>}
      */
     async checkDockerImageExists(tag) {
-        const image = "ibuhub/aistudio-to-api";
+        const image = "peteroooooooo/aistudio-to-api";
         const registry = "ghcr.io";
         const manifestUrl = `https://${registry}/v2/${image}/manifests/${tag}`;
 

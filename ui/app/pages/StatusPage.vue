@@ -833,16 +833,35 @@
                                         <span v-if="item.isExpired" class="expired-badge">
                                             {{ t("tagExpired") }}
                                         </span>
+                                        <span
+                                            v-if="item.health?.mode && item.health.mode !== 'active'"
+                                            class="expired-badge"
+                                            :title="getAccountHealthTitle(item)"
+                                        >
+                                            {{ getAccountHealthLabel(item) }}
+                                        </span>
                                     </div>
                                 </el-tooltip>
                                 <div class="account-actions">
+                                    <button
+                                        class="account-health-action"
+                                        :disabled="isBusy || item.isInvalid"
+                                        :title="getAccountHealthActionLabel(item)"
+                                        @click.stop="updateAccountHealth(item)"
+                                    >
+                                        {{ getAccountHealthActionLabel(item) }}
+                                    </button>
                                     <button
                                         class="btn-switch"
                                         :class="{
                                             'is-active': item.index === state.currentAuthIndex,
                                             'is-fast': item.hasContext && item.index !== state.currentAuthIndex,
                                         }"
-                                        :disabled="isBusy || item.index === state.currentAuthIndex"
+                                        :disabled="
+                                            isBusy ||
+                                            item.index === state.currentAuthIndex ||
+                                            item.health?.mode !== 'active'
+                                        "
                                         :title="
                                             item.index === state.currentAuthIndex
                                                 ? t('currentAccount')
@@ -4360,6 +4379,50 @@ const handleStreamingModeBeforeChange = async () => {
     }
 };
 
+const getAccountHealthLabel = account => {
+    const mode = account.health?.mode;
+    if (mode === "cooldown") return t("healthCooldown");
+    if (mode === "reauth") return t("healthReauth");
+    if (mode === "disabled") return t("healthDisabled");
+    return "";
+};
+
+const getAccountHealthTitle = account => {
+    const parts = [getAccountHealthLabel(account)];
+    if (account.health?.lastStatus) parts.push(`HTTP ${account.health.lastStatus}`);
+    if (account.health?.until) {
+        parts.push(t("healthUntil", { time: new Date(account.health.until).toLocaleString() }));
+    }
+    return parts.join(" · ");
+};
+
+const getAccountHealthActionLabel = account => {
+    if (account.health?.mode === "disabled") return t("healthEnable");
+    if (account.health?.mode && account.health.mode !== "active") return t("healthReset");
+    return t("healthDisable");
+};
+
+const updateAccountHealth = async account => {
+    const mode = account.health?.mode || "active";
+    const action = mode === "disabled" ? "enable" : mode === "active" ? "disable" : "reset";
+    state.isSwitchingAccount = true;
+    try {
+        const res = await fetch(`/api/accounts/${account.index}/health`, {
+            body: JSON.stringify({ action }),
+            headers: { "Content-Type": "application/json" },
+            method: "PUT",
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || data.message || `HTTP ${res.status}`);
+        ElMessage.success(t("healthUpdated"));
+        await updateContent();
+    } catch (error) {
+        ElMessage.error(t("healthUpdateFailed", { message: error.message || error }));
+    } finally {
+        state.isSwitchingAccount = false;
+    }
+};
+
 // Switch account by index
 const switchAccountByIndex = targetIndex => {
     if (state.currentAuthIndex === targetIndex) {
@@ -5558,6 +5621,13 @@ watchEffect(() => {
         color: @text-secondary;
         cursor: pointer;
         transition: all 0.2s;
+
+        &.account-health-action {
+            width: auto;
+            min-width: 42px;
+            padding: 0 6px;
+            font-size: 0.75rem;
+        }
 
         &:hover:not(:disabled) {
             border-color: @primary-color;
