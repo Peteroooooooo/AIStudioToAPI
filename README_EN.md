@@ -89,7 +89,7 @@ docker run -d \
   -e API_KEYS=your-api-key-1,your-api-key-2 \
   -e TZ=America/New_York \
   --restart unless-stopped \
-  ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.1
+  ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.2
 ```
 
 Parameters:
@@ -109,7 +109,7 @@ name: aistudio-to-api
 
 services:
   app:
-    image: ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.1
+    image: ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.2
     container_name: aistudio-to-api
     ports:
       # API server port (if using a reverse proxy, strongly consider `127.0.0.1:7860`)

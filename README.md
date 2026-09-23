@@ -89,7 +89,7 @@ docker run -d \
   -e API_KEYS=your-api-key-1,your-api-key-2 \
   -e TZ=Asia/Shanghai \
   --restart unless-stopped \
-  ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.1
+  ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.2
 ```
 
 参数说明：
@@ -109,7 +109,7 @@ name: aistudio-to-api
 
 services:
   app:
-    image: ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.1
+    image: ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.2
     container_name: aistudio-to-api
     ports:
       # API 服务器端口（如果使用反向代理，强烈建议改成 127.0.0.1:7860）
