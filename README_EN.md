@@ -41,9 +41,9 @@ A tool that wraps the Google AI Studio Build App web interface to provide OpenAI
 
    > 💡 **Tip:** If downloading the Camoufox browser fails or takes too long, you can manually download it from [here](https://github.com/daijro/camoufox/releases/tag/v135.0.1-beta.24), and set the environment variable `CAMOUFOX_EXECUTABLE_PATH` to the path of the browser executable (both absolute and relative paths are supported).
 
-3. Configure Environment Variables (Optional):
+3. Configure initial values (optional):
 
-   Copy `.env.example` in the root directory to `.env`, and modify settings in `.env` as needed (e.g., port, API Key).
+   Before the first start, you may copy `.env.example` to `.env` to import legacy settings. The service creates `data/config.json` on first start and uses that file thereafter; later `.env` changes do not overwrite it.
 
    If the service is reachable from the internet, set your own `API_KEYS` and console password. Do not use the default key `123456`.
 
@@ -60,6 +60,8 @@ A tool that wraps the Google AI Studio Build App web interface to provide OpenAI
    ```
 
    The API server will be available at `http://localhost:7860`
+
+   In the console's Settings page, runtime limits can be edited and applied immediately. Saves and manual file edits use the single `data/config.json` file. Changes to its `startup` section, including port and credentials, take effect after a restart. Mount `/app/data` persistently in Docker.
 
    After the service starts, you can access `http://localhost:7860` in your browser to open the web console homepage, where you can view account status and service status.
    Request usage statistics are persisted locally at `/data/usage-stats.jsonl`.
@@ -91,7 +93,7 @@ docker run -d \
   -e API_KEYS=your-api-key-1,your-api-key-2 \
   -e TZ=America/New_York \
   --restart unless-stopped \
-  ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.3
+  ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.4
 ```
 
 Parameters:
@@ -111,7 +113,7 @@ name: aistudio-to-api
 
 services:
   app:
-    image: ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.3
+    image: ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.4
     container_name: aistudio-to-api
     ports:
       # API server port (if using a reverse proxy, strongly consider `127.0.0.1:7860`)
@@ -241,7 +243,9 @@ Usage:
 
 ## 🧰 Configuration
 
-### 🔧 Environment Variables
+### 🔧 One-time import of legacy environment variables
+
+These values are read only when `data/config.json` is first created. Once the file exists, edit hot settings in the web console and startup settings in the config file.
 
 #### 📱 Application Configuration
 
@@ -310,6 +314,8 @@ To simplify the login process for multiple accounts, you can configure the `user
 Edit `configs/models.json` to customize available models and their settings.
 
 > 💡 **Tip:** The thinking parameter reserves the function to be set via the model suffix. It supports setting the thinking level by appending `-THINKING_LEVEL` or `(THINKING_LEVEL)` to the model name (`THINKING_LEVEL` supports `high`, `low`, `medium`, `minimal`, case-insensitive). For example: `gemini-3-flash-preview(minimal)` or `gemini-3-flash-preview-minimal`.
+>
+> This fork sends `thinkingLevel: HIGH` by default for `gemini-3.8-flash`. Precedence is model suffix > Chat `reasoning_effort` / Responses `reasoning.effort` > an explicit Gemini `thinkingLevel` > the HIGH default. This model supports only `low`, `medium`, and `high`; `minimal` returns a request error. Efforts `high`, `xhigh`, `max`, and `ultra` all map to upstream HIGH. `includeThoughts` independently controls whether thoughts are returned.
 >
 > Streaming mode can also be overridden with `-real` or `-fake`. This override has higher priority than the system streaming mode, but it only takes effect for streaming requests. For example: `gemini-3-flash-preview-fake`. When used together with a thinking suffix, the streaming suffix should come after the thinking suffix, for example: `gemini-3-flash-preview-minimal-fake` or `gemini-3-flash-preview(minimal)-real`.
 >

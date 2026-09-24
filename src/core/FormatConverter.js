@@ -36,6 +36,58 @@ class FormatConverter {
         minimal: "MINIMAL",
     };
 
+    /** Resolve all request formats to one Gemini thinking policy. */
+    static resolveThinkingConfig({
+        modelName,
+        modelThinkingLevel = null,
+        reasoningEffort = null,
+        thinkingConfig = null,
+        forceThinking = false,
+        includeThoughtsWhenReasoning = false,
+    }) {
+        const config = thinkingConfig ? { ...thinkingConfig } : {};
+        const model = String(modelName || "")
+            .replace(/^models\//i, "")
+            .toLowerCase();
+        const explicitLevel = config.thinkingLevel ?? config.thinking_level ?? null;
+        const effortLevels = {
+            high: "HIGH",
+            low: "LOW",
+            max: "HIGH",
+            medium: "MEDIUM",
+            minimal: "MINIMAL",
+            ultra: "HIGH",
+            xhigh: "HIGH",
+        };
+        let effortLevel = null;
+        if (reasoningEffort !== null && reasoningEffort !== undefined && reasoningEffort !== "") {
+            const effort = String(reasoningEffort).toLowerCase();
+            if (!Object.hasOwn(effortLevels, effort)) {
+                const error = new Error(`Unsupported reasoning effort: ${reasoningEffort}`);
+                error.code = "INVALID_THINKING_LEVEL";
+                throw error;
+            }
+            effortLevel = effortLevels[effort];
+        }
+
+        const thinkingLevel =
+            modelThinkingLevel ||
+            effortLevel ||
+            (typeof explicitLevel === "string" ? explicitLevel.toUpperCase() : explicitLevel) ||
+            (model === "gemini-3.8-flash" ? "HIGH" : null);
+        if (model === "gemini-3.8-flash" && thinkingLevel && !["LOW", "MEDIUM", "HIGH"].includes(thinkingLevel)) {
+            const error = new Error(`gemini-3.8-flash does not support thinking level ${thinkingLevel}`);
+            error.code = "INVALID_THINKING_LEVEL";
+            throw error;
+        }
+        delete config.thinking_level;
+        if (thinkingLevel) config.thinkingLevel = thinkingLevel;
+        if ((forceThinking || includeThoughtsWhenReasoning) && config.includeThoughts === undefined) {
+            config.includeThoughts = true;
+        }
+        return Object.keys(config).length > 0 ? config : null;
+    }
+
     /**
      * Parse web search suffix from model name.
      * Only supports the LAST hyphen token: `-search` (case-insensitive).
@@ -937,39 +989,26 @@ class FormatConverter {
                 thinkingConfig.includeThoughts = rawThinkingConfig.includeThoughts;
             }
 
+            if (rawThinkingConfig.thinking_level !== undefined) {
+                thinkingConfig.thinkingLevel = rawThinkingConfig.thinking_level;
+            } else if (rawThinkingConfig.thinkingLevel !== undefined) {
+                thinkingConfig.thinkingLevel = rawThinkingConfig.thinkingLevel;
+            }
+
             this.logger.info(
                 `[Adapter] Successfully extracted and converted thinking config: ${JSON.stringify(thinkingConfig)}`
             );
         }
 
-        // Handle OpenAI reasoning_effort parameter
-        if (!thinkingConfig) {
-            const effort = openaiBody.reasoning_effort || extraBody.reasoning_effort;
-            if (effort) {
-                this.logger.debug(
-                    `[Adapter] Detected OpenAI standard reasoning parameter (reasoning_effort: ${effort}), auto-converting to Google format.`
-                );
-                thinkingConfig = { includeThoughts: true };
-            }
-        }
-
-        // Force thinking mode (only set includeThoughts=true when missing)
-        if (
-            this.serverSystem.config.forceThinking &&
-            (!thinkingConfig || thinkingConfig.includeThoughts === undefined)
-        ) {
-            this.logger.info("[Adapter] ⚠️ Force thinking enabled, setting includeThoughts=true for OpenAI request.");
-            thinkingConfig = { ...(thinkingConfig || {}), includeThoughts: true };
-        }
-
-        // If model name suffix specifies thinkingLevel, override directly (highest priority)
-        if (modelThinkingLevel) {
-            if (!thinkingConfig) {
-                thinkingConfig = {};
-            }
-            thinkingConfig.thinkingLevel = modelThinkingLevel;
-            this.logger.info(`[Adapter] Applied thinkingLevel from model name suffix: ${modelThinkingLevel}`);
-        }
+        const reasoningEffort = openaiBody.reasoning_effort ?? extraBody.reasoning_effort;
+        thinkingConfig = FormatConverter.resolveThinkingConfig({
+            forceThinking: this.serverSystem.config.forceThinking,
+            includeThoughtsWhenReasoning: reasoningEffort !== null && reasoningEffort !== undefined,
+            modelName: cleanModelName,
+            modelThinkingLevel,
+            reasoningEffort,
+            thinkingConfig,
+        });
 
         if (thinkingConfig) {
             generationConfig.thinkingConfig = thinkingConfig;
@@ -2546,20 +2585,12 @@ class FormatConverter {
             }
         }
 
-        // Force thinking mode (only set includeThoughts=true when missing)
-        if (
-            this.serverSystem.config.forceThinking &&
-            (!thinkingConfig || thinkingConfig.includeThoughts === undefined)
-        ) {
-            this.logger.info("[Adapter] ⚠️ Force thinking enabled, setting includeThoughts=true for Claude request.");
-            thinkingConfig = { ...(thinkingConfig || {}), includeThoughts: true };
-        }
-
-        // Apply model name suffix thinkingLevel
-        if (modelThinkingLevel) {
-            if (!thinkingConfig) thinkingConfig = {};
-            thinkingConfig.thinkingLevel = modelThinkingLevel;
-        }
+        thinkingConfig = FormatConverter.resolveThinkingConfig({
+            forceThinking: this.serverSystem.config.forceThinking,
+            modelName: cleanModelName,
+            modelThinkingLevel,
+            thinkingConfig,
+        });
 
         if (thinkingConfig) {
             generationConfig.thinkingConfig = thinkingConfig;
@@ -3393,33 +3424,15 @@ class FormatConverter {
             topP: responseBody.top_p,
         };
 
-        // Handle reasoning config (for o-series models)
+        // Resolve Responses reasoning and the model-specific default together.
         const reasoning = responseBody.reasoning;
-        let thinkingConfig = null;
-
-        if (reasoning) {
-            thinkingConfig = { includeThoughts: true };
-        }
-
-        // Force thinking mode (only set includeThoughts=true when missing)
-        if (
-            this.serverSystem.config.forceThinking &&
-            (!thinkingConfig || thinkingConfig.includeThoughts === undefined)
-        ) {
-            this.logger.info(
-                "[Adapter] ⚠️ Force thinking enabled, setting includeThoughts=true for OpenAI Response API request."
-            );
-            thinkingConfig = { ...(thinkingConfig || {}), includeThoughts: true };
-        }
-
-        // If model name suffix specifies thinkingLevel, override directly (highest priority)
-        if (modelThinkingLevel) {
-            if (!thinkingConfig) {
-                thinkingConfig = {};
-            }
-            thinkingConfig.thinkingLevel = modelThinkingLevel;
-            this.logger.info(`[Adapter] Applied thinkingLevel from model name suffix: ${modelThinkingLevel}`);
-        }
+        const thinkingConfig = FormatConverter.resolveThinkingConfig({
+            forceThinking: this.serverSystem.config.forceThinking,
+            includeThoughtsWhenReasoning: Boolean(reasoning),
+            modelName: cleanModelName,
+            modelThinkingLevel,
+            reasoningEffort: reasoning?.effort,
+        });
 
         if (thinkingConfig) {
             generationConfig.thinkingConfig = thinkingConfig;

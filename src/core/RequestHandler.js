@@ -37,9 +37,10 @@ class RequestHandler {
         this.formatConverter = new FormatConverter(logger, serverSystem);
 
         this.needsSwitchingAfterRequest = false;
+    }
 
-        // Timeout settings
-        this.timeouts = {
+    get timeouts() {
+        return {
             FAKE_STREAM: this.config.fakeStreamTimeoutMs || DEFAULT_TIMEOUTS.FAKE_STREAM,
             STREAM_CHUNK: this.config.streamTimeoutMs || DEFAULT_TIMEOUTS.STREAM_CHUNK,
         };
@@ -954,7 +955,15 @@ class RequestHandler {
                 }
             }
 
-            const proxyRequest = this._buildProxyRequest(req, requestId);
+            let proxyRequest;
+            try {
+                proxyRequest = this._buildProxyRequest(req, requestId);
+            } catch (error) {
+                if (error.code === "INVALID_THINKING_LEVEL") {
+                    return this._sendErrorResponse(res, 400, error.message, "invalid_request_error");
+                }
+                throw error;
+            }
             proxyRequest.is_generative = isGenerativeRequest;
             this._initializeProxyRequestAttempt(proxyRequest);
 
@@ -1207,7 +1216,12 @@ class RequestHandler {
                 this.logger.error(
                     `❌ [Adapter] OpenAI request translation failed: ${error.message}, request ID: ${requestId}`
                 );
-                return this._sendErrorResponse(res, 400, "Invalid OpenAI request format.", "invalid_request_error");
+                return this._sendErrorResponse(
+                    res,
+                    400,
+                    error.code === "INVALID_THINKING_LEVEL" ? error.message : "Invalid OpenAI request format.",
+                    "invalid_request_error"
+                );
             }
 
             const effectiveStreamMode = modelStreamingMode || systemStreamMode;
@@ -1248,6 +1262,8 @@ class RequestHandler {
                     let initialMessage;
                     let skipFinalFailureSwitch = false;
                     const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
+                    const maxRetries = this.config.maxRetries;
+                    let retryAttempt = 1;
 
                     // eslint-disable-next-line no-constant-condition
                     while (true) {
@@ -1270,6 +1286,10 @@ class RequestHandler {
                                 `[Request] OpenAI real stream received ${initialStatus}, preparing retry...`
                             );
                             this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
+                            if (retryAttempt >= maxRetries) {
+                                skipFinalFailureSwitch = true;
+                                break;
+                            }
 
                             const retryPrepared = await this._prepareImmediateStatusRetry(
                                 initialMessage,
@@ -1294,6 +1314,7 @@ class RequestHandler {
                                 proxyRequest.request_attempt_id
                             );
                             currentQueueAuthIndex = this.currentAuthIndex;
+                            retryAttempt++;
                             continue;
                         }
 
@@ -1607,7 +1628,7 @@ class RequestHandler {
                 return this._sendErrorResponse(
                     res,
                     400,
-                    "Invalid OpenAI Response request format.",
+                    error.code === "INVALID_THINKING_LEVEL" ? error.message : "Invalid OpenAI Response request format.",
                     "invalid_request_error"
                 );
             }
@@ -1651,6 +1672,8 @@ class RequestHandler {
                     let initialMessage;
                     let skipFinalFailureSwitch = false;
                     const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
+                    const maxRetries = this.config.maxRetries;
+                    let retryAttempt = 1;
 
                     // eslint-disable-next-line no-constant-condition
                     while (true) {
@@ -1673,6 +1696,10 @@ class RequestHandler {
                                 `[Request] OpenAI Response API real stream received ${initialStatus}, preparing retry...`
                             );
                             this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
+                            if (retryAttempt >= maxRetries) {
+                                skipFinalFailureSwitch = true;
+                                break;
+                            }
 
                             const retryPrepared = await this._prepareImmediateStatusRetry(
                                 initialMessage,
@@ -1697,6 +1724,7 @@ class RequestHandler {
                                 proxyRequest.request_attempt_id
                             );
                             currentQueueAuthIndex = this.currentAuthIndex;
+                            retryAttempt++;
                             continue;
                         }
 
@@ -1981,7 +2009,12 @@ class RequestHandler {
                 this.logger.error(
                     `❌ [Adapter] Claude request translation failed: ${error.message}, request ID: ${requestId}`
                 );
-                return this._sendErrorResponse(res, 400, "Invalid Claude request format.", "invalid_request_error");
+                return this._sendErrorResponse(
+                    res,
+                    400,
+                    error.code === "INVALID_THINKING_LEVEL" ? error.message : "Invalid Claude request format.",
+                    "invalid_request_error"
+                );
             }
 
             const effectiveStreamMode = modelStreamingMode || systemStreamMode;
@@ -2023,6 +2056,8 @@ class RequestHandler {
                     let initialMessage;
                     let skipFinalFailureSwitch = false;
                     const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
+                    const maxRetries = this.config.maxRetries;
+                    let retryAttempt = 1;
 
                     // eslint-disable-next-line no-constant-condition
                     while (true) {
@@ -2045,6 +2080,10 @@ class RequestHandler {
                                 `[Request] Claude real stream received ${initialStatus}, preparing retry...`
                             );
                             this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
+                            if (retryAttempt >= maxRetries) {
+                                skipFinalFailureSwitch = true;
+                                break;
+                            }
 
                             const retryPrepared = await this._prepareImmediateStatusRetry(
                                 initialMessage,
@@ -2069,6 +2108,7 @@ class RequestHandler {
                                 proxyRequest.request_attempt_id
                             );
                             currentQueueAuthIndex = this.currentAuthIndex;
+                            retryAttempt++;
                             continue;
                         }
 
@@ -2302,7 +2342,12 @@ class RequestHandler {
                 this.logger.error(
                     `❌ [Adapter] Claude request translation failed: ${error.message}, request ID: ${requestId}`
                 );
-                return this._sendErrorResponse(res, 400, "Invalid Claude request format.", "invalid_request_error");
+                return this._sendErrorResponse(
+                    res,
+                    400,
+                    error.code === "INVALID_THINKING_LEVEL" ? error.message : "Invalid Claude request format.",
+                    "invalid_request_error"
+                );
             }
 
             // Build countTokens request
@@ -2443,7 +2488,7 @@ class RequestHandler {
                 return this._sendErrorResponse(
                     res,
                     400,
-                    "Invalid OpenAI Response request format.",
+                    error.code === "INVALID_THINKING_LEVEL" ? error.message : "Invalid OpenAI Response request format.",
                     "invalid_request_error"
                 );
             }
@@ -2970,6 +3015,8 @@ class RequestHandler {
         let headerMessage;
         let skipFinalFailureSwitch = false;
         const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
+        const maxRetries = this.config.maxRetries;
+        let retryAttempt = 1;
 
         // eslint-disable-next-line no-constant-condition
         while (true) {
@@ -2992,6 +3039,10 @@ class RequestHandler {
             ) {
                 this.logger.warn(`[Request] Gemini real stream received ${headerStatus}, preparing retry...`);
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
+                if (retryAttempt >= maxRetries) {
+                    skipFinalFailureSwitch = true;
+                    break;
+                }
 
                 const retryPrepared = await this._prepareImmediateStatusRetry(
                     headerMessage,
@@ -3017,6 +3068,7 @@ class RequestHandler {
                     proxyRequest.request_attempt_id
                 );
                 currentQueueAuthIndex = this.currentAuthIndex;
+                retryAttempt++;
                 continue;
             }
 
@@ -3264,6 +3316,9 @@ class RequestHandler {
     }
 
     async _executeRequestWithRetries(proxyRequest, messageQueue) {
+        // Keep one request's attempt budget stable while settings are edited.
+        const maxRetries = this.config.maxRetries;
+        const retryDelay = this.config.retryDelay;
         let lastError = null;
         let currentQueue = messageQueue;
         const registeredQueueAuthIndex = this.connectionRegistry.getAuthIndexForRequest(proxyRequest.request_id);
@@ -3275,7 +3330,7 @@ class RequestHandler {
         let retryAttempt = 1;
         const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
 
-        while (retryAttempt <= this.config.maxRetries) {
+        while (retryAttempt <= maxRetries) {
             // Record attempt at the start of each retry, before forwarding.
             // This ensures failed attempts (e.g. 429 before any response) are also counted.
             this._getUsageStatsService()?.recordAttempt(
@@ -3329,7 +3384,7 @@ class RequestHandler {
                     const canRetryOnCurrentAccountCandidate =
                         !isClientDisconnect &&
                         isClosedAccountRetryable &&
-                        retryAttempt < this.config.maxRetries &&
+                        retryAttempt < maxRetries &&
                         Number.isInteger(currentQueueAuthIndex) &&
                         currentQueueAuthIndex >= 0 &&
                         Number.isInteger(currentAuthIndex) &&
@@ -3376,7 +3431,7 @@ class RequestHandler {
                         if (Number.isInteger(currentQueueAuthIndex) && currentQueueAuthIndex >= 0) {
                             immediateSwitchTracker.attemptedAuthIndices.add(currentQueueAuthIndex);
                         }
-                        await new Promise(resolve => setTimeout(resolve, this.config.retryDelay));
+                        await new Promise(resolve => setTimeout(resolve, retryDelay));
                         retryAttempt++;
                         continue;
                     } else {
@@ -3412,6 +3467,10 @@ class RequestHandler {
                     this._shouldSwitchImmediately(errorPayload) &&
                     !isUserAbortedError(errorPayload)
                 ) {
+                    if (retryAttempt >= maxRetries) {
+                        lastError = { ...errorPayload, skipAccountSwitch: true };
+                        break;
+                    }
                     this.logger.warn(`[Request] Received ${errorStatus}, preparing retry...`);
                     try {
                         const retryPrepared = await this._prepareImmediateStatusRetry(
@@ -3448,18 +3507,19 @@ class RequestHandler {
                         proxyRequest.request_attempt_id
                     );
                     currentQueueAuthIndex = this.currentAuthIndex;
+                    retryAttempt++;
                     continue;
                 }
 
                 // Log the warning for the current attempt
                 this.logger.warn(
-                    `[Request] Attempt #${retryAttempt}/${this.config.maxRetries} for request #${proxyRequest.request_id} failed: ${errorPayload.message}`
+                    `[Request] Attempt #${retryAttempt}/${maxRetries} for request #${proxyRequest.request_id} failed: ${errorPayload.message}`
                 );
 
                 // If it's the last attempt, break the loop to return failure
-                if (retryAttempt >= this.config.maxRetries) {
+                if (retryAttempt >= maxRetries) {
                     this.logger.error(
-                        `❌ [Request] All ${this.config.maxRetries} retries failed for request #${proxyRequest.request_id}. Final error: ${errorPayload.message}`
+                        `❌ [Request] All ${maxRetries} retries failed for request #${proxyRequest.request_id}. Final error: ${errorPayload.message}`
                     );
                     break;
                 }
@@ -3491,7 +3551,7 @@ class RequestHandler {
                 }
 
                 // Wait before the next retry
-                await new Promise(resolve => setTimeout(resolve, this.config.retryDelay));
+                await new Promise(resolve => setTimeout(resolve, retryDelay));
                 if (
                     !(await this._waitForSystemAndConnectionIfBusy(null, {
                         connectionMessage: "Service temporarily unavailable: Connection not ready before retry.",
@@ -4183,6 +4243,7 @@ class RequestHandler {
             /^(\/v1beta\/models\/)([^:]+)(:(generateContent|streamGenerateContent).*)$/
         );
         let modelThinkingLevel = null;
+        let nativeModelName = null;
         let modelStreamingMode = null;
         let modelForceCodeExecution = false;
         let modelForceWebSearch = false;
@@ -4205,6 +4266,7 @@ class RequestHandler {
             modelForceWebSearch = parsedForceWebSearch;
             modelStreamingMode = parsedStreamingMode;
             modelThinkingLevel = parsedThinkingLevel;
+            nativeModelName = cleanModelName;
 
             const modelForceToolFlags = [];
             if (modelForceWebSearch) modelForceToolFlags.push("forceWebSearch=true");
@@ -4233,36 +4295,17 @@ class RequestHandler {
             }
         }
 
-        // Force thinking for native Google requests (processed first)
-        if (this.config.forceThinking && req.method === "POST" && bodyObj && bodyObj.contents) {
-            if (!bodyObj.generationConfig) {
-                bodyObj.generationConfig = {};
+        if (nativeModelName && req.method === "POST" && bodyObj?.contents) {
+            const thinkingConfig = FormatConverter.resolveThinkingConfig({
+                forceThinking: this.config.forceThinking,
+                modelName: nativeModelName,
+                modelThinkingLevel,
+                thinkingConfig: bodyObj.generationConfig?.thinkingConfig,
+            });
+            if (thinkingConfig) {
+                bodyObj.generationConfig = bodyObj.generationConfig || {};
+                bodyObj.generationConfig.thinkingConfig = thinkingConfig;
             }
-            if (
-                !bodyObj.generationConfig.thinkingConfig ||
-                bodyObj.generationConfig.thinkingConfig.includeThoughts === undefined
-            ) {
-                this.logger.info(`[Proxy] ⚠️ Force thinking enabled, setting includeThoughts=true. (Google Native)`);
-                bodyObj.generationConfig.thinkingConfig = {
-                    ...(bodyObj.generationConfig.thinkingConfig || {}),
-                    includeThoughts: true,
-                };
-            }
-        }
-
-        // If thinkingLevel is parsed from model name suffix, inject into thinkingConfig (after force thinking, higher priority, direct override)
-        if (modelThinkingLevel && req.method === "POST" && bodyObj && bodyObj.contents) {
-            if (!bodyObj.generationConfig) {
-                bodyObj.generationConfig = {};
-            }
-            if (!bodyObj.generationConfig.thinkingConfig) {
-                bodyObj.generationConfig.thinkingConfig = {};
-            }
-            // Model name suffix thinkingLevel has highest priority, direct override
-            bodyObj.generationConfig.thinkingConfig.thinkingLevel = modelThinkingLevel;
-            this.logger.info(
-                `[Proxy] Applied thinkingLevel from model name suffix: ${modelThinkingLevel} (Google Native)`
-            );
         }
 
         // Pre-process native Google requests

@@ -33,6 +33,32 @@ class StatusRoutes {
         ]);
     }
 
+    _runtimeSettingError(res, error) {
+        if (error.name === "RuntimeConfigValidationError") {
+            return res.status(400).json({ error: error.message, message: "settingFailed" });
+        }
+        this.logger.error(`[Config] Failed to save runtime setting: ${error.message}`);
+        return res.status(500).json({ error: "Could not save runtime settings.", message: "settingFailed" });
+    }
+
+    async _updateRuntimeSetting(res, key, value) {
+        try {
+            const state = await this.serverSystem.runtimeConfig.update({ [key]: value });
+            return res.status(200).json({ message: "settingUpdateSuccess", setting: key, value: state.effective[key] });
+        } catch (error) {
+            return this._runtimeSettingError(res, error);
+        }
+    }
+
+    async _toggleRuntimeSetting(res, key) {
+        try {
+            const state = await this.serverSystem.runtimeConfig.toggle(key);
+            return res.status(200).json({ message: "settingUpdateSuccess", setting: key, value: state.effective[key] });
+        } catch (error) {
+            return this._runtimeSettingError(res, error);
+        }
+    }
+
     _rejectIfSystemBusy(res) {
         if (!this.serverSystem.requestHandler?.isSystemBusy) {
             return false;
@@ -50,7 +76,7 @@ class StatusRoutes {
     setupRoutes(app, isAuthenticated) {
         // Favicon endpoint (public, no authentication required)
         app.get("/favicon.ico", (req, res) => {
-            const iconUrl = process.env.ICON_URL || "/AIStudio_logo.svg";
+            const iconUrl = this.config.iconUrl || "/AIStudio_logo.svg";
 
             // Redirect to the configured icon URL (default: local SVG icon)
             // This supports any icon format (ICO, PNG, SVG, etc.) and any size
@@ -60,7 +86,7 @@ class StatusRoutes {
         // Health check endpoint (public, no authentication required)
         app.get("/health", (req, res) => {
             const now = new Date();
-            const timezone = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+            const timezone = this.config.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
             let timestamp;
 
             try {
@@ -745,64 +771,60 @@ class StatusRoutes {
             }
         });
 
-        app.put("/api/settings/streaming-mode", isAuthenticated, (req, res) => {
-            const newMode = req.body.mode;
-            if (newMode === "fake" || newMode === "real") {
-                this.config.streamingMode = newMode;
-                this.logger.info(
-                    `[WebUI] Streaming mode switched by authenticated user to: ${this.config.streamingMode}`
-                );
-                res.status(200).json({ message: "settingUpdateSuccess", setting: "streamingMode", value: newMode });
-            } else {
-                res.status(400).json({ message: "errorInvalidMode" });
+        app.get("/api/settings/runtime", isAuthenticated, (req, res) => {
+            res.status(200).json(this.serverSystem.runtimeConfig.getState());
+        });
+
+        app.put("/api/settings/runtime", isAuthenticated, async (req, res) => {
+            try {
+                const state = await this.serverSystem.runtimeConfig.update(req.body);
+                return res.status(200).json(state);
+            } catch (error) {
+                return this._runtimeSettingError(res, error);
             }
         });
 
-        app.put("/api/settings/force-thinking", isAuthenticated, (req, res) => {
-            this.config.forceThinking = !this.config.forceThinking;
-            const statusText = this.config.forceThinking;
-            this.logger.info(`[WebUI] Force thinking toggle switched to: ${statusText}`);
-            res.status(200).json({ message: "settingUpdateSuccess", setting: "forceThinking", value: statusText });
+        app.delete("/api/settings/runtime", isAuthenticated, async (req, res) => {
+            try {
+                const state = await this.serverSystem.runtimeConfig.reset();
+                return res.status(200).json(state);
+            } catch (error) {
+                return this._runtimeSettingError(res, error);
+            }
         });
 
-        app.put("/api/settings/force-web-search", isAuthenticated, (req, res) => {
-            this.config.forceWebSearch = !this.config.forceWebSearch;
-            const statusText = this.config.forceWebSearch;
-            this.logger.info(`[WebUI] Force web search toggle switched to: ${statusText}`);
-            res.status(200).json({ message: "settingUpdateSuccess", setting: "forceWebSearch", value: statusText });
+        app.put("/api/settings/streaming-mode", isAuthenticated, (req, res) => {
+            const newMode = req.body.mode;
+            if (newMode === "fake" || newMode === "real") {
+                return this._updateRuntimeSetting(res, "streamingMode", newMode);
+            } else {
+                return res.status(400).json({ message: "errorInvalidMode" });
+            }
         });
 
-        app.put("/api/settings/force-code-execution", isAuthenticated, (req, res) => {
-            this.config.forceCodeExecution = !this.config.forceCodeExecution;
-            const statusText = this.config.forceCodeExecution;
-            this.logger.info(`[WebUI] Force code execution toggle switched to: ${statusText}`);
-            res.status(200).json({
-                message: "settingUpdateSuccess",
-                setting: "forceCodeExecution",
-                value: statusText,
-            });
-        });
+        app.put("/api/settings/force-thinking", isAuthenticated, (req, res) =>
+            this._toggleRuntimeSetting(res, "forceThinking")
+        );
 
-        app.put("/api/settings/force-url-context", isAuthenticated, (req, res) => {
-            this.config.forceUrlContext = !this.config.forceUrlContext;
-            const statusText = this.config.forceUrlContext;
-            this.logger.info(`[WebUI] Force URL context toggle switched to: ${statusText}`);
-            res.status(200).json({ message: "settingUpdateSuccess", setting: "forceUrlContext", value: statusText });
-        });
+        app.put("/api/settings/force-web-search", isAuthenticated, (req, res) =>
+            this._toggleRuntimeSetting(res, "forceWebSearch")
+        );
 
-        app.put("/api/settings/check-update", isAuthenticated, (req, res) => {
-            this.config.checkUpdate = !this.config.checkUpdate;
-            const statusText = this.config.checkUpdate;
-            this.logger.info(`[WebUI] Check update toggle switched to: ${statusText}`);
-            res.status(200).json({ message: "settingUpdateSuccess", setting: "checkUpdate", value: statusText });
-        });
+        app.put("/api/settings/force-code-execution", isAuthenticated, (req, res) =>
+            this._toggleRuntimeSetting(res, "forceCodeExecution")
+        );
 
-        app.put("/api/settings/enable-auth-update", isAuthenticated, (req, res) => {
-            this.config.enableAuthUpdate = !this.config.enableAuthUpdate;
-            const statusText = this.config.enableAuthUpdate;
-            this.logger.info(`[WebUI] Enable auth update toggle switched to: ${statusText}`);
-            res.status(200).json({ message: "settingUpdateSuccess", setting: "enableAuthUpdate", value: statusText });
-        });
+        app.put("/api/settings/force-url-context", isAuthenticated, (req, res) =>
+            this._toggleRuntimeSetting(res, "forceUrlContext")
+        );
+
+        app.put("/api/settings/check-update", isAuthenticated, (req, res) =>
+            this._toggleRuntimeSetting(res, "checkUpdate")
+        );
+
+        app.put("/api/settings/enable-auth-update", isAuthenticated, (req, res) =>
+            this._toggleRuntimeSetting(res, "enableAuthUpdate")
+        );
 
         app.put("/api/settings/safety-settings-threshold", isAuthenticated, (req, res) => {
             const newThreshold = String(req.body?.value || "")
@@ -813,30 +835,22 @@ class StatusRoutes {
                 return res.status(400).json({ error: "Invalid safety settings threshold", message: "settingFailed" });
             }
 
-            this.config.safetySettingsThreshold = newThreshold;
-            this.logger.info(`[WebUI] Safety settings threshold updated to: ${newThreshold}`);
-            return res.status(200).json({
-                message: "settingUpdateSuccess",
-                setting: "safetySettingsThreshold",
-                value: newThreshold,
-            });
+            return this._updateRuntimeSetting(res, "safetySettingsThreshold", newThreshold);
         });
 
-        app.put("/api/settings/debug-mode", isAuthenticated, (req, res) => {
-            const currentLevel = LoggingService.getLevel();
+        app.put("/api/settings/debug-mode", isAuthenticated, async (req, res) => {
+            const currentLevel = this.config.logLevel;
             const newLevel = currentLevel === "DEBUG" ? "INFO" : "DEBUG";
-            LoggingService.setLevel(newLevel);
-            this.logger.info(`[WebUI] Log level switched to: ${newLevel}`);
-
-            // Sync browser log level via WebSocket (broadcasts to all active contexts)
-            const updatedCount = this.serverSystem.requestHandler.setBrowserLogLevel(newLevel);
-            const browserSynced = updatedCount > 0;
-            if (!browserSynced) {
-                this.logger.warn(`[WebUI] Browser log level sync failed (no active connections)`);
+            try {
+                await this.serverSystem.runtimeConfig.update({ logLevel: newLevel });
+            } catch (error) {
+                return this._runtimeSettingError(res, error);
             }
+            this.logger.info(`[WebUI] Log level switched to: ${newLevel}`);
+            const updatedCount = this.serverSystem.browserLogSyncCount || 0;
 
-            res.status(200).json({
-                browserSynced,
+            return res.status(200).json({
+                browserSynced: updatedCount > 0,
                 message: "settingUpdateSuccess",
                 setting: "logLevel",
                 updatedContexts: updatedCount,

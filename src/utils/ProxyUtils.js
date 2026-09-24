@@ -1,6 +1,6 @@
 /**
  * File: src/utils/ProxyUtils.js
- * Description: Utility functions for parsing proxy configuration from environment variables
+ * Description: Utility functions for parsing configured proxy settings and legacy environment variables
  *
  * Author: iBenzene, bbbugg
  */
@@ -8,6 +8,7 @@
 const PROXY_SERVER_ENV_KEYS = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
 const NO_PROXY_ENV_KEYS = ["NO_PROXY", "no_proxy"];
 const DEFAULT_BYPASS = ["localhost", "127.0.0.1", "::", "::1", "0.0.0.0"];
+const LEGACY_PROXY_ENV_KEYS = [...PROXY_SERVER_ENV_KEYS, ...NO_PROXY_ENV_KEYS];
 
 const _getFirstEnvValue = envKeys => {
     const envKey = envKeys.find(key => process.env[key] && String(process.env[key]).trim());
@@ -21,19 +22,24 @@ const _getFirstEnvValue = envKeys => {
 
 const _getProxyServerEnv = () => _getFirstEnvValue(PROXY_SERVER_ENV_KEYS);
 
-const _getBypassEntries = () => {
-    const bypassEnv = _getFirstEnvValue(NO_PROXY_ENV_KEYS);
-    const userBypass = bypassEnv
-        ? bypassEnv.value
+const getProxyBypass = value => {
+    const userBypass = value
+        ? String(value)
               .split(",")
               .map(s => s.trim())
               .filter(Boolean)
         : [];
 
-    return [...new Set([...DEFAULT_BYPASS, ...userBypass])];
+    return [...new Set([...DEFAULT_BYPASS, ...userBypass])].join(",");
 };
 
-const getProxyBypassFromEnv = () => _getBypassEntries().join(",");
+const getProxyBypassFromEnv = () => getProxyBypass(_getFirstEnvValue(NO_PROXY_ENV_KEYS)?.value);
+
+const withoutLegacyProxyEnv = env => {
+    const browserEnv = { ...env };
+    for (const key of LEGACY_PROXY_ENV_KEYS) delete browserEnv[key];
+    return browserEnv;
+};
 
 // Redact credentials in proxy strings, without needing valid URL parsing.
 // - `scheme://user:pass@host` -> `scheme://***@host`
@@ -45,26 +51,18 @@ const _redactProxyCredentials = serverRaw => {
     return raw.replace(/^([^@/]+)@/, "***@");
 };
 
-/**
- * Parse proxy configuration from environment variables
- * Supports HTTPS_PROXY, HTTP_PROXY, ALL_PROXY and their lowercase variants
- * Also supports NO_PROXY for bypass rules
- *
- * @returns {Object|null} Proxy config object for Playwright, or null if no proxy configured
- * @example
- * // Returns: { server: "http://127.0.0.1:7890", bypass: "localhost,127.0.0.1" }
- * // Or with auth: { server: "http://proxy.com:8080", username: "user", password: "pass" }
- */
-const parseProxyFromEnv = () => {
-    const proxyEnv = _getProxyServerEnv();
-    if (!proxyEnv) return null;
+/** Parse a configured proxy URL into Playwright's launch/context format. */
+const parseProxyConfig = (proxyUrl, proxyBypass) => {
+    if (!proxyUrl || !String(proxyUrl).trim()) return null;
 
-    const bypass = getProxyBypassFromEnv();
+    const serverRaw = String(proxyUrl).trim();
+    const bypass = getProxyBypass(proxyBypass);
 
     // Playwright expects: { server, bypass?, username?, password? }
     // server examples: "http://127.0.0.1:7890", "socks5://127.0.0.1:7890"
     try {
-        const u = new URL(proxyEnv.value);
+        const u = new URL(serverRaw);
+        if (!u.host) throw new Error("Proxy URL has no host");
         const proxy = {
             bypass,
             server: `${u.protocol}//${u.host}`,
@@ -78,38 +76,57 @@ const parseProxyFromEnv = () => {
         // If URL parsing fails, use raw value directly
         return {
             bypass,
-            server: proxyEnv.value,
+            server: serverRaw,
         };
     }
 };
 
+/** Only used when importing an existing environment into the persistent config. */
+const parseProxyFromEnv = () => {
+    const proxyEnv = _getProxyServerEnv();
+    return parseProxyConfig(proxyEnv?.value, _getFirstEnvValue(NO_PROXY_ENV_KEYS)?.value);
+};
+
 /**
- * Get a safe summary of proxy configuration from environment variables.
+ * Get a safe summary of a configured proxy URL.
  * This is intended for logging/UI display and avoids leaking credentials.
  *
- * @returns {{enabled: boolean, envKey?: string, server?: string}}
+ * @returns {{enabled: boolean, server?: string}}
  */
-const getProxySummaryFromEnv = () => {
-    const proxyEnv = _getProxyServerEnv();
-    if (!proxyEnv) return { enabled: false };
+const getProxySummary = proxyUrl => {
+    if (!proxyUrl || !String(proxyUrl).trim()) return { enabled: false };
 
-    const serverRaw = proxyEnv.value;
+    const serverRaw = String(proxyUrl).trim();
 
     try {
         const u = new URL(serverRaw);
+        if (!u.host) throw new Error("Proxy URL has no host");
         return {
             enabled: true,
-            envKey: proxyEnv.envKey,
             server: `${u.protocol}//${u.host}`,
         };
     } catch {
         // If URL parsing fails, at least redact obvious `user:pass@` patterns
         return {
             enabled: true,
-            envKey: proxyEnv.envKey,
             server: _redactProxyCredentials(serverRaw),
         };
     }
 };
 
-module.exports = { getProxyBypassFromEnv, getProxySummaryFromEnv, parseProxyFromEnv };
+/** Only used when importing an existing environment into the persistent config. */
+const getProxySummaryFromEnv = () => {
+    const proxyEnv = _getProxyServerEnv();
+    if (!proxyEnv) return { enabled: false };
+    return { ...getProxySummary(proxyEnv.value), envKey: proxyEnv.envKey };
+};
+
+module.exports = {
+    getProxyBypass,
+    getProxyBypassFromEnv,
+    getProxySummary,
+    getProxySummaryFromEnv,
+    parseProxyConfig,
+    parseProxyFromEnv,
+    withoutLegacyProxyEnv,
+};

@@ -41,9 +41,9 @@
 
    > 💡 **提示：** 如果下载 Camoufox 浏览器失败或等待太久，可以自行点击 [此处](https://github.com/daijro/camoufox/releases/tag/v135.0.1-beta.24) 下载，然后设置环境变量 `CAMOUFOX_EXECUTABLE_PATH` 为可执行文件的路径（支持绝对和相对路径）。
 
-3. 配置环境变量（可选）：
+3. 配置文件：
 
-   复制根目录下的 `.env.example` 为 `.env`，并在 `.env` 中按需修改配置（如端口、API 密钥等）。
+   首次启动会生成 `data/config.json`，以后统一以这个文件为准。已有 `.env` 或 Portainer 环境变量只在首次生成文件时导入一次；之后请在控制台“设置”页或配置文件中修改。API 密钥、控制台密码、监听端口等启动项编辑文件后需重启进程。
 
    如果服务可从公网访问，请设置自己的 `API_KEYS` 和控制台密码，不要使用默认密钥 `123456`。
 
@@ -61,8 +61,20 @@
 
    API 服务将在 `http://localhost:7860` 上运行。
 
-   服务启动后，您可以在浏览器中访问 `http://localhost:7860` 打开 Web 控制台主页，在这里可以查看账号状态和服务状态。
-   请求统计数据会持久化保存到 `/data/usage-stats.jsonl`。
+### 本地联调
+
+1. 将有效的认证文件放在 `configs/auth/auth-0.json` 等位置。首次运行前可在 `.env.development` 中设置本地 `API_KEYS` 和 `WEB_CONSOLE_PASSWORD`；服务生成 `data/config.json` 后，后续修改请编辑该配置文件。这些路径已被 `.gitignore` 排除。
+2. 运行 `npm run dev`，在 `http://127.0.0.1:7860` 检查页面。后端源码和前端页面修改后会自动重新加载，无需部署 Docker。
+3. 确认 `http://127.0.0.1:7860/health/ready` 返回 `ready: true`，再运行 `npm run smoke:local` 验证真实 API 输出。默认检查 `gemini-3.8-flash`；Responses 接口示例：`npm run smoke:local -- --responses --effort medium`。
+
+推送 `stable` 分支会触发 GitHub Actions 测试；推送 `v*.*.*` 标签才会发布 arm64 镜像。随后在 Portainer 中把镜像标签改为新版本并更新 Stack。
+
+### 网页热更新配置
+
+控制台“设置”页可修改浏览器上下文上限、请求总尝试次数、账号失败和使用次数阈值、重试间隔与请求超时。保存后运行中的服务立即采用新值，并写入 `data/config.json`；直接编辑该文件保存后也会重新加载支持热更新的字段。页面会显示当前值与首次导入时的基准值。运行在 Docker 中时需持久挂载 `/app/data`。启动项与参数语义见 [独立版运维说明](docs/zh/fork-operations.md#运行参数热更新)。
+
+服务启动后，您可以在浏览器中访问 `http://localhost:7860` 打开 Web 控制台主页，在这里可以查看账号状态和服务状态。
+请求统计数据会持久化保存到 `/data/usage-stats.jsonl`。
 
 5. 更新到最新版本（已有本地部署时）：
 
@@ -91,7 +103,7 @@ docker run -d \
   -e API_KEYS=your-api-key-1,your-api-key-2 \
   -e TZ=Asia/Shanghai \
   --restart unless-stopped \
-  ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.3
+  ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.4
 ```
 
 参数说明：
@@ -111,7 +123,7 @@ name: aistudio-to-api
 
 services:
   app:
-    image: ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.3
+    image: ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.4
     container_name: aistudio-to-api
     ports:
       # API 服务器端口（如果使用反向代理，强烈建议改成 127.0.0.1:7860）
@@ -241,7 +253,9 @@ services:
 
 ## 🧰 相关配置
 
-### 🔧 环境变量
+### 🔧 旧环境变量的一次性导入
+
+以下变量仅用于首次生成 `data/config.json`，已有配置文件时不再读取。日常修改请使用控制台“设置”页；启动项请编辑配置文件。
 
 #### 📱 应用配置
 
@@ -310,6 +324,8 @@ services:
 编辑 `configs/models.json` 以自定义可用模型及其设置。
 
 > 💡 **提示：** 思考参数预留了通过模型后缀名来设置的功能，支持在模型名后面通过 `-THINKING_LEVEL` 或 `(THINKING_LEVEL)` 来设置（`THINKING_LEVEL` 支持 `high`、`low`、`medium`、`minimal`，不区分大小写）。例如：`gemini-3-flash-preview(minimal)` 或 `gemini-3-flash-preview-minimal`。
+>
+> `gemini-3.8-flash` 在本 fork 中默认发送 `thinkingLevel: HIGH`。优先级是模型名后缀 > Chat 的 `reasoning_effort` / Responses 的 `reasoning.effort` > 请求中显式的 Gemini `thinkingLevel` > 默认 HIGH。该模型只支持 `low`、`medium`、`high`；`minimal` 会返回请求错误。`high`、`xhigh`、`max` 和 `ultra` 均映射为上游 HIGH；`includeThoughts` 独立控制是否返回思考内容。
 >
 > 真假流式也支持通过模型名后缀覆盖，支持追加 `-real` 或 `-fake`。该后缀优先级高于系统的真假流式，但只会在流式请求中生效。例如：`gemini-3-flash-preview-fake`。若和思考后缀同时使用，真假流后缀应放在思考后缀之后，例如：`gemini-3-flash-preview-minimal-fake` 或 `gemini-3-flash-preview(minimal)-real`。
 >

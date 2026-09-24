@@ -10,7 +10,7 @@ const path = require("path");
 const { firefox } = require("playwright");
 const os = require("os");
 
-const { parseProxyFromEnv } = require("../utils/ProxyUtils");
+const { getProxySummary, parseProxyConfig, withoutLegacyProxyEnv } = require("../utils/ProxyUtils");
 const StickyProxyManager = require("../utils/StickyProxyManager");
 const {
     AuthExpiredError,
@@ -34,7 +34,7 @@ class BrowserManager {
         this.logger = logger;
         this.config = config;
         this.authSource = authSource;
-        this.stickyProxyManager = new StickyProxyManager(logger, authSource);
+        this.stickyProxyManager = new StickyProxyManager(logger, authSource, { proxyBypass: config.proxyBypass });
         this.stickyProxyManager.isEnabled();
         this.browser = null;
 
@@ -1324,12 +1324,14 @@ class BrowserManager {
             throw new Error(`Browser executable not found at path: ${browserExecutablePath}`);
         }
 
-        const proxyConfig = stickyProxy ? stickyProxy.proxy : parseProxyFromEnv();
+        const proxyConfig = stickyProxy
+            ? stickyProxy.proxy
+            : parseProxyConfig(this.config.proxyUrl, this.config.proxyBypass);
         if (proxyConfig) {
             this.logger.info(
                 stickyProxy
                     ? `[VNC] Launching browser with proxy: ${stickyProxy.display}`
-                    : `[VNC] 🌐 Using proxy: ${proxyConfig.server}`
+                    : `[VNC] 🌐 Using proxy: ${getProxySummary(this.config.proxyUrl).server}`
             );
         }
 
@@ -1337,7 +1339,7 @@ class BrowserManager {
         // It does NOT affect the main `this.browser` used for the API proxy.
         const vncBrowser = await firefox.launch({
             env: {
-                ...process.env,
+                ...withoutLegacyProxyEnv(process.env),
                 ...extraArgs.env,
             },
             executablePath: browserExecutablePath,
@@ -1484,11 +1486,11 @@ class BrowserManager {
         if (this.browser) return;
 
         const isStickyProxyEnabled = this.stickyProxyManager.isEnabled();
-        const proxyConfig = isStickyProxyEnabled ? null : parseProxyFromEnv();
+        const proxyConfig = isStickyProxyEnabled
+            ? null
+            : parseProxyConfig(this.config.proxyUrl, this.config.proxyBypass);
         if (isStickyProxyEnabled) {
-            this.logger.info(
-                "[Browser] Sticky proxy mode enabled; main browser launch will not use environment proxy."
-            );
+            this.logger.info("[Browser] Sticky proxy mode enabled; main browser launch will not use the global proxy.");
         }
         this.logger.info("🚀 [Browser] Launching main browser instance...");
         const browserExecutablePath = this._getBrowserExecutablePath();
@@ -1498,6 +1500,7 @@ class BrowserManager {
         }
         this.browser = await firefox.launch({
             args: this.launchArgs,
+            env: withoutLegacyProxyEnv(process.env),
             executablePath: browserExecutablePath,
             firefoxUserPrefs: this.firefoxUserPrefs,
             headless: true,
@@ -2051,7 +2054,9 @@ class BrowserManager {
             this._wsInitState.set(authIndex, { failed: false, success: false });
 
             const stickyProxy = this.stickyProxyManager.getProxyForAuth(authIndex);
-            const proxyConfig = stickyProxy ? stickyProxy.proxy : parseProxyFromEnv();
+            const proxyConfig = stickyProxy
+                ? stickyProxy.proxy
+                : parseProxyConfig(this.config.proxyUrl, this.config.proxyBypass);
             if (stickyProxy) {
                 this.logger.info(
                     `[Context#${authIndex}] Using sticky proxy for account "${stickyProxy.accountKey}": ${stickyProxy.display}`

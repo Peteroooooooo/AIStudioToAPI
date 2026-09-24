@@ -956,6 +956,120 @@
                     <h1>{{ t("settings") }}</h1>
                 </header>
 
+                <section class="status-card runtime-config-card" aria-labelledby="runtime-config-title">
+                    <div class="runtime-config-header">
+                        <div>
+                            <span class="runtime-config-eyebrow">{{ t("runtimeConfigEyebrow") }}</span>
+                            <h2 id="runtime-config-title">{{ t("runtimeConfigTitle") }}</h2>
+                            <p>{{ t("runtimeConfigDescription") }}</p>
+                        </div>
+                        <div class="runtime-config-actions">
+                            <button
+                                class="runtime-action-button"
+                                type="button"
+                                :disabled="runtimeConfig.busy"
+                                @click="refreshRuntimeConfig"
+                            >
+                                {{ t("runtimeRefresh") }}
+                            </button>
+                            <button
+                                class="runtime-action-button runtime-action-danger"
+                                type="button"
+                                :disabled="runtimeConfig.busy || !runtimeConfig.loaded"
+                                @click="resetRuntimeConfig"
+                            >
+                                {{ t("runtimeResetInitial") }}
+                            </button>
+                            <button
+                                class="runtime-action-button runtime-action-primary"
+                                type="button"
+                                :disabled="!runtimeCanSave"
+                                @click="saveRuntimeConfig"
+                            >
+                                {{ runtimeConfig.busy === "saving" ? t("runtimeSaving") : t("runtimeSave") }}
+                            </button>
+                        </div>
+                    </div>
+
+                    <div v-if="runtimeConfig.error" class="runtime-config-notice is-error" role="alert">
+                        {{ runtimeConfig.error }}
+                    </div>
+                    <div
+                        v-else-if="runtimeConfig.externalChangeKey"
+                        class="runtime-config-notice is-warning"
+                        role="status"
+                    >
+                        {{ t(runtimeConfig.externalChangeKey) }}
+                    </div>
+                    <div v-else-if="runtimeConfig.notice" class="runtime-config-notice is-success" role="status">
+                        {{ runtimeConfig.notice }}
+                    </div>
+                    <div v-if="runtimeConfig.loaded" class="runtime-config-meta">
+                        <span>{{ t("runtimeRevision", { revision: runtimeConfig.revision }) }}</span>
+                        <span v-if="runtimeConfig.configPath" class="runtime-config-path">
+                            {{ t("runtimeConfigFile") }}: <code>{{ runtimeConfig.configPath }}</code>
+                        </span>
+                        <span v-if="runtimeDirtyKeys.length" class="is-dirty">
+                            {{ t("runtimeUnsavedCount", { count: runtimeDirtyKeys.length }) }}
+                        </span>
+                    </div>
+
+                    <div v-if="runtimeConfig.busy === 'loading' && !runtimeConfig.loaded" class="runtime-config-empty">
+                        {{ t("loading") }}
+                    </div>
+                    <div v-else-if="!runtimeConfig.loaded" class="runtime-config-empty">
+                        {{ t("runtimeNotLoaded") }}
+                    </div>
+                    <div v-else class="runtime-config-groups">
+                        <div v-for="group in runtimeConfigGroups" :key="group.key" class="runtime-config-group">
+                            <div class="runtime-config-group-heading">
+                                <h3>{{ t(group.titleKey) }}</h3>
+                                <p>{{ t(group.descriptionKey) }}</p>
+                            </div>
+                            <div class="runtime-config-fields">
+                                <div v-for="field in group.fields" :key="field.key" class="runtime-config-field">
+                                    <div class="runtime-field-heading">
+                                        <label :for="`runtime-${field.key}`">{{ t(field.titleKey) }}</label>
+                                    </div>
+                                    <code class="runtime-field-key">{{ field.key }}</code>
+                                    <p class="runtime-field-description">{{ t(field.descriptionKey) }}</p>
+                                    <div class="runtime-field-input-row">
+                                        <input
+                                            :id="`runtime-${field.key}`"
+                                            v-model="runtimeDraft[field.key]"
+                                            type="number"
+                                            inputmode="numeric"
+                                            step="1"
+                                            :min="field.min"
+                                            :max="field.max"
+                                            :disabled="!!runtimeConfig.busy"
+                                            :aria-invalid="!!runtimeFieldErrors[field.key]"
+                                            :aria-describedby="`runtime-${field.key}-help`"
+                                        />
+                                        <span v-if="field.unitKey" class="runtime-field-unit">{{
+                                            t(field.unitKey)
+                                        }}</span>
+                                    </div>
+                                    <div :id="`runtime-${field.key}-help`" class="runtime-field-footnote">
+                                        <span v-if="runtimeFieldErrors[field.key]" class="runtime-field-error">
+                                            {{ runtimeFieldErrors[field.key] }}
+                                        </span>
+                                        <span v-else>
+                                            {{ t("runtimeEffective") }}:
+                                            <strong>{{
+                                                formatRuntimeValue(field, runtimeConfig.effective[field.key])
+                                            }}</strong>
+                                            <span class="runtime-field-separator">·</span>
+                                            {{ t("runtimeInitial") }}:
+                                            {{ formatRuntimeValue(field, runtimeConfig.defaults[field.key]) }}
+                                        </span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
                 <div class="dashboard-grid settings-grid">
                     <!-- Version Information Card -->
                     <div class="status-card">
@@ -995,8 +1109,12 @@
                                     </svg>
                                     GitHub {{ t("repo") }}
                                 </span>
-                                <a href="https://github.com/iBUHub/AIStudioToAPI" target="_blank" class="repo-link">
-                                    iBUHub/AIStudioToAPI
+                                <a
+                                    href="https://github.com/Peteroooooooo/AIStudioToAPI"
+                                    target="_blank"
+                                    class="repo-link"
+                                >
+                                    Peteroooooooo/AIStudioToAPI
                                 </a>
                             </div>
                             <div class="status-item">
@@ -1072,9 +1190,7 @@
                                         :title="t('newVersionAvailable')"
                                     >
                                         <a
-                                            :href="
-                                                state.releaseUrl || 'https://github.com/iBUHub/AIStudioToAPI/releases'
-                                            "
+                                            :href="state.releaseUrl || forkReleasesUrl"
                                             target="_blank"
                                             class="update-link"
                                         >
@@ -1082,9 +1198,7 @@
                                         </a>
                                         <a
                                             class="copy-icon"
-                                            :href="
-                                                state.releaseUrl || 'https://github.com/iBUHub/AIStudioToAPI/releases'
-                                            "
+                                            :href="state.releaseUrl || forkReleasesUrl"
                                             target="_blank"
                                             style="color: inherit; display: inline-flex"
                                         >
@@ -1109,7 +1223,7 @@
                                     </span>
                                     <span v-else class="clickable-version" :title="t('viewRelease')">
                                         <a
-                                            href="https://github.com/iBUHub/AIStudioToAPI/releases"
+                                            href="https://github.com/Peteroooooooo/AIStudioToAPI/releases"
                                             target="_blank"
                                             style="color: inherit; text-decoration: none"
                                         >
@@ -1117,7 +1231,7 @@
                                         </a>
                                         <a
                                             class="copy-icon"
-                                            href="https://github.com/iBUHub/AIStudioToAPI/releases"
+                                            href="https://github.com/Peteroooooooo/AIStudioToAPI/releases"
                                             target="_blank"
                                             style="color: inherit; display: inline-flex"
                                         >
@@ -2841,6 +2955,7 @@ import { useTheme } from "../utils/useTheme";
 import EnvVarTooltip from "../components/EnvVarTooltip.vue";
 
 const router = useRouter();
+const forkReleasesUrl = "https://github.com/Peteroooooooo/AIStudioToAPI/releases";
 const fileInput = ref(null);
 const usageStatsImportInput = ref(null);
 const activeTab = ref("home");
@@ -3673,7 +3788,9 @@ const scheduleUpdate = () => {
     if (!isActive) return;
     const randomInterval = 4000 + Math.floor(Math.random() * 3000);
     updateTimer = setTimeout(async () => {
-        await Promise.all([updateContent(), fetchUsageStats()]).catch(err => {
+        const updates = [updateContent(), fetchUsageStats()];
+        if (activeTab.value === "settings") updates.push(pollRuntimeConfig());
+        await Promise.all(updates).catch(err => {
             console.error("Error fetching data:", err.message || err);
         });
         scheduleUpdate();
@@ -3701,6 +3818,10 @@ const switchTab = tabName => {
     }
 
     activeTab.value = tabName;
+
+    if (tabName === "settings" && (!runtimeConfig.loaded || !runtimeDirtyKeys.value.length)) {
+        loadRuntimeConfig();
+    }
 
     if (tabName === "logs") {
         nextTick(() => {
@@ -3749,6 +3870,279 @@ const state = reactive({
     // theme: handled by useTheme
     usageCount: 0,
 });
+
+const runtimeConfigGroups = [
+    {
+        descriptionKey: "runtimeCapacityDescription",
+        fields: [
+            {
+                descriptionKey: "runtimeMaxContextsDescription",
+                key: "maxContexts",
+                max: 32,
+                min: 0,
+                titleKey: "runtimeMaxContexts",
+            },
+        ],
+        key: "capacity",
+        titleKey: "runtimeCapacityTitle",
+    },
+    {
+        descriptionKey: "runtimeRetryDescription",
+        fields: [
+            {
+                descriptionKey: "runtimeMaxRetriesDescription",
+                key: "maxRetries",
+                max: 10,
+                min: 1,
+                titleKey: "runtimeMaxRetries",
+            },
+            {
+                descriptionKey: "runtimeFailureThresholdDescription",
+                key: "failureThreshold",
+                max: 10000,
+                min: 0,
+                titleKey: "runtimeFailureThreshold",
+            },
+            {
+                descriptionKey: "runtimeSwitchOnUsesDescription",
+                key: "switchOnUses",
+                max: 10000,
+                min: 0,
+                titleKey: "runtimeSwitchOnUses",
+            },
+            {
+                descriptionKey: "runtimeRetryDelayDescription",
+                key: "retryDelay",
+                max: 60000,
+                min: 50,
+                titleKey: "runtimeRetryDelay",
+                unitKey: "runtimeMilliseconds",
+            },
+        ],
+        key: "retry",
+        titleKey: "runtimeRetryTitle",
+    },
+    {
+        descriptionKey: "runtimeTimeoutDescription",
+        fields: [
+            {
+                descriptionKey: "runtimeStreamTimeoutDescription",
+                key: "streamTimeoutMs",
+                max: 300000,
+                min: 1,
+                titleKey: "runtimeStreamTimeout",
+                unitKey: "runtimeMilliseconds",
+            },
+            {
+                descriptionKey: "runtimeFakeStreamTimeoutDescription",
+                key: "fakeStreamTimeoutMs",
+                max: 300000,
+                min: 1,
+                titleKey: "runtimeFakeStreamTimeout",
+                unitKey: "runtimeMilliseconds",
+            },
+        ],
+        key: "timeouts",
+        titleKey: "runtimeTimeoutTitle",
+    },
+];
+const runtimeFields = runtimeConfigGroups.flatMap(group => group.fields);
+const runtimeDraft = reactive({});
+const runtimeConfig = reactive({
+    busy: "",
+    configPath: "",
+    defaults: {},
+    effective: {},
+    error: "",
+    externalChangeKey: "",
+    loaded: false,
+    notice: "",
+    revision: 0,
+});
+let runtimePollPromise = null;
+const runtimeDirtyKeys = computed(() =>
+    runtimeConfig.loaded
+        ? runtimeFields
+              .filter(field => String(runtimeDraft[field.key]) !== String(runtimeConfig.effective[field.key]))
+              .map(field => field.key)
+        : []
+);
+const runtimeFieldErrors = computed(() => {
+    if (!runtimeConfig.loaded) return {};
+    const errors = {};
+    for (const field of runtimeFields) {
+        const raw = String(runtimeDraft[field.key] ?? "").trim();
+        const value = Number(raw);
+        if (!raw || !Number.isSafeInteger(value) || value < field.min || value > field.max) {
+            errors[field.key] = t("runtimeInvalidRange", { max: field.max, min: field.min });
+        }
+    }
+    return errors;
+});
+const runtimeCanSave = computed(
+    () =>
+        runtimeConfig.loaded &&
+        !runtimeConfig.busy &&
+        runtimeDirtyKeys.value.length > 0 &&
+        !Object.keys(runtimeFieldErrors.value).length
+);
+const formatRuntimeValue = (field, value) => {
+    if (value === undefined || value === null) return "—";
+    if (value === 0 && field.key === "maxContexts") return t("runtimeUnlimited");
+    if (value === 0 && ["failureThreshold", "switchOnUses"].includes(field.key)) return t("runtimeDisabled");
+    return field.unitKey ? `${value} ${t(field.unitKey)}` : String(value);
+};
+const applyRuntimeSnapshot = (snapshot, { preserveDraft = false } = {}) => {
+    if (!snapshot?.effective || !snapshot?.defaults) {
+        throw new Error(t("runtimeInvalidResponse"));
+    }
+    const dirtyKeys = preserveDraft ? new Set(runtimeDirtyKeys.value) : new Set();
+    const changed =
+        runtimeConfig.loaded &&
+        (runtimeConfig.revision !== snapshot.revision ||
+            runtimeFields.some(field => runtimeConfig.effective[field.key] !== snapshot.effective[field.key]));
+    runtimeConfig.effective = snapshot.effective;
+    runtimeConfig.defaults = snapshot.defaults;
+    runtimeConfig.configPath = snapshot.configPath || "";
+    runtimeConfig.revision = snapshot.revision ?? 0;
+    for (const field of runtimeFields) {
+        if (!dirtyKeys.has(field.key)) runtimeDraft[field.key] = String(snapshot.effective[field.key]);
+    }
+    state.maxContexts = snapshot.effective.maxContexts;
+    state.maxRetries = snapshot.effective.maxRetries;
+    runtimeConfig.loaded = true;
+    return { changed, hadDirtyDraft: dirtyKeys.size > 0 };
+};
+const readRuntimeResponse = async response => {
+    const payload = await response.json().catch(() => ({}));
+    if (response.status === 401) {
+        window.location.href = "/login";
+        throw new Error(t("runtimeSessionExpired"));
+    }
+    if (!response.ok) {
+        throw new Error(payload.error || payload.message || `HTTP ${response.status}`);
+    }
+    return payload;
+};
+const pollRuntimeConfig = async () => {
+    if (!isActive || activeTab.value !== "settings" || runtimeConfig.busy || runtimePollPromise) return;
+    runtimePollPromise = (async () => {
+        try {
+            const response = await fetch("/api/settings/runtime", {
+                cache: "no-store",
+                headers: { Accept: "application/json" },
+            });
+            const snapshot = await readRuntimeResponse(response);
+            if (!isActive) return;
+            const { changed, hadDirtyDraft } = applyRuntimeSnapshot(snapshot, { preserveDraft: true });
+            runtimeConfig.error = "";
+            if (changed) {
+                runtimeConfig.notice = "";
+                runtimeConfig.externalChangeKey = hadDirtyDraft
+                    ? "runtimeExternalChangedDraft"
+                    : "runtimeExternalChanged";
+            }
+        } catch (error) {
+            if (isActive) runtimeConfig.error = t("runtimeLoadFailed", { error: error.message || error });
+        } finally {
+            runtimePollPromise = null;
+        }
+    })();
+    await runtimePollPromise;
+};
+const loadRuntimeConfig = async () => {
+    if (runtimeConfig.busy) return;
+    runtimeConfig.busy = "loading";
+    runtimeConfig.error = "";
+    runtimeConfig.notice = "";
+    try {
+        if (runtimePollPromise) await runtimePollPromise;
+        const response = await fetch("/api/settings/runtime", {
+            cache: "no-store",
+            headers: { Accept: "application/json" },
+        });
+        applyRuntimeSnapshot(await readRuntimeResponse(response));
+        runtimeConfig.externalChangeKey = "";
+    } catch (error) {
+        runtimeConfig.error = t("runtimeLoadFailed", { error: error.message || error });
+    } finally {
+        runtimeConfig.busy = "";
+    }
+};
+const refreshRuntimeConfig = async () => {
+    if (runtimeDirtyKeys.value.length) {
+        try {
+            await ElMessageBox.confirm(t("runtimeDiscardConfirm"), t("runtimeRefresh"), {
+                cancelButtonText: t("cancel"),
+                confirmButtonText: t("ok"),
+                lockScroll: false,
+                type: "warning",
+            });
+        } catch {
+            return;
+        }
+    }
+    await loadRuntimeConfig();
+};
+const saveRuntimeConfig = async () => {
+    if (!runtimeCanSave.value) return;
+    runtimeConfig.busy = "saving";
+    runtimeConfig.error = "";
+    runtimeConfig.notice = "";
+    try {
+        if (runtimePollPromise) await runtimePollPromise;
+        const changes = Object.fromEntries(runtimeDirtyKeys.value.map(key => [key, Number(runtimeDraft[key])]));
+        if (!Object.keys(changes).length) return;
+        const response = await fetch("/api/settings/runtime", {
+            body: JSON.stringify(changes),
+            headers: { Accept: "application/json", "Content-Type": "application/json" },
+            method: "PUT",
+        });
+        applyRuntimeSnapshot(await readRuntimeResponse(response));
+        runtimeConfig.externalChangeKey = "";
+        runtimeConfig.notice = t("runtimeSaveSuccess");
+        ElMessage.success(runtimeConfig.notice);
+        updateContent();
+    } catch (error) {
+        runtimeConfig.error = t("runtimeSaveFailed", { error: error.message || error });
+        ElMessage.error(runtimeConfig.error);
+    } finally {
+        runtimeConfig.busy = "";
+    }
+};
+const resetRuntimeConfig = async () => {
+    if (runtimeConfig.busy || !runtimeConfig.loaded) return;
+    try {
+        await ElMessageBox.confirm(t("runtimeResetConfirm"), t("runtimeResetInitial"), {
+            cancelButtonText: t("cancel"),
+            confirmButtonText: t("ok"),
+            lockScroll: false,
+            type: "warning",
+        });
+    } catch {
+        return;
+    }
+    runtimeConfig.busy = "resetting";
+    runtimeConfig.error = "";
+    runtimeConfig.notice = "";
+    try {
+        if (runtimePollPromise) await runtimePollPromise;
+        const response = await fetch("/api/settings/runtime", {
+            headers: { Accept: "application/json" },
+            method: "DELETE",
+        });
+        applyRuntimeSnapshot(await readRuntimeResponse(response));
+        runtimeConfig.externalChangeKey = "";
+        runtimeConfig.notice = t("runtimeResetSuccess");
+        ElMessage.success(runtimeConfig.notice);
+        updateContent();
+    } catch (error) {
+        runtimeConfig.error = t("runtimeResetFailed", { error: error.message || error });
+        ElMessage.error(runtimeConfig.error);
+    } finally {
+        runtimeConfig.busy = "";
+    }
+};
 
 const safetySettingsThresholdOptions = [
     { label: "safetySettingsThreshold.OFF", value: "OFF" },
@@ -5059,8 +5453,7 @@ onMounted(() => {
     syncStatsFiltersViewport(statsFiltersMobileMediaQuery);
     statsFiltersMobileMediaQuery.addEventListener("change", syncStatsFiltersViewport);
 
-    updateContent().finally(scheduleUpdate);
-    fetchUsageStats().finally(scheduleUpdate);
+    Promise.allSettled([updateContent(), fetchUsageStats()]).then(scheduleUpdate);
 
     // Check for updates once on initial load
     checkForUpdates();
@@ -5374,6 +5767,275 @@ watchEffect(() => {
 }
 
 /* Settings View Specifics */
+.runtime-config-card {
+    margin-bottom: 24px;
+}
+
+.runtime-config-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 24px;
+    margin-bottom: 20px;
+
+    h2 {
+        color: @text-primary;
+        font-size: 1.3rem;
+        line-height: 1.3;
+        margin: 4px 0 6px;
+    }
+
+    p {
+        color: @text-secondary;
+        font-size: 0.9rem;
+        line-height: 1.5;
+        margin: 0;
+        max-width: 620px;
+    }
+}
+
+.runtime-config-eyebrow {
+    color: @primary-color;
+    font-size: 0.74rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.runtime-config-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+.runtime-action-button {
+    background: @background-white;
+    border: 1px solid @border-color;
+    border-radius: 9px;
+    color: @text-primary;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.85rem;
+    font-weight: 600;
+    min-height: 36px;
+    padding: 7px 12px;
+    transition:
+        border-color 0.2s,
+        background-color 0.2s;
+
+    &:hover:not(:disabled) {
+        border-color: @primary-color;
+        background: rgba(var(--color-primary-rgb), 0.07);
+    }
+
+    &:disabled {
+        cursor: not-allowed;
+        opacity: 0.5;
+    }
+}
+
+.runtime-action-primary {
+    background: @primary-color;
+    border-color: @primary-color;
+    color: @text-on-primary;
+
+    &:hover:not(:disabled) {
+        background: var(--color-primary-hover);
+        border-color: var(--color-primary-hover);
+    }
+}
+
+.runtime-action-danger:hover:not(:disabled) {
+    background: rgba(var(--color-error-rgb), 0.08);
+    border-color: @error-color;
+    color: @error-color;
+}
+
+.runtime-config-notice {
+    border-radius: 9px;
+    font-size: 0.85rem;
+    line-height: 1.45;
+    margin-bottom: 16px;
+    padding: 10px 12px;
+
+    &.is-error {
+        background: rgba(var(--color-error-rgb), 0.09);
+        color: @error-color;
+    }
+
+    &.is-success {
+        background: rgba(var(--color-success-rgb), 0.1);
+        color: @success-color;
+    }
+
+    &.is-warning {
+        background: rgba(var(--color-warning-rgb), 0.1);
+        color: @warning-color;
+    }
+}
+
+.runtime-config-meta {
+    color: @text-secondary;
+    display: flex;
+    flex-wrap: wrap;
+    font-size: 0.78rem;
+    gap: 8px 18px;
+    margin-bottom: 18px;
+
+    .is-dirty {
+        color: @warning-color;
+        font-weight: 600;
+    }
+}
+
+.runtime-config-path {
+    overflow-wrap: anywhere;
+
+    code {
+        color: @text-primary;
+    }
+}
+
+.runtime-config-empty {
+    color: @text-secondary;
+    padding: 26px 0;
+    text-align: center;
+}
+
+.runtime-config-groups {
+    display: grid;
+    gap: 20px;
+}
+
+.runtime-config-group {
+    border-top: 1px solid @border-light;
+    padding-top: 18px;
+}
+
+.runtime-config-group-heading {
+    margin-bottom: 14px;
+
+    h3 {
+        color: @text-primary;
+        font-size: 0.95rem;
+        margin: 0 0 4px;
+    }
+
+    p {
+        color: @text-secondary;
+        font-size: 0.8rem;
+        line-height: 1.4;
+        margin: 0;
+    }
+}
+
+.runtime-config-fields {
+    display: grid;
+    gap: 12px;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
+}
+
+.runtime-config-field {
+    background: @background-light;
+    border: 1px solid @border-light;
+    border-radius: 12px;
+    min-width: 0;
+    padding: 15px;
+}
+
+.runtime-field-heading {
+    align-items: flex-start;
+    display: flex;
+    gap: 8px;
+    justify-content: space-between;
+
+    label {
+        color: @text-primary;
+        font-size: 0.87rem;
+        font-weight: 700;
+        line-height: 1.4;
+    }
+}
+
+.runtime-field-description {
+    color: @text-secondary;
+    font-size: 0.78rem;
+    line-height: 1.45;
+    margin: 8px 0 12px;
+    min-height: 2.25em;
+}
+
+.runtime-field-key {
+    color: @text-secondary;
+    display: inline-block;
+    font-size: 0.7rem;
+    margin-top: 4px;
+}
+
+.runtime-field-input-row {
+    align-items: center;
+    display: flex;
+    gap: 8px;
+
+    input {
+        background: @background-white;
+        border: 1px solid @border-color;
+        border-radius: 8px;
+        color: @text-primary;
+        font: inherit;
+        font-size: 0.94rem;
+        max-width: 160px;
+        min-height: 38px;
+        padding: 7px 10px;
+        width: 100%;
+
+        &:focus-visible {
+            border-color: @primary-color;
+            outline: 2px solid rgba(var(--color-primary-rgb), 0.18);
+        }
+
+        &[aria-invalid="true"] {
+            border-color: @error-color;
+        }
+    }
+}
+
+.runtime-field-unit,
+.runtime-field-footnote {
+    color: @text-secondary;
+    font-size: 0.74rem;
+}
+
+.runtime-field-footnote {
+    line-height: 1.45;
+    margin-top: 10px;
+
+    strong {
+        color: @text-primary;
+    }
+}
+
+.runtime-field-separator {
+    margin: 0 5px;
+}
+
+.runtime-field-error {
+    color: @error-color;
+}
+
+@media (max-width: 700px) {
+    .runtime-config-header {
+        flex-direction: column;
+        gap: 16px;
+    }
+
+    .runtime-config-actions {
+        justify-content: flex-start;
+        width: 100%;
+    }
+}
+
 .settings-card {
     max-width: 600px;
     margin: 0 auto;

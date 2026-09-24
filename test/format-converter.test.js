@@ -2,6 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const FormatConverter = require("../src/core/FormatConverter");
+const RequestHandler = require("../src/core/RequestHandler");
 
 const logger = { debug() {}, error() {}, info() {}, warn() {} };
 const converter = new FormatConverter(logger, { config: {} });
@@ -48,4 +49,121 @@ test("Responses API primitive function output becomes an object", async () => {
     const response = googleRequest.contents.flatMap(content => content.parts).find(part => part.functionResponse)
         ?.functionResponse.response;
     assert.deepEqual(response, { result: true });
+});
+
+test("Gemini 3.8 Flash defaults to HIGH across Chat, Responses, and Claude requests", async () => {
+    const chat = await converter.translateOpenAIToGoogle({
+        messages: [{ content: "hello", role: "user" }],
+        model: "gemini-3.8-flash",
+    });
+    const responses = await converter.translateOpenAIResponseToGoogle({
+        input: "hello",
+        model: "gemini-3.8-flash",
+    });
+    const claude = await converter.translateClaudeToGoogle({
+        max_tokens: 100,
+        messages: [{ content: "hello", role: "user" }],
+        model: "gemini-3.8-flash",
+    });
+    for (const result of [chat, responses, claude]) {
+        assert.equal(result.googleRequest.generationConfig.thinkingConfig.thinkingLevel, "HIGH");
+    }
+});
+
+test("reasoning effort overrides the default, while the model suffix overrides effort", async () => {
+    const chat = await converter.translateOpenAIToGoogle({
+        messages: [{ content: "hello", role: "user" }],
+        model: "gemini-3.8-flash",
+        reasoning_effort: "medium",
+    });
+    assert.equal(chat.googleRequest.generationConfig.thinkingConfig.thinkingLevel, "MEDIUM");
+
+    const responses = await converter.translateOpenAIResponseToGoogle({
+        input: "hello",
+        model: "gemini-3.8-flash",
+        reasoning: { effort: "medium" },
+    });
+    assert.equal(responses.googleRequest.generationConfig.thinkingConfig.thinkingLevel, "MEDIUM");
+
+    const suffix = await converter.translateOpenAIResponseToGoogle({
+        input: "hello",
+        model: "gemini-3.8-flash(low)-real",
+        reasoning: { effort: "high" },
+    });
+    assert.equal(suffix.cleanModelName, "gemini-3.8-flash");
+    assert.equal(suffix.modelStreamingMode, "real");
+    assert.equal(suffix.googleRequest.generationConfig.thinkingConfig.thinkingLevel, "LOW");
+});
+
+test("Codex high efforts map to HIGH while explicit thought visibility is retained", async () => {
+    for (const effort of ["high", "xhigh", "max", "ultra"]) {
+        const response = await converter.translateOpenAIResponseToGoogle({
+            input: "hello",
+            model: "gemini-3.8-flash",
+            reasoning: { effort },
+        });
+        assert.equal(response.googleRequest.generationConfig.thinkingConfig.thinkingLevel, "HIGH");
+    }
+
+    const chat = await converter.translateOpenAIToGoogle({
+        extra_body: { thinkingConfig: { includeThoughts: false, thinkingLevel: "LOW" } },
+        messages: [{ content: "hello", role: "user" }],
+        model: "gemini-3.8-flash",
+        reasoning_effort: "medium",
+    });
+    assert.deepEqual(chat.googleRequest.generationConfig.thinkingConfig, {
+        includeThoughts: false,
+        thinkingLevel: "MEDIUM",
+    });
+});
+
+test("the HIGH default is limited to Gemini 3.8 Flash and unsupported levels fail clearly", async () => {
+    const other = await converter.translateOpenAIResponseToGoogle({ input: "hello", model: "gemini-3.6-flash" });
+    assert.equal(other.googleRequest.generationConfig.thinkingConfig, undefined);
+
+    await assert.rejects(
+        converter.translateOpenAIResponseToGoogle({
+            input: "hello",
+            model: "gemini-3.8-flash",
+            reasoning: { effort: "minimal" },
+        }),
+        /does not support thinking level MINIMAL/
+    );
+    await assert.rejects(
+        converter.translateOpenAIResponseToGoogle({
+            input: "hello",
+            model: "gemini-3.8-flash",
+            reasoning: { effort: "none" },
+        }),
+        /Unsupported reasoning effort: none/
+    );
+});
+
+test("native Gemini requests use the same default and preserve explicit settings", () => {
+    const config = { safetySettingsThreshold: "OFF", streamingMode: "real" };
+    const handler = new RequestHandler({ config }, {}, logger, {}, config, {});
+    const build = (model, thinkingConfig) => {
+        const body = { contents: [{ parts: [{ text: "hello" }], role: "user" }] };
+        if (thinkingConfig) body.generationConfig = { thinkingConfig };
+        const request = handler._buildProxyRequest(
+            {
+                body,
+                headers: {},
+                method: "POST",
+                path: `/v1beta/models/${model}:generateContent`,
+            },
+            "test-request"
+        );
+        return { body: JSON.parse(request.body), path: request.path };
+    };
+
+    assert.equal(build("gemini-3.8-flash").body.generationConfig.thinkingConfig.thinkingLevel, "HIGH");
+    const explicit = build("gemini-3.8-flash", { includeThoughts: false, thinkingLevel: "MEDIUM" });
+    assert.deepEqual(explicit.body.generationConfig.thinkingConfig, {
+        includeThoughts: false,
+        thinkingLevel: "MEDIUM",
+    });
+    const suffix = build("gemini-3.8-flash(low)", { thinkingLevel: "MEDIUM" });
+    assert.equal(suffix.path, "/v1beta/models/gemini-3.8-flash:generateContent");
+    assert.equal(suffix.body.generationConfig.thinkingConfig.thinkingLevel, "LOW");
 });

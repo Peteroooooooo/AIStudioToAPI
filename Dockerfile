@@ -95,7 +95,7 @@ ENV NODE_ENV=production \
 
 # Health check for container orchestration platforms
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD node -e "const port = process.env.PORT || 7860; require('http').get('http://localhost:' + port + '/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)}).on('error', () => process.exit(1));" || exit 1
+    CMD node -e "const fs=require('fs'); let port=Number(process.env.PORT)||7860; try { const saved=JSON.parse(fs.readFileSync('/app/data/config.json','utf8')); port=saved.startup?.httpPort||port; } catch {} require('http').get('http://127.0.0.1:'+port+'/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1));" || exit 1
 
 # Start the application server
 CMD ["node", "main.js"]

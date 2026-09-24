@@ -14,6 +14,7 @@ class LoggingService {
     static LEVELS = { DEBUG: 0, ERROR: 3, INFO: 1, WARN: 2 };
     static currentLevel =
         process.env.LOG_LEVEL?.toUpperCase() === "DEBUG" ? LoggingService.LEVELS.DEBUG : LoggingService.LEVELS.INFO;
+    static timezone = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
 
     /**
      * Set the global log level
@@ -24,6 +25,10 @@ class LoggingService {
         if (LoggingService.LEVELS[upperLevel] !== undefined) {
             LoggingService.currentLevel = LoggingService.LEVELS[upperLevel];
         }
+    }
+
+    static setTimezone(timezone) {
+        if (typeof timezone === "string" && timezone) LoggingService.timezone = timezone;
     }
 
     /**
@@ -69,7 +74,7 @@ class LoggingService {
      */
     _getTimestamp() {
         const now = new Date();
-        const timezone = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+        const timezone = LoggingService.timezone;
 
         try {
             // Format: YYYY-MM-DD HH:mm:ss.SSS [Timezone]
