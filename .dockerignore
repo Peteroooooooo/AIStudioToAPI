@@ -16,6 +16,15 @@ yarn-error.log*
 .env.*
 !.env.example
 
+# Local authentication and runtime data must stay out of build contexts
+configs/auth
+auth-*.json
+aistudio-auth-*.json
+users.csv
+data
+cache
+logs
+
 # IDE and editor files
 .vscode
 .idea

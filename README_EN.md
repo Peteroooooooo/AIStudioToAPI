@@ -2,7 +2,7 @@
 
 [中文文档](README.md) | English
 
-> This `stable` branch is Peter's independently maintained fork, based on upstream v1.3.5 plus the format conversion patch already used on Cubie. It adds account cooldown, repeated 401 quarantine, manual recovery, and an arm64 image. Repository updates do not replace the running container. See the [fork operations guide](docs/zh/fork-operations.md).
+> This `stable` branch is Peter's independently maintained fork, based on upstream v1.3.5 plus a format conversion patch. It adds account cooldown, repeated 401 quarantine, manual recovery, and an arm64 image. Repository updates do not replace the running container. See the [fork operations guide](docs/zh/fork-operations.md).
 
 A tool that wraps the Google AI Studio Build App web interface to provide OpenAI API, Gemini API, and Anthropic API compatible endpoints. The service acts as a proxy, converting API requests into browser interactions with the AI Studio Build App interface.
 
@@ -44,6 +44,8 @@ A tool that wraps the Google AI Studio Build App web interface to provide OpenAI
 3. Configure Environment Variables (Optional):
 
    Copy `.env.example` in the root directory to `.env`, and modify settings in `.env` as needed (e.g., port, API Key).
+
+   If the service is reachable from the internet, set your own `API_KEYS` and console password. Do not use the default key `123456`.
 
 4. Start the service:
 
@@ -165,6 +167,7 @@ After deployment, you need to add Google accounts using one of these methods:
 **Method 2: Upload Auth Files**
 
 - Run `npm run setup-auth` on your local machine to generate auth files (refer to steps 1 and 2 of [Run Directly](#-run-directly-windows--macos--linux)), the auth files are in `/configs/auth`
+- If you are already signed in to AI Studio in Chrome, use the [local export extension](tools/chrome-auth-sync/README.md) in that Chrome profile to download a JSON file without signing in again.
 - In the web console, click "Upload Auth" to upload the auth JSON file, or manually upload to the mounted `/path/to/auth` directory
 
 > 💡 **Tip**: You can also download auth files from an existing container and upload them to a new container. Click the "Download Auth" button for the corresponding account in the web console to download the auth file.
