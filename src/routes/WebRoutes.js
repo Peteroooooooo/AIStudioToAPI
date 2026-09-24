@@ -7,7 +7,6 @@
 
 const session = require("express-session");
 const cookieParser = require("cookie-parser");
-const crypto = require("crypto");
 const path = require("path");
 const AuthRoutes = require("./AuthRoutes");
 const StatusRoutes = require("./StatusRoutes");
@@ -34,9 +33,6 @@ class WebRoutes {
      * Configure session and login related middleware
      */
     setupSession(app) {
-        // Generate a secure random session secret
-        const sessionSecret = crypto.randomBytes(32).toString("hex");
-
         // Trust first proxy (Nginx) for secure cookies and IP forwarding
         app.set("trust proxy", 1);
 
@@ -50,11 +46,11 @@ class WebRoutes {
                 sameSite: "lax",
                 // This allows HTTP access in production if HTTPS is not configured
                 // Set SECURE_COOKIES=true when using HTTPS/SSL
-                secure: process.env.SECURE_COOKIES?.toLowerCase() === "true",
+                secure: this.serverSystem.config.secureCookies,
             },
             resave: false,
             saveUninitialized: false,
-            secret: sessionSecret,
+            secret: this.serverSystem.config.sessionSecret,
         });
         app.use(this.sessionParser);
 

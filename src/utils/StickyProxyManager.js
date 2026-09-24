@@ -12,7 +12,7 @@
 const fs = require("fs");
 const path = require("path");
 
-const { getProxyBypassFromEnv } = require("./ProxyUtils");
+const { getProxyBypass } = require("./ProxyUtils");
 
 class StickyProxyManager {
     constructor(logger, authSource, options = {}) {
@@ -20,9 +20,7 @@ class StickyProxyManager {
         this.authSource = authSource;
         this.proxyFilePath = options.proxyFilePath || path.join(process.cwd(), "proxylist.txt");
         this.mappingFilePath = options.mappingFilePath || path.join(process.cwd(), "proxy_mapping.json");
-        this.proxyBypass = Object.prototype.hasOwnProperty.call(options, "proxyBypass")
-            ? options.proxyBypass
-            : getProxyBypassFromEnv();
+        this.proxyBypass = getProxyBypass(options.proxyBypass);
         this._lastEnabledLogState = null;
         this._lastLoadedProxyCount = null;
         this._loggedBypass = false;

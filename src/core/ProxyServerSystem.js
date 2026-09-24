@@ -22,6 +22,7 @@ const ConnectionRegistry = require("./ConnectionRegistry");
 const RequestHandler = require("./RequestHandler");
 const UsageStatsService = require("./UsageStatsService");
 const ConfigLoader = require("../utils/ConfigLoader");
+const { RuntimeConfigStore } = require("../utils/RuntimeConfigStore");
 const WebRoutes = require("../routes/WebRoutes");
 
 /**
@@ -35,6 +36,38 @@ class ProxyServerSystem extends EventEmitter {
 
         const configLoader = new ConfigLoader(this.logger);
         this.config = configLoader.loadConfiguration();
+
+        this.runtimeConfig = new RuntimeConfigStore(
+            this.config,
+            this.logger,
+            path.join(process.cwd(), "data"),
+            changed => {
+                if (changed.includes("logLevel")) {
+                    LoggingService.setLevel(this.config.logLevel);
+                    this.browserLogSyncCount = this.requestHandler?.setBrowserLogLevel(this.config.logLevel) || 0;
+                }
+                if (!changed.includes("maxContexts")) return;
+                this._runtimeRebalanceGeneration = (this._runtimeRebalanceGeneration || 0) + 1;
+                if (this._runtimeRebalancePending) return;
+                this._runtimeRebalancePending = true;
+                setImmediate(async () => {
+                    try {
+                        while (this.browserManager?.browser) {
+                            const generation = this._runtimeRebalanceGeneration;
+                            await this.browserManager.abortBackgroundPreload();
+                            await this.browserManager.rebalanceContextPool();
+                            if (generation === this._runtimeRebalanceGeneration) break;
+                        }
+                    } catch (error) {
+                        this.logger.error(`[Config] Could not rebalance context pool: ${error.message}`);
+                    } finally {
+                        this._runtimeRebalancePending = false;
+                    }
+                });
+            }
+        );
+        LoggingService.setLevel(this.config.logLevel);
+        configLoader._printConfiguration(this.config);
 
         this.authSource = new AuthSource(this.logger);
         this.browserManager = new BrowserManager(this.logger, this.config, this.authSource);
@@ -221,7 +254,8 @@ class ProxyServerSystem extends EventEmitter {
 
             const serverApiKeys = this.config.apiKeys;
             if (!serverApiKeys || serverApiKeys.length === 0) {
-                return next();
+                this.logger.error("[Auth] No API keys configured; denying request.");
+                return res.status(503).json({ error: { message: "API authentication is not configured." } });
             }
 
             let clientKey = null;
@@ -632,6 +666,7 @@ class ProxyServerSystem extends EventEmitter {
      */
     async shutdown() {
         this.logger.info("[System] Shutting down server system...");
+        this.runtimeConfig?.close();
 
         // Clear stale queue cleanup interval
         if (this.staleQueueCleanupInterval) {

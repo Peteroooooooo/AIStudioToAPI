@@ -14,6 +14,7 @@ const CreateAuth = require("../auth/CreateAuth");
 class AuthRoutes {
     constructor(serverSystem) {
         this.serverSystem = serverSystem;
+        this.config = serverSystem.config;
         this.logger = serverSystem.logger;
         this.distIndexPath = serverSystem.distIndexPath;
         this.loginAttempts = new Map(); // Track login attempts for rate limiting
@@ -21,14 +22,10 @@ class AuthRoutes {
         // Initialize auth creation handler
         this.createAuth = new CreateAuth(serverSystem);
 
-        // Rate limiting configuration from environment variables
-        this.rateLimitEnabled = process.env.RATE_LIMIT_MAX_ATTEMPTS !== "0";
-
-        const parsedWindow = parseInt(process.env.RATE_LIMIT_WINDOW_MINUTES, 10);
-        this.rateLimitWindow = Number.isFinite(parsedWindow) && parsedWindow > 0 ? parsedWindow : 15; // minutes
-
-        const parsedMaxAttempts = parseInt(process.env.RATE_LIMIT_MAX_ATTEMPTS, 10);
-        this.rateLimitMaxAttempts = Number.isFinite(parsedMaxAttempts) && parsedMaxAttempts > 0 ? parsedMaxAttempts : 5;
+        // Startup settings come from the persisted config file.
+        this.rateLimitEnabled = this.config.rateLimitMaxAttempts !== 0;
+        this.rateLimitWindow = this.config.rateLimitWindowMinutes;
+        this.rateLimitMaxAttempts = this.config.rateLimitMaxAttempts || 5;
 
         if (this.rateLimitEnabled) {
             this.logger.info(
@@ -130,8 +127,8 @@ class AuthRoutes {
         // Config endpoint to tell the frontend what login fields to display
         app.get("/api/auth/config", (req, res) => {
             // Require username only if both username and password are set
-            const requireUsername = !!process.env.WEB_CONSOLE_USERNAME && !!process.env.WEB_CONSOLE_PASSWORD;
-            const requirePassword = !!process.env.WEB_CONSOLE_PASSWORD;
+            const requireUsername = !!this.config.webConsoleUsername && !!this.config.webConsolePassword;
+            const requirePassword = !!this.config.webConsolePassword;
             res.json({ requirePassword, requireUsername });
         });
 
@@ -164,8 +161,8 @@ class AuthRoutes {
             const { apiKey, username, password } = req.body;
             let authSuccess = false;
             const submittedPassword = password || apiKey;
-            const expectedUsername = process.env.WEB_CONSOLE_USERNAME;
-            const expectedPassword = process.env.WEB_CONSOLE_PASSWORD;
+            const expectedUsername = this.config.webConsoleUsername;
+            const expectedPassword = this.config.webConsolePassword;
 
             if (expectedUsername && expectedPassword) {
                 if (username === expectedUsername && submittedPassword === expectedPassword) {

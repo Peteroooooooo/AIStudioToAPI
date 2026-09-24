@@ -11,6 +11,10 @@ camoufox/
 
 # Temporary files
 tmp/
+temp/
+
+# Generated runtime data
+data/
 
 # Config files
 configs/
