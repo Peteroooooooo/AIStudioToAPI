@@ -12,8 +12,7 @@ yarn-error.log*
 .yarn
 
 # Environment files
-.env
-.env.*
+.env*
 !.env.example
 
 # Local authentication and runtime data must stay out of build contexts
