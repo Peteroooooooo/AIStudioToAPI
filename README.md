@@ -167,7 +167,7 @@ services:
 **方法 2：上传认证文件**
 
 - 在本地机器上运行 `npm run setup-auth` 生成认证文件（参考 [直接运行](#-直接运行windows--macos--linux) 的 1 和 2），认证文件在 `/configs/auth`
-- 如果已经在 Chrome 中登录 AI Studio，也可以使用 [本地导出扩展](tools/chrome-auth-sync/README.md)，从对应的 Chrome Profile 导出 JSON，无需重新登录。
+- 如果已经在 Chrome 中登录 AI Studio，也可以使用独立的 [AI Studio Auth Exporter 扩展](https://github.com/Peteroooooooo/AIStudio-Auth-Exporter)，从对应的 Chrome Profile 导出 JSON，无需重新登录。
 - 在网页控制台，点击「上传 Auth」，上传 auth 的 JSON 文件，或手动上传到挂载的 `/path/to/auth` 目录
 
 > 💡 **提示**：您也可以从已有的容器下载 auth 文件，然后上传到新的容器。在网页控制台点击对应账号的「下载 Auth」按钮即可下载 auth 文件。
