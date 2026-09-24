@@ -1,0 +1,17 @@
+{
+    "action": {
+        "default_popup": "popup.html",
+        "default_title": "Export AI Studio account"
+    },
+    "description": "Export the signed-in AI Studio tab's browser state as a local JSON file.",
+    "host_permissions": [
+        "https://google.com/*",
+        "https://aistudio.google.com/*",
+        "https://ai.studio/*",
+        "https://accounts.google.com/*"
+    ],
+    "manifest_version": 3,
+    "name": "AI Studio Auth Export",
+    "permissions": ["cookies", "scripting"],
+    "version": "0.1.0"
+}

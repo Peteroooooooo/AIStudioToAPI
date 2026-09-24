@@ -2,7 +2,7 @@
 
 中文文档 | [English](README_EN.md)
 
-> 本分支是 Peter 的独立维护版，基于上游 v1.3.5 和已在 Cubie 使用的格式转换补丁。新增账号自动冷却、重复 401 隔离、手动恢复和独立的 arm64 镜像。运行中的旧容器不会因仓库更新而自动替换。部署细节见 [独立版运维说明](docs/zh/fork-operations.md)。
+> 本分支是 Peter 的独立维护版，基于上游 v1.3.5 和格式转换补丁。新增账号自动冷却、重复 401 隔离、手动恢复和独立的 arm64 镜像。仓库更新不会自动替换运行中的容器。部署细节见 [独立版运维说明](docs/zh/fork-operations.md)。
 
 一个将 Google AI Studio Build App 网页端封装为兼容 OpenAI API、Gemini API 和 Anthropic API 的工具。该服务将充当代理，将 API 请求转换为与 AI Studio Build App 应用界面的浏览器交互。
 
@@ -44,6 +44,8 @@
 3. 配置环境变量（可选）：
 
    复制根目录下的 `.env.example` 为 `.env`，并在 `.env` 中按需修改配置（如端口、API 密钥等）。
+
+   如果服务可从公网访问，请设置自己的 `API_KEYS` 和控制台密码，不要使用默认密钥 `123456`。
 
 4. 启动服务：
 
@@ -165,6 +167,7 @@ services:
 **方法 2：上传认证文件**
 
 - 在本地机器上运行 `npm run setup-auth` 生成认证文件（参考 [直接运行](#-直接运行windows--macos--linux) 的 1 和 2），认证文件在 `/configs/auth`
+- 如果已经在 Chrome 中登录 AI Studio，也可以使用 [本地导出扩展](tools/chrome-auth-sync/README.md)，从对应的 Chrome Profile 导出 JSON，无需重新登录。
 - 在网页控制台，点击「上传 Auth」，上传 auth 的 JSON 文件，或手动上传到挂载的 `/path/to/auth` 目录
 
 > 💡 **提示**：您也可以从已有的容器下载 auth 文件，然后上传到新的容器。在网页控制台点击对应账号的「下载 Auth」按钮即可下载 auth 文件。

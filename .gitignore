@@ -5,11 +5,8 @@
 .claude/
 
 # Environment variables (keep .env.example)
-.env
-.env.local
-.env.*.local
-.env.development
-.env.production
+.env*
+!.env.example
 
 # Node.js dependencies
 node_modules/
@@ -23,6 +20,7 @@ camoufox*.zip
 # Authentication files
 configs/auth/
 auth-*.json
+aistudio-auth-*.json
 users.csv
 cache/
 

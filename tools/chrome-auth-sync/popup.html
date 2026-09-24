@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>AI Studio 账号导出</title>
+        <style>
+            body {
+                width: 340px;
+                margin: 0;
+                padding: 18px;
+                font:
+                    14px/1.5 system-ui,
+                    sans-serif;
+                color: #202124;
+            }
+            h1 {
+                margin: 0 0 10px;
+                font-size: 18px;
+            }
+            p {
+                margin: 0 0 14px;
+                color: #5f6368;
+            }
+            button {
+                width: 100%;
+                padding: 10px;
+                border: 0;
+                border-radius: 6px;
+                background: #1a73e8;
+                color: white;
+                font: inherit;
+                cursor: pointer;
+            }
+            button:disabled {
+                opacity: 0.55;
+                cursor: wait;
+            }
+            #status {
+                min-height: 42px;
+                margin-top: 12px;
+                white-space: pre-wrap;
+                overflow-wrap: anywhere;
+            }
+            #status.error {
+                color: #b3261e;
+            }
+            #status.success {
+                color: #137333;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>AI Studio 账号导出</h1>
+        <p>读取当前标签所在 Chrome Profile 的 AI Studio 登录状态。</p>
+        <button id="export" type="button">从当前标签导出 JSON</button>
+        <div id="status" role="status" aria-live="polite"></div>
+        <script type="module" src="popup.mjs"></script>
+    </body>
+</html>
