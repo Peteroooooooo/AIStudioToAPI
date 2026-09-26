@@ -271,6 +271,25 @@ class ConnectionRegistry extends EventEmitter {
                     return;
                 }
                 parsedMessage.authIndex = entry.authIndex;
+                if (parsedMessage.event_type === "chunk") {
+                    this.emit("backendChunk", {
+                        data: parsedMessage.data,
+                        requestAttemptId: parsedMessage.request_attempt_id,
+                        requestId,
+                    });
+                } else if (
+                    parsedMessage.event_type === "response_headers" ||
+                    parsedMessage.event_type === "error" ||
+                    parsedMessage.event_type === "stream_close"
+                ) {
+                    this.emit("backendAttemptEvent", {
+                        authIndex: entry.authIndex,
+                        eventType: parsedMessage.event_type,
+                        requestAttemptId: entry.requestAttemptId,
+                        requestId,
+                        statusCode: parsedMessage.status,
+                    });
+                }
                 // The queue owns the source account. Record outcomes here before a concurrent
                 // switch can change the global currentAuthIndex.
                 const status = Number(parsedMessage.status);
@@ -283,6 +302,7 @@ class ConnectionRegistry extends EventEmitter {
                         entry.backendFailureReported = true;
                         this.emit("backendOutcome", {
                             authIndex: entry.authIndex,
+                            requestAttemptId: entry.requestAttemptId,
                             requestId,
                             status: Number.isFinite(status) ? status : 500,
                             success: false,
@@ -291,6 +311,7 @@ class ConnectionRegistry extends EventEmitter {
                 } else if (parsedMessage.event_type === "stream_close" && !entry.backendFailed) {
                     this.emit("backendOutcome", {
                         authIndex: entry.authIndex,
+                        requestAttemptId: entry.requestAttemptId,
                         requestId,
                         success: true,
                     });

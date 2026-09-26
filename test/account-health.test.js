@@ -98,3 +98,23 @@ test("backend outcome belongs to its queue account and stale responses are ignor
     assert.equal(health.isAvailable(1), false);
     assert.equal(health.isAvailable(2), true);
 });
+
+test("token chunks from a stale or wrong-account attempt are discarded", () => {
+    const registry = new ConnectionRegistry(logger);
+    const chunks = [];
+    registry.on("backendChunk", chunk => chunks.push(chunk));
+    registry.createMessageQueue("request-token", 1, "attempt-2");
+    const message = {
+        data: 'data: {"usageMetadata":{"totalTokenCount":7}}\n\n',
+        event_type: "chunk",
+        request_attempt_id: "attempt-2",
+        request_id: "request-token",
+    };
+    registry._handleIncomingMessage(JSON.stringify(message), 2);
+    registry._handleIncomingMessage(JSON.stringify({ ...message, request_attempt_id: "attempt-1" }), 1);
+    assert.equal(chunks.length, 0);
+    registry._handleIncomingMessage(JSON.stringify(message), 1);
+    assert.equal(chunks.length, 1);
+    assert.equal(chunks[0].requestAttemptId, "attempt-2");
+    registry.removeMessageQueue("request-token");
+});

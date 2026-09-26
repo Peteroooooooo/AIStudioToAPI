@@ -63,15 +63,27 @@
 
 ### 本地联调
 
-1. 将有效的认证文件放在 `configs/auth/auth-0.json` 等位置。首次运行前可在 `.env.development` 中设置本地 `API_KEYS` 和 `WEB_CONSOLE_PASSWORD`；服务生成 `data/config.json` 后，后续修改请编辑该配置文件。这些路径已被 `.gitignore` 排除。
+1. 将有效的认证文件放在 `configs/auth/auth-0.json` 等位置。首次运行会生成 `data/config.json`；本地 API 密钥、控制台密码和端口以该文件中的 `startup` 为准。这些路径已被 `.gitignore` 排除。
 2. 运行 `npm run dev`，在 `http://127.0.0.1:7860` 检查页面。后端源码和前端页面修改后会自动重新加载，无需部署 Docker。
 3. 确认 `http://127.0.0.1:7860/health/ready` 返回 `ready: true`，再运行 `npm run smoke:local` 验证真实 API 输出。默认检查 `gemini-3.8-flash`；Responses 接口示例：`npm run smoke:local -- --responses --effort medium`。
+
+控制台“用量”页会从上游响应的 `usageMetadata` 记录每条请求的输入、输出、思考、总 Token，以及上游报告的缓存输入 Token。请求重试时，每次上游尝试单独记录实际使用的账号和 Token；请求总量汇总各次尝试，账号用量归到实际发出该次尝试的账号。按时间、模型、账号、API 密钥、接口格式、状态码、缓存状态和耗时筛选时，汇总、排行、趋势与明细采用同一筛选条件。页面提供可暂停的 30 秒自动刷新，后台标签页暂停轮询。API 密钥只保存稳定的 HMAC 标识，不保存明文。
+
+上游未报告的 Token 字段显示为“–”，与真实的 0 分开；中断、重试缺少部分用量时会标注为部分上报。旧统计记录无法补算，旧版多账号重试记录的 Token 无法可靠归属某个账号，会列为未归属。本项目没有自行缓存模型回答；“缓存命中”只表示上游明确报告了缓存输入 Token，浏览器上下文复用不算命中。请求记录保存在 `data/usage-stats.jsonl`。
+
+### Gemini 显式缓存
+
+本分支会在成功回答后，后台为足够长的固定系统提示／工具定义和对话历史创建 Gemini `cachedContents`。客户端仍发送完整历史；服务按账号、模型和内容寻找最长相同前缀，仅把新增消息转发给 Gemini。多个新 session 如使用相同系统提示，可以共享固定前缀；旧 session 中途被其他 session 打断后，也能在缓存有效期内继续命中自己的历史前缀。缓存失效时会删除本地映射并用原请求重试一次。
+
+缓存有效期、临近过期续期窗口、最小 Token、历史检查点间隔与资源数量可在设置页热更新。缓存索引位于 `data/gemini-cache-index.json`，只保存请求前缀哈希、资源名和时间，不保存提示词明文；该文件随 `/app/data` 持久化。缓存资源属于创建它的 Google 账号，账号不可用时会按正常路由发送完整请求。Gemini 上游在 `usageMetadata.cachedContentTokenCount` 报告实际命中 Token，Responses 与 Claude 接口也会转出各自的缓存输入字段。
+
+本地真实请求验证：`node scripts/dev/cacheE2eLocal.js` 测 Gemini 多轮及 A→B→A，`node scripts/dev/cacheProtocolLocal.js` 测 Responses 和 Claude 协议，`node scripts/dev/cacheSystemOnlyProbe.js` 测新 session 的共享系统提示。脚本从已忽略的 `data/config.json` 读取密钥，不打印密钥或提示词。运行前确认 `/health/ready` 可用；这些测试会向 Gemini 发送真实请求并建立短期缓存。
 
 推送 `stable` 分支会触发 GitHub Actions 测试；推送 `v*.*.*` 标签才会发布 arm64 镜像。随后在 Portainer 中把镜像标签改为新版本并更新 Stack。
 
 ### 网页热更新配置
 
-控制台“设置”页可修改浏览器上下文上限、请求总尝试次数、账号失败和使用次数阈值、重试间隔与请求超时。保存后运行中的服务立即采用新值，并写入 `data/config.json`；直接编辑该文件保存后也会重新加载支持热更新的字段。页面会显示当前值与首次导入时的基准值。运行在 Docker 中时需持久挂载 `/app/data`。启动项与参数语义见 [独立版运维说明](docs/zh/fork-operations.md#运行参数热更新)。
+控制台按“总览、账号、用量、设置、日志”组织。设置页集中修改浏览器上下文上限、请求总尝试次数、账号轮转阈值、超时和模型能力开关；点击“保存并应用”后写入 `data/config.json`。直接编辑该文件也会热加载支持的字段。上下文池容量变更需要后台重平衡，页面会显示当前已初始化数量。启动项仅显示脱敏摘要，修改后需重启；“日志显示条数”只对当前进程生效。运行在 Docker 中时需持久挂载 `/app/data`。启动项与参数语义见 [独立版运维说明](docs/zh/fork-operations.md#运行参数热更新)。
 
 服务启动后，您可以在浏览器中访问 `http://localhost:7860` 打开 Web 控制台主页，在这里可以查看账号状态和服务状态。
 请求统计数据会持久化保存到 `/data/usage-stats.jsonl`。
@@ -103,7 +115,7 @@ docker run -d \
   -e API_KEYS=your-api-key-1,your-api-key-2 \
   -e TZ=Asia/Shanghai \
   --restart unless-stopped \
-  ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.4
+  ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.5
 ```
 
 参数说明：
@@ -123,7 +135,7 @@ name: aistudio-to-api
 
 services:
   app:
-    image: ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.4
+    image: ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.5
     container_name: aistudio-to-api
     ports:
       # API 服务器端口（如果使用反向代理，强烈建议改成 127.0.0.1:7860）
@@ -280,14 +292,14 @@ services:
 | :------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------ | :-------- |
 | `INITIAL_AUTH_INDEX`            | 启动时使用的初始身份验证索引。                                                                                                                                      | `0`       |
 | `ENABLE_AUTH_UPDATE`            | 是否启用自动保存凭证更新。默认为启用状态，将在每次登录/切换账号成功时以及每 24 小时自动更新 auth 文件。设为 `false` 禁用。                                          | `true`    |
-| `MAX_RETRIES`                   | 请求失败后的最大重试次数（仅对假流式和非流式生效）。                                                                                                                | `3`       |
+| `MAX_RETRIES`                   | 单次客户端请求的总上游尝试次数，包含首次调用；例如 `3` 表示最多尝试三次。                                                                                           | `3`       |
 | `RETRY_DELAY`                   | 两次重试之间的间隔（毫秒）。                                                                                                                                        | `2000`    |
 | `STREAM_TIMEOUT_MS`             | 真流式响应相邻数据块之间的超时时间（毫秒），最大 `300000`。                                                                                                         | `60000`   |
 | `FAKE_STREAM_TIMEOUT_MS`        | 假流式/非流式缓冲响应的超时时间（毫秒），最大 `300000`。                                                                                                            | `300000`  |
-| `SWITCH_ON_USES`                | 自动切换帐户前允许的请求次数（设为 `0` 禁用）。                                                                                                                     | `40`      |
-| `FAILURE_THRESHOLD`             | 切换帐户前允许的连续失败次数（设为 `0` 禁用）。                                                                                                                     | `3`       |
+| `SWITCH_ON_USES`                | 自动切换帐户前允许的请求次数（设为 `0` 禁用）。                                                                                                                     | `50`      |
+| `FAILURE_THRESHOLD`             | 切换帐户前允许的连续失败次数（设为 `0` 禁用）。                                                                                                                     | `2`       |
 | `IMMEDIATE_SWITCH_STATUS_CODES` | 触发立即切换帐户的 HTTP 状态码（逗号分隔，设为空值以禁用）。                                                                                                        | `429,503` |
-| `MAX_CONTEXTS`                  | 最大同时登录的账号数量。同时登录的账号切换更快，无需重新登录。数值越大内存消耗越高（约：1 个账号 ~700MB，2 个账号 ~950MB，3 个账号 ~1100MB）。设为 `0` 表示无限制。 | `1`       |
+| `MAX_CONTEXTS`                  | 最大同时登录的账号数量。同时登录的账号切换更快，无需重新登录。数值越大内存消耗越高（约：1 个账号 ~700MB，2 个账号 ~950MB，3 个账号 ~1100MB）。设为 `0` 表示无限制。 | `2`       |
 | `HTTP_PROXY`                    | 用于访问 Google 服务的 HTTP 代理地址。                                                                                                                              | 无        |
 | `HTTPS_PROXY`                   | 用于访问 Google 服务的 HTTPS 代理地址。                                                                                                                             | 无        |
 | `NO_PROXY`                      | 不经过代理的地址列表（逗号分隔）。项目已内置自动绕过本地地址（localhost, 127.0.0.1, ::, ::1, 0.0.0.0），通常无需手动配置本地绕过。                                  | 无        |

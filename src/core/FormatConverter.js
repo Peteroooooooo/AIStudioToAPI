@@ -1843,7 +1843,7 @@ class FormatConverter {
                 const responseUsage = {
                     input_tokens: usage.prompt_tokens,
                     input_tokens_details: {
-                        cached_tokens: 0,
+                        cached_tokens: usage.prompt_tokens_details?.cached_tokens || 0,
                     },
                     output_tokens: usage.completion_tokens,
                     output_tokens_details: {
@@ -2173,7 +2173,7 @@ class FormatConverter {
             usage: {
                 input_tokens: usage.prompt_tokens,
                 input_tokens_details: {
-                    cached_tokens: 0,
+                    cached_tokens: usage.prompt_tokens_details?.cached_tokens || 0,
                 },
                 output_tokens: usage.completion_tokens,
                 output_tokens_details: {
@@ -2215,6 +2215,7 @@ class FormatConverter {
 
         const completionTextTokens = usage.candidatesTokenCount || 0;
         const reasoningTokens = usage.thoughtsTokenCount || 0;
+        const cachedInputTokens = usage.cachedContentTokenCount || 0;
         let completionImageTokens = 0;
 
         if (Array.isArray(usage.candidatesTokensDetails)) {
@@ -2238,6 +2239,7 @@ class FormatConverter {
             },
             prompt_tokens: promptTokens,
             prompt_tokens_details: {
+                cached_tokens: cachedInputTokens,
                 text_tokens: inputTokens,
                 tool_tokens: toolPromptTokens,
             },
@@ -2780,6 +2782,18 @@ class FormatConverter {
         return { cleanModelName, googleRequest, modelStreamingMode };
     }
 
+    /** Convert Gemini usage to Anthropic's uncached input and cache-read counters. */
+    _parseClaudeUsage(usage = {}) {
+        const totalInputTokens = (usage.promptTokenCount || 0) + (usage.toolUsePromptTokenCount || 0);
+        const cachedInputTokens = Math.min(usage.cachedContentTokenCount || 0, totalInputTokens);
+        return {
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: cachedInputTokens,
+            input_tokens: totalInputTokens - cachedInputTokens,
+            output_tokens: (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0),
+        };
+    }
+
     /**
      * Convert Google streaming response chunk to Claude format
      * @param {string} googleChunk - The Google response chunk
@@ -2820,11 +2834,12 @@ class FormatConverter {
 
         // Update stream state with usage if available
         if (usage) {
-            const inputTokens = (usage.promptTokenCount || 0) + (usage.toolUsePromptTokenCount || 0);
-            const outputTokens = (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0);
-
-            if (inputTokens > 0) streamState.inputTokens = inputTokens;
-            streamState.outputTokens = outputTokens;
+            const claudeUsage = this._parseClaudeUsage(usage);
+            if (claudeUsage.input_tokens + claudeUsage.cache_read_input_tokens > 0) {
+                streamState.inputTokens = claudeUsage.input_tokens;
+                streamState.cachedInputTokens = claudeUsage.cache_read_input_tokens;
+            }
+            streamState.outputTokens = claudeUsage.output_tokens;
         }
 
         // Initialize stream state
@@ -2860,6 +2875,8 @@ class FormatConverter {
                     stop_sequence: null,
                     type: "message",
                     usage: {
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: streamState.cachedInputTokens || 0,
                         input_tokens: streamState.inputTokens || 0,
                         output_tokens: 0,
                     },
@@ -3008,6 +3025,9 @@ class FormatConverter {
                 },
                 type: "message_delta",
                 usage: {
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: streamState.cachedInputTokens || 0,
+                    input_tokens: streamState.inputTokens || 0,
                     output_tokens: streamState.outputTokens || 0,
                 },
             });
@@ -3038,6 +3058,7 @@ class FormatConverter {
 
         const candidate = googleResponse.candidates?.[0];
         const usage = googleResponse.usageMetadata || {};
+        const claudeUsage = this._parseClaudeUsage(usage);
 
         const messageId = `msg_${this._generateRequestId()}`;
         const content = [];
@@ -3051,11 +3072,7 @@ class FormatConverter {
                 stop_reason: "end_turn",
                 stop_sequence: null,
                 type: "message",
-                usage: {
-                    input_tokens: (usage.promptTokenCount || 0) + (usage.toolUsePromptTokenCount || 0),
-                    // Match OpenAI logic: sum candidates tokens + thoughts tokens
-                    output_tokens: (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0),
-                },
+                usage: claudeUsage,
             };
         }
 
@@ -3111,11 +3128,7 @@ class FormatConverter {
             stop_reason: stopReason,
             stop_sequence: null,
             type: "message",
-            usage: {
-                input_tokens: (usage.promptTokenCount || 0) + (usage.toolUsePromptTokenCount || 0),
-                // Match OpenAI logic: sum candidates tokens + thoughts tokens
-                output_tokens: (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0),
-            },
+            usage: claudeUsage,
         };
     }
 

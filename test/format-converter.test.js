@@ -7,6 +7,24 @@ const RequestHandler = require("../src/core/RequestHandler");
 const logger = { debug() {}, error() {}, info() {}, warn() {} };
 const converter = new FormatConverter(logger, { config: {} });
 
+test("Responses usage forwards upstream cached input tokens", () => {
+    const converted = converter.convertGoogleToResponseAPINonStream(
+        {
+            candidates: [{ content: { parts: [{ text: "ok" }], role: "model" }, finishReason: "STOP" }],
+            usageMetadata: {
+                cachedContentTokenCount: 8,
+                candidatesTokenCount: 2,
+                promptTokenCount: 12,
+                totalTokenCount: 14,
+            },
+        },
+        "gemini-test"
+    );
+    assert.equal(converted.usage.input_tokens, 12);
+    assert.equal(converted.usage.input_tokens_details.cached_tokens, 8);
+    assert.equal(converted.usage.total_tokens, 14);
+});
+
 test("tool schemas omit unsupported JSON Schema keywords while preserving property names", () => {
     const schema = converter._convertSchemaToGemini({
         allOf: [

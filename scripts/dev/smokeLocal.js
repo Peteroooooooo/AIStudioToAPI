@@ -1,9 +1,11 @@
 /**
  * A small end-to-end check against a locally running development server.
- * Reads the API key from the ignored .env.development file; never prints it.
+ * Reads the API key and port from the ignored data/config.json file; never prints the key.
  */
+const fs = require("fs");
 const path = require("path");
-require("dotenv").config({ path: path.resolve(__dirname, "../../.env.development") });
+const configPath = path.resolve(__dirname, "../../data/config.json");
+const startup = JSON.parse(fs.readFileSync(configPath, "utf8")).startup;
 
 const args = process.argv.slice(2);
 const option = name => {
@@ -13,13 +15,13 @@ const option = name => {
 const model = option("--model") || "gemini-3.8-flash";
 const effort = option("--effort");
 const useResponses = args.includes("--responses");
-const port = Number(process.env.PORT || 7860);
+const port = startup.httpPort;
 const baseUrl = `http://127.0.0.1:${port}`;
-const apiKey = process.env.API_KEYS?.split(",")[0]?.trim();
+const apiKey = startup.apiKeys?.[0]?.trim();
 const timeoutMs = Number(process.env.SMOKE_TIMEOUT_MS || 130000);
 
 if (!apiKey || !Number.isInteger(port) || port < 1 || port > 65535 || !Number.isFinite(timeoutMs)) {
-    console.error("Local smoke check needs a valid API_KEYS and PORT in .env.development.");
+    console.error("Local smoke check needs a valid API key and port in data/config.json.");
     process.exit(2);
 }
 
