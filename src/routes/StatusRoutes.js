@@ -10,7 +10,9 @@ const path = require("path");
 const archiver = require("archiver");
 const VersionChecker = require("../utils/VersionChecker");
 const LoggingService = require("../utils/LoggingService");
+const { sanitizeStatusLogs } = require("../utils/LogSanitizer");
 const UsageStatsService = require("../core/UsageStatsService");
+const { parseUsageQuery, UsageQueryError } = require("../core/UsageAnalytics");
 
 /**
  * Status Routes Manager
@@ -215,6 +217,33 @@ class StatusRoutes {
         app.get("/api/usage-stats", isAuthenticated, (req, res) => {
             const snapshot = this.serverSystem.usageStatsService?.getSnapshot();
             res.json(snapshot || UsageStatsService.createEmptySnapshot());
+        });
+
+        app.get("/api/usage-stats/overview", isAuthenticated, (req, res) => {
+            try {
+                const nowMs = Date.now();
+                const query = parseUsageQuery(req.query, nowMs);
+                res.json(this.serverSystem.usageStatsService.getOverview(query, nowMs));
+            } catch (error) {
+                if (error instanceof UsageQueryError) {
+                    return res.status(400).json({ error: error.message, message: "invalidUsageStatsQuery" });
+                }
+                this.logger.error(`[UsageStats] Failed to build overview: ${error.message}`);
+                return res.status(500).json({ message: "usageStatsQueryFailed" });
+            }
+        });
+
+        app.get("/api/usage-stats/requests", isAuthenticated, (req, res) => {
+            try {
+                const query = parseUsageQuery(req.query, Date.now(), true);
+                res.json(this.serverSystem.usageStatsService.getRequests(query));
+            } catch (error) {
+                if (error instanceof UsageQueryError) {
+                    return res.status(400).json({ error: error.message, message: "invalidUsageStatsQuery" });
+                }
+                this.logger.error(`[UsageStats] Failed to list requests: ${error.message}`);
+                return res.status(500).json({ message: "usageStatsQueryFailed" });
+            }
         });
 
         app.get("/api/usage-stats/download", isAuthenticated, async (req, res) => {
@@ -1062,12 +1091,17 @@ class StatusRoutes {
 
         return {
             logCount: displayLogs.length,
-            logs: displayLogs.join("\n"),
+            logs: sanitizeStatusLogs(
+                displayLogs.join("\n"),
+                config,
+                this.serverSystem.runtimeConfig?.fileExtras?.startup
+            ),
             status: {
                 accountDetails,
                 activeContextsCount: browserManager.contexts.size,
                 apiKeySource: config.apiKeySource,
                 browserConnected: !!this.serverSystem.connectionRegistry.getConnectionByAuth(currentAuthIndex, false),
+                cacheStats: requestHandler.cacheManager?.stats() || null,
                 checkUpdate: config.checkUpdate,
                 currentAccountName,
                 currentAuthIndex,

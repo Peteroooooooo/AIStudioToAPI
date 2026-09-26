@@ -5,7 +5,7 @@
 const fs = require("fs");
 const path = require("path");
 const { randomUUID } = require("crypto");
-const { validateStartup } = require("./ConfigLoader");
+const { CACHE_DEFAULTS, validateStartup } = require("./ConfigLoader");
 
 const SAFETY_THRESHOLDS = new Set([
     "HARM_BLOCK_THRESHOLD_UNSPECIFIED",
@@ -17,6 +17,11 @@ const SAFETY_THRESHOLDS = new Set([
 ]);
 
 const NUMERIC_LIMITS = Object.freeze({
+    cacheCheckpointTokens: [1024, 100000],
+    cacheMaxEntries: [1, 1000],
+    cacheMinTokens: [1024, 100000],
+    cacheRenewWindowSeconds: [0, 86400],
+    cacheTtlSeconds: [60, 604800],
     failureThreshold: [0, 10000],
     fakeStreamTimeoutMs: [1, 300000],
     maxContexts: [0, 32],
@@ -26,6 +31,7 @@ const NUMERIC_LIMITS = Object.freeze({
     switchOnUses: [0, 10000],
 });
 const BOOLEAN_FIELDS = new Set([
+    "cacheEnabled",
     "checkUpdate",
     "enableAuthUpdate",
     "forceCodeExecution",
@@ -55,7 +61,7 @@ class RuntimeConfigStore {
         this.logger = logger;
         this.filePath = path.join(dataDir, "config.json");
         this.onChange = onChange;
-        this.defaults = Object.fromEntries(FIELDS.map(key => [key, config[key]]));
+        this.defaults = Object.fromEntries(FIELDS.map(key => [key, config[key] ?? CACHE_DEFAULTS[key]]));
         this.settings = { ...this.defaults };
         this.fileExtras = {};
         this.revision = 0;
@@ -125,11 +131,15 @@ class RuntimeConfigStore {
             throw new RuntimeConfigValidationError("Unsupported config file format.");
         }
         validateStartup(saved.startup);
-        // Files created by the first hot-config build did not include logLevel.
-        // Seed that one newly managed field from the persisted startup value.
+        // Add newly managed fields without changing values already saved by the user.
         const previousLogLevel = saved.startup?.logLevel ?? this.config.logLevel;
-        const defaults = this._validateComplete({ logLevel: previousLogLevel, ...saved.resetDefaults });
-        const settings = this._validateComplete({ logLevel: previousLogLevel, ...saved.settings });
+        const cacheDefaults = Object.fromEntries(Object.keys(CACHE_DEFAULTS).map(key => [key, this.defaults[key]]));
+        const defaults = this._validateComplete({
+            ...cacheDefaults,
+            logLevel: previousLogLevel,
+            ...saved.resetDefaults,
+        });
+        const settings = this._validateComplete({ ...cacheDefaults, logLevel: previousLogLevel, ...saved.settings });
         const fileExtras = Object.fromEntries(
             Object.entries(saved).filter(([key]) => !["version", "revision", "resetDefaults", "settings"].includes(key))
         );
@@ -155,10 +165,11 @@ class RuntimeConfigStore {
             this._apply(saved.settings);
             const previousStartup = this.fileExtras.startup || {};
             const completedStartup = { ...(this.config.startup || {}), ...previousStartup };
-            if (
-                JSON.stringify(completedStartup) !== JSON.stringify(previousStartup) ||
-                !Object.hasOwn(JSON.parse(content).settings, "logLevel")
-            ) {
+            const previousFile = JSON.parse(content);
+            const missingManagedFields = [...Object.keys(CACHE_DEFAULTS), "logLevel"].some(
+                key => !Object.hasOwn(previousFile.settings, key) || !Object.hasOwn(previousFile.resetDefaults, key)
+            );
+            if (JSON.stringify(completedStartup) !== JSON.stringify(previousStartup) || missingManagedFields) {
                 // Expand files created by an older release once. Values already
                 // present in the file always win over the startup seed.
                 this.fileExtras.startup = completedStartup;
@@ -245,11 +256,25 @@ class RuntimeConfigStore {
     }
 
     getState() {
+        const activeStartup = this.config.startup || {};
+        const savedStartup = this.fileExtras.startup || activeStartup;
+        const restartRequired = Object.keys({ ...activeStartup, ...savedStartup }).some(
+            key => JSON.stringify(activeStartup[key]) !== JSON.stringify(savedStartup[key])
+        );
         return {
             configPath: this.filePath,
             defaults: { ...this.defaults },
             effective: Object.fromEntries(FIELDS.map(key => [key, this.config[key]])),
             revision: this.revision,
+            startup: {
+                apiKeyCount: Array.isArray(activeStartup.apiKeys) ? activeStartup.apiKeys.length : 0,
+                consolePasswordConfigured: Boolean(activeStartup.webConsolePassword),
+                consoleUsernameConfigured: Boolean(activeStartup.webConsoleUsername),
+                host: activeStartup.host || this.config.host,
+                httpPort: activeStartup.httpPort ?? this.config.httpPort,
+                proxyConfigured: Boolean(activeStartup.proxyUrl),
+                restartRequired,
+            },
         };
     }
 

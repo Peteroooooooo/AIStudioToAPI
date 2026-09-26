@@ -11,6 +11,15 @@ const crypto = require("crypto");
 const LoggingService = require("./LoggingService");
 const { getProxyBypass, getProxyBypassFromEnv, getProxySummary } = require("./ProxyUtils");
 
+const CACHE_DEFAULTS = Object.freeze({
+    cacheCheckpointTokens: 1024,
+    cacheEnabled: true,
+    cacheMaxEntries: 100,
+    cacheMinTokens: 1024,
+    cacheRenewWindowSeconds: 0,
+    cacheTtlSeconds: 3600,
+});
+
 const isValidStartupValue = (key, value) => {
     switch (key) {
         case "apiKeys":
@@ -100,13 +109,14 @@ class ConfigLoader {
         const importLegacyEnv = !fs.existsSync(configPath);
         const legacyEnv = importLegacyEnv ? process.env : {};
         const config = {
+            ...CACHE_DEFAULTS,
             apiKeys: [],
             apiKeySource: "Not set",
             browserExecutablePath: null,
             checkUpdate: true,
             enableAuthUpdate: true,
             enableUsageStats: true,
-            failureThreshold: 3,
+            failureThreshold: 2,
             fakeStreamTimeoutMs: 300000,
             forceCodeExecution: false,
             forceThinking: false,
@@ -118,7 +128,7 @@ class ConfigLoader {
             immediateSwitchStatusCodes: [429, 503],
             initialAuthIndex: null,
             logLevel: "INFO",
-            maxContexts: 1,
+            maxContexts: 2,
             maxRetries: 3,
             proxyBypass: importLegacyEnv ? getProxyBypassFromEnv() : getProxyBypass(),
             proxyUrl: null,
@@ -130,7 +140,7 @@ class ConfigLoader {
             sessionSecret: crypto.randomBytes(32).toString("hex"),
             streamingMode: "real",
             streamTimeoutMs: 60000,
-            switchOnUses: 40,
+            switchOnUses: 50,
             timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
             webConsolePassword: null,
             webConsoleUsername: null,
@@ -381,3 +391,4 @@ class ConfigLoader {
 
 module.exports = ConfigLoader;
 module.exports.validateStartup = validateStartup;
+module.exports.CACHE_DEFAULTS = CACHE_DEFAULTS;

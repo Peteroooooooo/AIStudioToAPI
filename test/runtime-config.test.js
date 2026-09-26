@@ -11,6 +11,12 @@ const logger = { debug() {}, error() {}, info() {}, warn() {} };
 
 function initialConfig() {
     return {
+        cacheCheckpointTokens: 1024,
+        cacheEnabled: true,
+        cacheMaxEntries: 100,
+        cacheMinTokens: 1024,
+        cacheRenewWindowSeconds: 0,
+        cacheTtlSeconds: 3600,
         checkUpdate: true,
         enableAuthUpdate: true,
         failureThreshold: 3,
@@ -90,6 +96,48 @@ test("file is seeded once, page edits persist, and reset uses the saved initial 
     }
 });
 
+test("startup status reports effective values and pending restart without credential values", async () => {
+    const config = initialConfig();
+    config.startup.proxyUrl = "http://proxy-user:proxy-password@127.0.0.1:8080";
+    config.startup.webConsoleUsername = "console-user";
+    const { directory, store } = temporaryStore(config);
+    try {
+        const current = store.getState();
+        assert.deepEqual(current.startup, {
+            apiKeyCount: 1,
+            consolePasswordConfigured: true,
+            consoleUsernameConfigured: true,
+            host: "127.0.0.1",
+            httpPort: 7860,
+            proxyConfigured: true,
+            restartRequired: false,
+        });
+        for (const secret of [
+            "fake-test-key",
+            "test-console-password",
+            "test-session-secret",
+            "proxy-password",
+            "console-user",
+        ]) {
+            assert.equal(JSON.stringify(current).includes(secret), false);
+        }
+
+        const saved = JSON.parse(fs.readFileSync(store.filePath, "utf8"));
+        saved.startup.host = "0.0.0.0";
+        saved.startup.apiKeys = ["next-test-key"];
+        fs.writeFileSync(store.filePath, JSON.stringify(saved));
+        await store._reloadFromDisk();
+        const pending = store.getState();
+        assert.equal(pending.startup.host, "127.0.0.1");
+        assert.equal(pending.startup.apiKeyCount, 1);
+        assert.equal(pending.startup.restartRequired, true);
+        assert.equal(JSON.stringify(pending).includes("next-test-key"), false);
+    } finally {
+        store.close();
+        fs.rmSync(directory, { force: true, recursive: true });
+    }
+});
+
 test("invalid edits leave the effective and saved settings unchanged", async () => {
     const { config, directory, store } = temporaryStore();
     try {
@@ -140,9 +188,13 @@ test("manual config file saves hot-load valid settings and reject invalid files"
     try {
         const saved = JSON.parse(fs.readFileSync(store.filePath, "utf8"));
         saved.settings.retryDelay = 750;
+        saved.settings.cacheTtlSeconds = 1800;
+        saved.settings.cacheEnabled = false;
         fs.writeFileSync(store.filePath, JSON.stringify(saved));
-        await waitFor(() => config.retryDelay === 750);
+        await waitFor(() => config.retryDelay === 750 && config.cacheTtlSeconds === 1800);
+        assert.equal(config.cacheEnabled, false);
         assert.ok(changed.includes("retryDelay"));
+        assert.ok(changed.includes("cacheEnabled"));
 
         const revision = store.getState().revision;
         saved.settings.maxRetries = 0;
@@ -158,6 +210,69 @@ test("manual config file saves hot-load valid settings and reject invalid files"
         await new Promise(resolve => setTimeout(resolve, 1400));
         assert.equal(config.retryDelay, 750);
         assert.equal(store.getState().revision, revision);
+    } finally {
+        store.close();
+        fs.rmSync(directory, { force: true, recursive: true });
+    }
+});
+
+test("older config files gain cache settings without losing saved values", () => {
+    const { directory, store } = temporaryStore();
+    try {
+        store.close();
+        const saved = JSON.parse(fs.readFileSync(store.filePath, "utf8"));
+        saved.settings.maxContexts = 7;
+        for (const key of [
+            "cacheCheckpointTokens",
+            "cacheEnabled",
+            "cacheMaxEntries",
+            "cacheMinTokens",
+            "cacheRenewWindowSeconds",
+            "cacheTtlSeconds",
+        ]) {
+            delete saved.settings[key];
+            delete saved.resetDefaults[key];
+        }
+        fs.writeFileSync(store.filePath, JSON.stringify(saved));
+
+        const config = initialConfig();
+        const restarted = new RuntimeConfigStore(config, logger, directory);
+        try {
+            assert.equal(config.maxContexts, 7);
+            assert.equal(config.cacheEnabled, true);
+            assert.equal(config.cacheTtlSeconds, 3600);
+            const migrated = JSON.parse(fs.readFileSync(store.filePath, "utf8"));
+            assert.equal(migrated.settings.maxContexts, 7);
+            assert.equal(migrated.settings.cacheEnabled, true);
+            assert.equal(migrated.resetDefaults.cacheTtlSeconds, 3600);
+        } finally {
+            restarted.close();
+        }
+    } finally {
+        store.close();
+        fs.rmSync(directory, { force: true, recursive: true });
+    }
+});
+
+test("cache controls validate ranges and apply immediately", async () => {
+    const { config, directory, store } = temporaryStore();
+    try {
+        assert.throws(() => store.update({ cacheMinTokens: 1023 }), /cacheMinTokens/);
+        assert.throws(() => store.update({ cacheCheckpointTokens: 1023 }), /cacheCheckpointTokens/);
+        assert.throws(() => store.update({ cacheEnabled: "yes" }), /cacheEnabled/);
+        await store.update({
+            cacheCheckpointTokens: 1024,
+            cacheEnabled: false,
+            cacheMaxEntries: 12,
+            cacheMinTokens: 1024,
+            cacheTtlSeconds: 3600,
+        });
+        assert.equal(config.cacheEnabled, false);
+        assert.equal(config.cacheMinTokens, 1024);
+        assert.equal(config.cacheCheckpointTokens, 1024);
+        assert.equal(config.cacheTtlSeconds, 3600);
+        assert.equal(config.cacheMaxEntries, 12);
+        assert.equal(store.getState().effective.cacheEnabled, false);
     } finally {
         store.close();
         fs.rmSync(directory, { force: true, recursive: true });

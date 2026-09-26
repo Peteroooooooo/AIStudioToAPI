@@ -128,7 +128,20 @@ class ProxyServerSystem extends EventEmitter {
             () => this.browserManager.currentAuthIndex,
             this.browserManager
         );
+        this.usageStatsService.connectionRegistry = this.connectionRegistry;
+        this.connectionRegistry.on("backendChunk", ({ requestId, requestAttemptId, data }) => {
+            try {
+                this.usageStatsService.recordBackendChunk(requestId, requestAttemptId, data);
+            } catch (error) {
+                this.logger.warn(`[UsageStats] Failed to read token usage: ${error.message}`);
+            }
+        });
+        this.connectionRegistry.on("backendAttemptEvent", event => {
+            this.usageStatsService.recordBackendAttemptEvent(event);
+        });
         this.connectionRegistry.on("backendOutcome", outcome => {
+            if (outcome.requestId?.startsWith("cache_resource_")) return;
+            if (this.requestHandler?.cacheManager.consumeCachedAttemptOutcome(outcome)) return;
             if (outcome.success) {
                 this.authSource.health.recordSuccess(outcome.authIndex);
             } else {
@@ -258,18 +271,16 @@ class ProxyServerSystem extends EventEmitter {
                 return res.status(503).json({ error: { message: "API authentication is not configured." } });
             }
 
-            let clientKey = null;
-            if (req.headers["x-goog-api-key"]) {
-                clientKey = req.headers["x-goog-api-key"];
-            } else if (req.headers.authorization && req.headers.authorization.startsWith("Bearer ")) {
-                clientKey = req.headers.authorization.substring(7);
-            } else if (req.headers["x-api-key"]) {
-                clientKey = req.headers["x-api-key"];
-            } else if (req.query.key) {
-                clientKey = req.query.key;
-            }
-
-            if (clientKey && serverApiKeys.includes(clientKey)) {
+            const authorization = req.headers.authorization;
+            const suppliedKeys = [
+                req.headers["x-goog-api-key"],
+                typeof authorization === "string" && authorization.startsWith("Bearer ")
+                    ? authorization.substring(7)
+                    : null,
+                req.headers["x-api-key"],
+                req.query.key,
+            ];
+            if (suppliedKeys.some(key => typeof key === "string" && serverApiKeys.includes(key))) {
                 this.logger.info(
                     `[Auth] API Key verification passed (from: ${this.webRoutes.authRoutes.getClientIP(req)})`
                 );
@@ -409,6 +420,8 @@ class ProxyServerSystem extends EventEmitter {
             if (
                 req.path !== "/api/status" &&
                 req.path !== "/api/usage-stats" &&
+                req.path !== "/api/usage-stats/overview" &&
+                req.path !== "/api/usage-stats/requests" &&
                 req.path !== "/" &&
                 req.path !== "/favicon.ico" &&
                 req.path !== "/login" &&
@@ -667,6 +680,7 @@ class ProxyServerSystem extends EventEmitter {
     async shutdown() {
         this.logger.info("[System] Shutting down server system...");
         this.runtimeConfig?.close();
+        await this.requestHandler?.cacheManager?.close();
 
         // Clear stale queue cleanup interval
         if (this.staleQueueCleanupInterval) {
