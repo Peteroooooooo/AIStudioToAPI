@@ -13,6 +13,7 @@ const https = require("https");
 const fs = require("fs");
 const net = require("net");
 const path = require("path");
+const crypto = require("crypto");
 const { URL } = require("url");
 
 const LoggingService = require("../utils/LoggingService");
@@ -23,6 +24,7 @@ const RequestHandler = require("./RequestHandler");
 const UsageStatsService = require("./UsageStatsService");
 const ConfigLoader = require("../utils/ConfigLoader");
 const { RuntimeConfigStore } = require("../utils/RuntimeConfigStore");
+const { ManagedApiKeyStore } = require("../utils/ManagedApiKeyStore");
 const WebRoutes = require("../routes/WebRoutes");
 
 /**
@@ -36,6 +38,15 @@ class ProxyServerSystem extends EventEmitter {
 
         const configLoader = new ConfigLoader(this.logger);
         this.config = configLoader.loadConfiguration();
+        this.apiKeyStore = new ManagedApiKeyStore(this.logger, path.join(process.cwd(), "data"), this.config.apiKeys);
+        this.config.apiKeys = [];
+        this.config.apiKeySource = "Managed";
+        if (!this.config.webConsolePassword && !this.apiKeyStore.list().keys.some(key => key.source === "legacy")) {
+            this.apiKeyStore.close();
+            throw new Error(
+                "No web console password or imported API key is configured. Set WEB_CONSOLE_PASSWORD before first start, or set startup.webConsolePassword in data/config.json. Then create API keys in Settings."
+            );
+        }
 
         this.runtimeConfig = new RuntimeConfigStore(
             this.config,
@@ -66,6 +77,7 @@ class ProxyServerSystem extends EventEmitter {
                 });
             }
         );
+        this.runtimeConfig.apiKeyStore = this.apiKeyStore;
         LoggingService.setLevel(this.config.logLevel);
         configLoader._printConfiguration(this.config);
 
@@ -265,8 +277,7 @@ class ProxyServerSystem extends EventEmitter {
                 }
             }
 
-            const serverApiKeys = this.config.apiKeys;
-            if (!serverApiKeys || serverApiKeys.length === 0) {
+            if (!this.apiKeyStore || this.apiKeyStore.list().count === 0) {
                 this.logger.error("[Auth] No API keys configured; denying request.");
                 return res.status(503).json({ error: { message: "API authentication is not configured." } });
             }
@@ -280,7 +291,12 @@ class ProxyServerSystem extends EventEmitter {
                 req.headers["x-api-key"],
                 req.query.key,
             ];
-            if (suppliedKeys.some(key => typeof key === "string" && serverApiKeys.includes(key))) {
+            const suppliedKey = suppliedKeys.find(key => this.apiKeyStore.match(key));
+            if (suppliedKey) {
+                req.authenticatedApiKeyId = crypto
+                    .createHmac("sha256", this.config.sessionSecret)
+                    .update(suppliedKey)
+                    .digest("hex");
                 this.logger.info(
                     `[Auth] API Key verification passed (from: ${this.webRoutes.authRoutes.getClientIP(req)})`
                 );
@@ -680,6 +696,7 @@ class ProxyServerSystem extends EventEmitter {
     async shutdown() {
         this.logger.info("[System] Shutting down server system...");
         this.runtimeConfig?.close();
+        this.apiKeyStore?.close();
         await this.requestHandler?.cacheManager?.close();
 
         // Clear stale queue cleanup interval

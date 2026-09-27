@@ -1,7 +1,10 @@
 /** Keep credentials out of the authenticated status response's log text. */
 
-function collectSecrets(config, savedStartup) {
+function collectSecrets(config, savedStartup, managedKeys = []) {
     const secrets = new Set();
+    for (const key of managedKeys) {
+        if (typeof key === "string" && key) secrets.add(key);
+    }
     for (const source of [config, config?.startup, savedStartup]) {
         if (!source) continue;
         for (const key of Array.isArray(source.apiKeys) ? source.apiKeys : []) {
@@ -30,9 +33,9 @@ function collectSecrets(config, savedStartup) {
     return [...secrets].sort((a, b) => b.length - a.length);
 }
 
-function sanitizeStatusLogs(value, config, savedStartup) {
+function sanitizeStatusLogs(value, config, savedStartup, managedKeys = []) {
     let text = typeof value === "string" ? value : "";
-    for (const secret of collectSecrets(config, savedStartup)) {
+    for (const secret of collectSecrets(config, savedStartup, managedKeys)) {
         text = text.replaceAll(secret, "[REDACTED]");
     }
     return text

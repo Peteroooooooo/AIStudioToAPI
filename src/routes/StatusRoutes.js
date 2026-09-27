@@ -804,6 +804,53 @@ class StatusRoutes {
             res.status(200).json(this.serverSystem.runtimeConfig.getState());
         });
 
+        const requireConsolePassword = (req, res, next) => {
+            res.set("Cache-Control", "no-store");
+            if (!this.config.webConsolePassword) {
+                return res.status(403).json({ error: "Set a web console password before managing API keys." });
+            }
+            return next();
+        };
+
+        app.get("/api/settings/api-keys", isAuthenticated, requireConsolePassword, (req, res) => {
+            res.status(200).json(this.serverSystem.apiKeyStore.list());
+        });
+
+        app.get("/api/settings/api-keys/:id/secret", isAuthenticated, requireConsolePassword, (req, res) => {
+            const key = this.serverSystem.apiKeyStore.getSecret(req.params.id);
+            if (!key) return res.status(404).json({ error: "API key not found." });
+            return res.status(200).json({ key });
+        });
+
+        app.post("/api/settings/api-keys", isAuthenticated, requireConsolePassword, (req, res) => {
+            try {
+                const created = this.serverSystem.apiKeyStore.create(req.body?.name);
+                this.logger.info("[Auth] Generated an API key from Settings.");
+                return res.status(201).json(created);
+            } catch (error) {
+                if (error.name === "ManagedApiKeyValidationError") {
+                    return res.status(400).json({ error: error.message });
+                }
+                this.logger.error(`[Auth] Could not create API key: ${error.message}`);
+                return res.status(500).json({ error: "Could not create API key." });
+            }
+        });
+
+        app.delete("/api/settings/api-keys/:id", isAuthenticated, requireConsolePassword, (req, res) => {
+            try {
+                const removed = this.serverSystem.apiKeyStore.revoke(req.params.id, !this.config.webConsolePassword);
+                if (!removed) return res.status(404).json({ error: "API key not found." });
+                this.logger.info("[Auth] Revoked an API key from Settings.");
+                return res.sendStatus(204);
+            } catch (error) {
+                if (error.name === "ManagedApiKeyConflictError") {
+                    return res.status(409).json({ error: error.message });
+                }
+                this.logger.error(`[Auth] Could not revoke API key: ${error.message}`);
+                return res.status(500).json({ error: "Could not revoke API key." });
+            }
+        });
+
         app.put("/api/settings/runtime", isAuthenticated, async (req, res) => {
             try {
                 const state = await this.serverSystem.runtimeConfig.update(req.body);
@@ -1094,7 +1141,8 @@ class StatusRoutes {
             logs: sanitizeStatusLogs(
                 displayLogs.join("\n"),
                 config,
-                this.serverSystem.runtimeConfig?.fileExtras?.startup
+                this.serverSystem.runtimeConfig?.fileExtras?.startup,
+                this.serverSystem.apiKeyStore?.getSecretsForLogRedaction()
             ),
             status: {
                 accountDetails,

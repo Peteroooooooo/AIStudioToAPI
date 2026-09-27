@@ -41,11 +41,11 @@ A tool that wraps the Google AI Studio Build App web interface to provide OpenAI
 
    > 💡 **Tip:** If downloading the Camoufox browser fails or takes too long, you can manually download it from [here](https://github.com/daijro/camoufox/releases/tag/v135.0.1-beta.24), and set the environment variable `CAMOUFOX_EXECUTABLE_PATH` to the path of the browser executable (both absolute and relative paths are supported).
 
-3. Configure initial values (optional):
+3. Configure initial values:
 
-   Before the first start, you may copy `.env.example` to `.env` to import legacy settings. The service creates `data/config.json` on first start and uses that file thereafter; later `.env` changes do not overwrite it.
+   Before the first start, copy `.env.example` to `.env` and set `WEB_CONSOLE_PASSWORD`. The service creates `data/config.json` on first start and uses that file thereafter; later `.env` changes do not overwrite it.
 
-   If the service is reachable from the internet, set your own `API_KEYS` and console password. Do not use the default key `123456`.
+   Set a web console password before the first start. After signing in, generate client API keys under **Settings → API Keys**. Keys can be copied or revoked without restarting. Existing `API_KEYS` and keys in `data/config.json` are migrated automatically and remain valid. Older installations without a separate console password must set `startup.webConsolePassword` in `data/config.json` and restart before managing API keys.
 
 4. Start the service:
 
@@ -90,10 +90,10 @@ docker run -d \
   -p 7860:7860 \
   -v /path/to/auth:/app/configs/auth \
   -v /path/to/data:/app/data \
-  -e API_KEYS=your-api-key-1,your-api-key-2 \
+  -e WEB_CONSOLE_PASSWORD=your-console-password \
   -e TZ=America/New_York \
   --restart unless-stopped \
-  ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.4
+  ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.6
 ```
 
 Parameters:
@@ -101,7 +101,7 @@ Parameters:
 - `-p 7860:7860`: API server port (if using a reverse proxy, strongly consider `127.0.0.1:7860`)
 - `-v /path/to/auth:/app/configs/auth`: Mount directory containing auth files
 - `-v /path/to/data:/app/data`: Mount persistent data directory for usage statistics and account health
-- `-e API_KEYS`: Comma-separated list of API keys for authentication
+- `-e WEB_CONSOLE_PASSWORD`: Web console password for first boot; generate API keys in Settings after signing in
 - `-e TZ=America/New_York`: Timezone for logs (optional, defaults to system timezone)
 
 ##### 📦 Option 2: Docker Compose
@@ -113,7 +113,7 @@ name: aistudio-to-api
 
 services:
   app:
-    image: ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.4
+    image: ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.6
     container_name: aistudio-to-api
     ports:
       # API server port (if using a reverse proxy, strongly consider `127.0.0.1:7860`)
@@ -125,8 +125,8 @@ services:
       # Mount persistent data directory for usage statistics
       - ./data:/app/data
     environment:
-      # Comma-separated list of API keys for authentication
-      API_KEYS: your-api-key-1,your-api-key-2
+      # Web console password for first boot; generate API keys in Settings
+      WEB_CONSOLE_PASSWORD: your-console-password
       # Timezone setting (optional, defaults to system timezone)
       TZ: America/New_York
 ```
@@ -149,7 +149,7 @@ If you prefer to build the Docker image yourself, you can use the following comm
      -p 7860:7860 \
      -v /path/to/auth:/app/configs/auth \
      -v /path/to/data:/app/data \
-     -e API_KEYS=your-api-key-1,your-api-key-2 \
+     -e WEB_CONSOLE_PASSWORD=your-console-password \
      -e TZ=America/New_York \
      --restart unless-stopped \
      aistudio-to-api
@@ -239,7 +239,7 @@ Usage:
 
 - Deploy and start AIStudioToAPI first, and make sure the Gemini native API endpoint is reachable, for example `http://localhost:7860/v1beta`.
 - In AMC WebUI, go to **Settings -> API Configuration**, enable "Custom API Configuration", and set the Gemini-compatible Base URL to AIStudioToAPI's `/v1beta` endpoint.
-- The API Key configured in AMC WebUI should match one of the `API_KEYS` configured for AIStudioToAPI.
+- Generate a key under **Settings → API Keys** in AIStudioToAPI and copy it into AMC WebUI.
 
 ## 🧰 Configuration
 
@@ -249,20 +249,20 @@ These values are read only when `data/config.json` is first created. Once the fi
 
 #### 📱 Application Configuration
 
-| Variable                    | Description                                                                                                                                                                 | Default              |
-| :-------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------- |
-| `API_KEYS`                  | Comma-separated list of valid API keys for authentication.                                                                                                                  | `123456`             |
-| `WEB_CONSOLE_USERNAME`      | Username for web console login (optional). If both username and password are set, both are required to login.                                                               | None                 |
-| `WEB_CONSOLE_PASSWORD`      | Password for web console login (optional). If only password is set, login requires password only. If neither is set, the system falls back to `API_KEYS` for console login. | None                 |
-| `PORT`                      | API server port.                                                                                                                                                            | `7860`               |
-| `HOST`                      | Server listening host address.                                                                                                                                              | `0.0.0.0`            |
-| `ICON_URL`                  | Custom favicon URL for the console. Supports ICO, PNG, SVG, etc.                                                                                                            | `/AIStudio_logo.svg` |
-| `SECURE_COOKIES`            | Enable secure cookies. `true` for HTTPS only, `false` for both HTTP and HTTPS.                                                                                              | `false`              |
-| `RATE_LIMIT_MAX_ATTEMPTS`   | Maximum failed login attempts allowed within the time window (`0` to disable).                                                                                              | `5`                  |
-| `RATE_LIMIT_WINDOW_MINUTES` | Time window for rate limiting in minutes.                                                                                                                                   | `15`                 |
-| `CHECK_UPDATE`              | Enable version update check on page load (`false` to disable).                                                                                                              | `true`               |
-| `LOG_LEVEL`                 | Logging output level. Set to `DEBUG` for detailed debug logs.                                                                                                               | `INFO`               |
-| `TZ`                        | Timezone used for logs and displayed times, for example `America/New_York`. Defaults to the system timezone when empty.                                                     | System timezone      |
+| Variable                    | Description                                                                                                                                                            | Default              |
+| :-------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------- |
+| `API_KEYS`                  | Legacy import only: comma-separated client keys. Generate keys in Settings for new installations.                                                                      | None                 |
+| `WEB_CONSOLE_USERNAME`      | Username for web console login (optional). If both username and password are set, both are required to login.                                                          | None                 |
+| `WEB_CONSOLE_PASSWORD`      | Web console password. Set before first boot on new installations. Older installations may still sign in with imported legacy API keys when no console password is set. | None                 |
+| `PORT`                      | API server port.                                                                                                                                                       | `7860`               |
+| `HOST`                      | Server listening host address.                                                                                                                                         | `0.0.0.0`            |
+| `ICON_URL`                  | Custom favicon URL for the console. Supports ICO, PNG, SVG, etc.                                                                                                       | `/AIStudio_logo.svg` |
+| `SECURE_COOKIES`            | Enable secure cookies. `true` for HTTPS only, `false` for both HTTP and HTTPS.                                                                                         | `false`              |
+| `RATE_LIMIT_MAX_ATTEMPTS`   | Maximum failed login attempts allowed within the time window (`0` to disable).                                                                                         | `5`                  |
+| `RATE_LIMIT_WINDOW_MINUTES` | Time window for rate limiting in minutes.                                                                                                                              | `15`                 |
+| `CHECK_UPDATE`              | Enable version update check on page load (`false` to disable).                                                                                                         | `true`               |
+| `LOG_LEVEL`                 | Logging output level. Set to `DEBUG` for detailed debug logs.                                                                                                          | `INFO`               |
+| `TZ`                        | Timezone used for logs and displayed times, for example `America/New_York`. Defaults to the system timezone when empty.                                                | System timezone      |
 
 #### 🌐 Proxy Configuration
 

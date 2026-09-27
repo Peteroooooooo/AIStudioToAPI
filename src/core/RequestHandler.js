@@ -120,13 +120,14 @@ class RequestHandler {
     }
 
     _getCallerApiKeyId(req) {
+        if (req.authenticatedApiKeyId) return req.authenticatedApiKeyId;
         const authorization = req.headers?.authorization;
         const suppliedKey = [
             req.headers?.["x-goog-api-key"],
             typeof authorization === "string" && authorization.startsWith("Bearer ") ? authorization.slice(7) : null,
             req.headers?.["x-api-key"],
             req.query?.key,
-        ].find(key => typeof key === "string" && this.config.apiKeys?.includes(key));
+        ].find(key => this.serverSystem?.apiKeyStore?.match(key));
         if (!suppliedKey) return null;
         return crypto.createHmac("sha256", this.config.sessionSecret).update(suppliedKey).digest("hex");
     }

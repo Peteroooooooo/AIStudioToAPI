@@ -32,7 +32,6 @@ function initialConfig() {
         retryDelay: 2000,
         safetySettingsThreshold: "OFF",
         startup: {
-            apiKeys: ["fake-test-key"],
             host: "127.0.0.1",
             httpPort: 7860,
             sessionSecret: "test-session-secret",
@@ -47,6 +46,7 @@ function initialConfig() {
 function temporaryStore(config = initialConfig(), onChange = () => {}) {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "aistudio-runtime-test-"));
     const store = new RuntimeConfigStore(config, logger, directory, onChange);
+    store.apiKeyStore = { list: () => ({ count: 1 }) };
     return { config, directory, store };
 }
 
@@ -65,7 +65,7 @@ test("file is seeded once, page edits persist, and reset uses the saved initial 
         assert.equal(initial.effective.maxContexts, 2);
         assert.equal(initial.defaults.maxContexts, 2);
         assert.equal(initial.revision, 0);
-        assert.equal(JSON.stringify(initial).includes("fake-test-key"), false);
+        assert.equal(JSON.stringify(initial).includes("test-console-password"), false);
 
         await store.update({ forceThinking: true, logLevel: "DEBUG", maxContexts: 1, maxRetries: 4 });
         assert.equal(config.maxContexts, 1);
@@ -74,7 +74,7 @@ test("file is seeded once, page edits persist, and reset uses the saved initial 
         assert.equal(config.logLevel, "DEBUG");
         const saved = JSON.parse(fs.readFileSync(store.filePath, "utf8"));
         assert.equal(saved.settings.maxContexts, 1);
-        assert.deepEqual(saved.startup.apiKeys, ["fake-test-key"]);
+        assert.equal(Object.hasOwn(saved.startup, "apiKeys"), false);
 
         store.close();
         const changedEnvironment = initialConfig();
@@ -112,26 +112,19 @@ test("startup status reports effective values and pending restart without creden
             proxyConfigured: true,
             restartRequired: false,
         });
-        for (const secret of [
-            "fake-test-key",
-            "test-console-password",
-            "test-session-secret",
-            "proxy-password",
-            "console-user",
-        ]) {
+        for (const secret of ["test-console-password", "test-session-secret", "proxy-password", "console-user"]) {
             assert.equal(JSON.stringify(current).includes(secret), false);
         }
 
         const saved = JSON.parse(fs.readFileSync(store.filePath, "utf8"));
         saved.startup.host = "0.0.0.0";
-        saved.startup.apiKeys = ["next-test-key"];
         fs.writeFileSync(store.filePath, JSON.stringify(saved));
         await store._reloadFromDisk();
         const pending = store.getState();
         assert.equal(pending.startup.host, "127.0.0.1");
         assert.equal(pending.startup.apiKeyCount, 1);
         assert.equal(pending.startup.restartRequired, true);
-        assert.equal(JSON.stringify(pending).includes("next-test-key"), false);
+        assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(store.filePath, "utf8")).startup, "apiKeys"), false);
     } finally {
         store.close();
         fs.rmSync(directory, { force: true, recursive: true });
