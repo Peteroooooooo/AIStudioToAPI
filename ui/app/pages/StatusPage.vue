@@ -139,6 +139,7 @@
                 :failure-count="state.failureCount"
                 :t="t"
                 @add="addUser"
+                @reauth="reauthenticateAccount"
                 @upload="triggerFileUpload"
                 @deduplicate="deduplicateAuth"
                 @switch="switchAccountByIndex"
@@ -1245,6 +1246,15 @@ const addUser = () => {
     router.push("/auth");
 };
 
+const reauthenticateAccount = targetIndex => {
+    const account = state.accountDetails.find(item => item.index === targetIndex);
+    if (!account || account.isInvalid) {
+        ElMessage.error(t("errorAccountNotFound", { index: targetIndex }));
+        return;
+    }
+    router.push({ path: "/auth", query: { reauth: String(targetIndex) } });
+};
+
 // Delete account by index
 const deleteAccountByIndex = async targetIndex => {
     if (targetIndex === null || targetIndex === undefined) {
@@ -1433,6 +1443,27 @@ const handleLogout = () => {
 
 const updateAccountHealth = async account => {
     const mode = account.health?.mode || "active";
+    if (mode !== "disabled" && (account.isExpired || mode === "reauth")) {
+        state.isSwitchingAccount = true;
+        try {
+            const res = await fetch(`/api/accounts/${account.index}/recheck`, { method: "POST" });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.message ? t(data.message, data) : data.error || `HTTP ${res.status}`);
+            if (data.recovered) {
+                ElMessage.success(t("accountsRecheckRecovered", { index: account.index }));
+            } else if (data.needsReauth) {
+                ElMessage.warning(t("accountsRecheckNeedsLogin", { index: account.index }));
+            } else {
+                ElMessage.info(t("accountsRecheckUnconfirmed", { index: account.index }));
+            }
+            await updateContent();
+        } catch (error) {
+            ElMessage.error(t("accountsRecheckFailed", { error: error.message || error }));
+        } finally {
+            state.isSwitchingAccount = false;
+        }
+        return;
+    }
     const action = mode === "disabled" ? "enable" : mode === "active" ? "disable" : "reset";
     state.isSwitchingAccount = true;
     try {
@@ -2048,6 +2079,22 @@ const checkForUpdates = async () => {
 // Theme handling is now managed by useTheme composable
 
 onMounted(() => {
+    const reauthResult = sessionStorage.getItem("reauthResult");
+    if (reauthResult) {
+        sessionStorage.removeItem("reauthResult");
+        try {
+            const result = JSON.parse(reauthResult);
+            if (Number.isSafeInteger(result.index) && result.index >= 0) {
+                const message = t(result.refreshPending ? "authReauthRefreshPending" : "authReauthSuccess", {
+                    index: result.index,
+                });
+                if (result.refreshPending) ElMessage.info({ duration: 7000, message });
+                else ElMessage.success(message);
+            }
+        } catch (error) {
+            console.warn("Invalid reauthentication result:", error);
+        }
+    }
     if (activeTab.value === "settings") loadRuntimeConfig();
     // Listen for language changes
     I18n.onChange(() => {

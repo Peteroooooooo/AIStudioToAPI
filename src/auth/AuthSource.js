@@ -8,6 +8,7 @@
 const fs = require("fs");
 const fsPromises = require("fs").promises;
 const path = require("path");
+const { randomUUID } = require("crypto");
 const AccountHealth = require("./AccountHealth");
 
 /**
@@ -26,6 +27,9 @@ class AuthSource {
         this.duplicateIndices = [];
         // Expired auth indices (valid JSON but marked as expired, excluded from rotation)
         this.expiredIndices = [];
+        // A freshly replaced credential is held out of rotation until its old live
+        // browser context and in-flight requests have drained.
+        this.pendingRefreshIndices = new Set();
         this.initialIndices = [];
         this.accountNameMap = new Map();
         // Map any valid index -> canonical (latest) index for the same account email
@@ -114,6 +118,7 @@ class AuthSource {
             this.rotationIndices = [];
             this.duplicateIndices = [];
             this.expiredIndices = [];
+            this.pendingRefreshIndices.clear();
             this.accountNameMap.clear();
             this.canonicalIndexMap.clear();
             this.duplicateGroups = [];
@@ -158,6 +163,9 @@ class AuthSource {
         }
 
         this.availableIndices = validIndices.sort((a, b) => a - b);
+        this.pendingRefreshIndices = new Set(
+            [...this.pendingRefreshIndices].filter(index => this.availableIndices.includes(index))
+        );
         this._buildRotationIndices();
     }
 
@@ -179,8 +187,21 @@ class AuthSource {
 
         const emailKeyToIndices = new Map();
 
-        // Only process non-expired accounts for rotation and deduplication
-        const nonExpiredIndices = this.availableIndices.filter(idx => !this.expiredIndices.includes(idx));
+        // During reauthentication, hold every file for the same Google account out
+        // of rotation until the previous browser context has drained.
+        const pendingEmailKeys = new Set(
+            [...this.pendingRefreshIndices]
+                .map(index => this._normalizeEmailKey(this.accountNameMap.get(index)))
+                .filter(Boolean)
+        );
+
+        // Only process usable accounts for rotation and deduplication
+        const nonExpiredIndices = this.availableIndices.filter(
+            idx =>
+                !this.expiredIndices.includes(idx) &&
+                !this.pendingRefreshIndices.has(idx) &&
+                !pendingEmailKeys.has(this._normalizeEmailKey(this.accountNameMap.get(idx)))
+        );
 
         for (const index of nonExpiredIndices) {
             const accountName = this.accountNameMap.get(index);
@@ -305,12 +326,28 @@ class AuthSource {
             return false;
         }
 
+        if (this.pendingRefreshIndices.has(index)) {
+            this.logger.info(`[Auth] Ignoring stale expiration for auth #${index} during credential replacement.`);
+            return false;
+        }
+
         const authFilePath = path.join(process.cwd(), "configs", "auth", `auth-${index}.json`);
         try {
             const fileContent = await fsPromises.readFile(authFilePath, "utf-8");
             const authData = JSON.parse(fileContent);
+            if (this.pendingRefreshIndices.has(index)) return false;
             authData.expired = true;
-            await fsPromises.writeFile(authFilePath, JSON.stringify(authData, null, 2));
+            const temporaryPath = `${authFilePath}.${process.pid}.${randomUUID()}.tmp`;
+            try {
+                await fsPromises.writeFile(temporaryPath, JSON.stringify(authData, null, 2), {
+                    flag: "wx",
+                    mode: 0o600,
+                });
+                if (this.pendingRefreshIndices.has(index)) return false;
+                await fsPromises.rename(temporaryPath, authFilePath);
+            } finally {
+                await fsPromises.unlink(temporaryPath).catch(() => {});
+            }
 
             this.expiredIndices.push(index);
 
@@ -338,7 +375,7 @@ class AuthSource {
      * @param {number} index - Auth index to restore
      * @returns {Promise<boolean>} True if successfully restored, false if auth doesn't exist, is not expired, or file operation fails
      */
-    async unmarkAsExpired(index) {
+    async unmarkAsExpired(index, options = {}) {
         if (!this.availableIndices.includes(index)) {
             this.logger.warn(`[Auth] Cannot unmark non-existent auth #${index}`);
             return false;
@@ -352,9 +389,26 @@ class AuthSource {
         const authFilePath = path.join(process.cwd(), "configs", "auth", `auth-${index}.json`);
         try {
             const fileContent = await fsPromises.readFile(authFilePath, "utf-8");
+            if (options.expectedContent !== undefined && fileContent !== options.expectedContent) {
+                this.logger.info(`[Auth] Auth #${index} changed during recheck; leaving its current state untouched.`);
+                return false;
+            }
             const authData = JSON.parse(fileContent);
             delete authData.expired;
-            await fsPromises.writeFile(authFilePath, JSON.stringify(authData, null, 2));
+            if (options.storageState) {
+                authData.cookies = options.storageState.cookies;
+                authData.origins = options.storageState.origins;
+            }
+            const temporaryPath = `${authFilePath}.${process.pid}.${randomUUID()}.tmp`;
+            try {
+                await fsPromises.writeFile(temporaryPath, JSON.stringify(authData, null, 2), {
+                    flag: "wx",
+                    mode: 0o600,
+                });
+                await fsPromises.rename(temporaryPath, authFilePath);
+            } finally {
+                await fsPromises.unlink(temporaryPath).catch(() => {});
+            }
 
             this.expiredIndices = this.expiredIndices.filter(idx => idx !== index);
 
@@ -376,6 +430,12 @@ class AuthSource {
      */
     isExpired(index) {
         return this.expiredIndices.includes(index);
+    }
+
+    setPendingRefresh(index, pending) {
+        if (pending) this.pendingRefreshIndices.add(index);
+        else this.pendingRefreshIndices.delete(index);
+        this._buildRotationIndices();
     }
 }
 

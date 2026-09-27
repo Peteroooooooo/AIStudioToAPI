@@ -346,7 +346,8 @@ class ProxyServerSystem extends EventEmitter {
         }
 
         this.httpServer.on("upgrade", (req, socket) => {
-            const pathname = new URL(req.url, `http://${req.headers.host}`).pathname;
+            const requestUrl = new URL(req.url, `http://${req.headers.host}`);
+            const pathname = requestUrl.pathname;
 
             if (pathname === "/vnc") {
                 this.logger.info("[VNC Proxy] Detected VNC WebSocket upgrade request. Verifying session...");
@@ -361,6 +362,16 @@ class ProxyServerSystem extends EventEmitter {
                         return;
                     }
 
+                    const createAuth = this.webRoutes.authRoutes.createAuth;
+                    if (!createAuth.matchesSessionId(requestUrl.searchParams.get("sessionId"))) {
+                        this.logger.warn(
+                            "[VNC Proxy] Rejected WebSocket connection for a stale or missing VNC session."
+                        );
+                        socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+                        socket.destroy();
+                        return;
+                    }
+
                     this.logger.info("[VNC Proxy] Session verified. Proxying...");
                     const target = net.createConnection({ host: "localhost", port: 6080 });
 
@@ -369,7 +380,7 @@ class ProxyServerSystem extends EventEmitter {
 
                         // Forward the WebSocket handshake headers to the backend
                         const headers = [
-                            `GET ${req.url} HTTP/1.1`,
+                            "GET /vnc HTTP/1.1",
                             "Host: localhost:6080",
                             "Upgrade: websocket",
                             "Connection: Upgrade",

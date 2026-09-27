@@ -348,6 +348,29 @@ class StatusRoutes {
             return res.json({ health: result, index });
         });
 
+        app.post("/api/accounts/:index/recheck", isAuthenticated, async (req, res) => {
+            if (this._rejectIfSystemBusy(res)) return;
+            const index = Number(req.params.index);
+            if (
+                !Number.isSafeInteger(index) ||
+                index < 0 ||
+                !this.serverSystem.authSource.initialIndices.includes(index)
+            ) {
+                return res.status(404).json({ message: "errorVncReauthAccountNotFound" });
+            }
+            try {
+                const result = await this.serverSystem.browserManager.recheckExpiredAccount(index);
+                if (result.reason === "busy") {
+                    return res.status(409).json({ message: "errorAccountRecheckBusy" });
+                }
+                const recovered = result.recovered || result.reason === "not_expired";
+                return res.json({ needsReauth: result.reason === "needs_login", reason: result.reason, recovered });
+            } catch (error) {
+                this.logger.error(`[Auth] Could not recheck account #${index}: ${error.message}`);
+                return res.status(500).json({ message: "errorAccountRecheckFailed" });
+            }
+        });
+
         app.put("/api/accounts/current", isAuthenticated, async (req, res) => {
             try {
                 if (this._rejectIfSystemBusy(res)) return;

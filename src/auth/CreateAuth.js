@@ -8,7 +8,9 @@
 const fs = require("fs");
 const path = require("path");
 const net = require("net");
+const crypto = require("crypto");
 const { spawn } = require("child_process");
+const { detectAccountEmail } = require("./AuthPageIdentity");
 
 /**
  * CreateAuth Manager
@@ -21,6 +23,7 @@ class CreateAuth {
         this.vncSession = null;
         this.currentLockToken = null; // Token to identify who holds the lock
         this.currentVncAbortController = null; // Controller to abort ongoing setup
+        this.savingSession = null;
     }
 
     /**
@@ -128,6 +131,30 @@ class CreateAuth {
             this.logger.error("[VNC] VNC feature is not supported on Windows.");
             return res.status(501).json({ message: "errorVncUnsupportedOs" });
         }
+        if (this.savingSession) {
+            return res.status(409).json({ message: "errorVncSaveInProgress" });
+        }
+
+        // A reauthentication session is bound to one existing credential. Never infer
+        // the target from a client-provided email at save time.
+        const targetAuthIndex = req.body?.targetAuthIndex;
+        let expectedAccountName = null;
+        if (targetAuthIndex !== undefined) {
+            const authSource = this.serverSystem.authSource;
+            if (
+                !Number.isSafeInteger(targetAuthIndex) ||
+                targetAuthIndex < 0 ||
+                !authSource.initialIndices.includes(targetAuthIndex)
+            ) {
+                return res.status(404).json({ message: "errorVncReauthAccountNotFound" });
+            }
+            const authData = authSource.getAuth(targetAuthIndex);
+            expectedAccountName =
+                typeof authData?.accountName === "string" ? authData.accountName.trim().toLowerCase() : null;
+            if (!expectedAccountName || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(expectedAccountName)) {
+                return res.status(409).json({ message: "errorVncReauthAccountUnknown" });
+            }
+        }
 
         // --- Concurrency Handling with Token Ownership ---
         const myToken = {}; // Unique object identity
@@ -174,7 +201,11 @@ class CreateAuth {
             }
         };
 
-        const sessionResources = {};
+        const sessionResources = {
+            expectedAccountName,
+            sessionId: crypto.randomBytes(32).toString("base64url"),
+            targetAuthIndex,
+        };
 
         try {
             // Check immediately
@@ -193,7 +224,7 @@ class CreateAuth {
             const isMobile = /Mobi|Android/i.test(userAgent);
             this.logger.info(`[VNC] Detected User-Agent: "${userAgent}". Is mobile: ${isMobile}`);
 
-            const { width, height } = req.body;
+            const { width, height } = req.body || {};
             const screenWidth =
                 typeof width === "number" && width > 0 ? Math.floor(width / 2) * 2 : isMobile ? 412 : 1280;
             const screenHeight =
@@ -339,6 +370,7 @@ class CreateAuth {
                 this.serverSystem.browserManager.launchBrowserForVNC({
                     env: { DISPLAY: display },
                     isMobile,
+                    targetAuthIndex,
                 }),
                 signal
             );
@@ -403,18 +435,19 @@ class CreateAuth {
             sessionResources.page = page;
             checkAborted();
 
-            sessionResources.timeoutHandle = setTimeout(
-                () => {
-                    this.logger.warn("[VNC] Session has been idle for 10 minutes. Automatically cleaning up.");
-                    scopedCleanup("idle_timeout");
-                },
-                10 * 60 * 1000
-            );
+            sessionResources.startedAt = Date.now();
+            sessionResources.timeoutMs = targetAuthIndex !== undefined ? 30 * 60 * 1000 : 10 * 60 * 1000;
+            this._scheduleSessionTimeout(sessionResources, scopedCleanup);
 
             this.vncSession = sessionResources;
 
             this.logger.info(`[VNC] VNC session is live and accessible via the server's WebSocket proxy.`);
-            res.json({ protocol: "websocket", success: true });
+            res.json({
+                protocol: "websocket",
+                sessionId: sessionResources.sessionId,
+                success: true,
+                ...(targetAuthIndex !== undefined ? { accountName: expectedAccountName, targetAuthIndex } : {}),
+            });
         } catch (error) {
             if (error.message === "VNC_SETUP_ABORTED") {
                 this.logger.warn("[VNC] Current session setup aborted by new incoming request.");
@@ -452,50 +485,63 @@ class CreateAuth {
         if (!this.vncSession || !this.vncSession.context) {
             return res.status(400).json({ message: "errorVncNoSession" });
         }
+        if (!this.matchesSessionId(req.body?.sessionId)) {
+            return res.status(409).json({ message: "errorVncSessionMismatch" });
+        }
 
-        let { accountName } = req.body;
+        let { accountName } = req.body || {};
         const { context, page, stickyProxy } = this.vncSession;
         // Capture session ref to prevent global change affecting us
         const sessionRef = this.vncSession;
-
-        if (accountName) {
-            this.logger.info(`[VNC] Using provided account name: ${accountName}`);
-        } else {
-            try {
-                this.logger.info("[VNC] Attempting to retrieve account name by scanning <script> JSON...");
-                const scriptLocators = page.locator('script[type="application/json"]');
-                const count = await scriptLocators.count();
-                this.logger.info(`[VNC] -> Found ${count} JSON <script> tags.`);
-
-                const emailRegex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/;
-                let foundEmail = false;
-
-                for (let i = 0; i < count; i++) {
-                    const content = await scriptLocators.nth(i).textContent();
-                    if (content) {
-                        const match = content.match(emailRegex);
-                        if (match && match[0]) {
-                            accountName = match[0];
-                            this.logger.info(`[VNC] -> Successfully retrieved account: ${accountName}`);
-                            foundEmail = true;
-                            break;
-                        }
-                    }
-                }
-
-                if (!foundEmail) {
-                    throw new Error(`Iterated through all ${count} <script> tags, but no email found.`);
-                }
-            } catch (e) {
-                this.logger.warn(
-                    `[VNC] Could not automatically detect email: ${e.message}. Requesting manual input from client.`
-                );
-                return res.status(400).json({ message: "errorVncEmailFetchFailed" });
-            }
+        if (this.savingSession) {
+            return res.status(409).json({ message: "errorVncSaveInProgress" });
         }
+        this.savingSession = sessionRef;
 
         try {
-            const storageState = await context.storageState();
+            if (sessionRef.targetAuthIndex !== undefined) {
+                const result = await this._saveReauthenticatedAccount(sessionRef);
+                res.json(result);
+                setTimeout(() => this._cleanupVncSession("auth_saved", sessionRef), 500);
+                return;
+            }
+
+            if (accountName) {
+                this.logger.info("[VNC] Using provided account name.");
+            } else {
+                try {
+                    this.logger.info("[VNC] Attempting to retrieve account name by scanning <script> JSON...");
+                    const scriptLocators = page.locator('script[type="application/json"]');
+                    const count = await scriptLocators.count();
+                    this.logger.info(`[VNC] -> Found ${count} JSON <script> tags.`);
+
+                    const emailRegex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/;
+                    let foundEmail = false;
+
+                    for (let i = 0; i < count; i++) {
+                        const content = await scriptLocators.nth(i).textContent();
+                        if (content) {
+                            const match = content.match(emailRegex);
+                            if (match && match[0]) {
+                                accountName = match[0];
+                                foundEmail = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!foundEmail) {
+                        throw new Error(`Iterated through all ${count} <script> tags, but no email found.`);
+                    }
+                } catch (e) {
+                    this.logger.warn(
+                        `[VNC] Could not automatically detect email: ${e.message}. Requesting manual input from client.`
+                    );
+                    return res.status(400).json({ message: "errorVncEmailFetchFailed" });
+                }
+            }
+
+            const storageState = await context.storageState({ indexedDB: true });
             const authData = { ...storageState, accountName };
 
             const configDir = path.join(process.cwd(), "configs", "auth");
@@ -509,7 +555,7 @@ class CreateAuth {
             const nextAuthIndex = existingIndices.length > 0 ? Math.max(...existingIndices) + 1 : 0;
 
             const newAuthFilePath = path.join(configDir, `auth-${nextAuthIndex}.json`);
-            fs.writeFileSync(newAuthFilePath, JSON.stringify(authData, null, 2));
+            fs.writeFileSync(newAuthFilePath, JSON.stringify(authData, null, 2), { mode: 0o600 });
 
             this.logger.info(`[VNC] Saved new auth file: ${newAuthFilePath}`);
 
@@ -538,11 +584,171 @@ class CreateAuth {
             }, 500);
         } catch (error) {
             this.logger.error(`[VNC] Failed to save auth file: ${error.message}`);
-            res.status(500).json({
-                error: error.message,
-                message: "errorVncSaveFailed",
-            });
+            res.status(error.status || 500).json({ message: error.messageKey || "errorVncSaveFailed" });
+        } finally {
+            if (this.savingSession === sessionRef) this.savingSession = null;
         }
+    }
+
+    _reauthError(status, messageKey) {
+        const error = new Error(messageKey);
+        error.status = status;
+        error.messageKey = messageKey;
+        return error;
+    }
+
+    _scheduleSessionTimeout(session, scopedCleanup = reason => this._cleanupVncSession(reason, session)) {
+        if (session.timeoutHandle) clearTimeout(session.timeoutHandle);
+        const maxLifetimeRemaining = 2 * 60 * 60 * 1000 - (Date.now() - session.startedAt);
+        const timeout = Math.max(0, Math.min(session.timeoutMs, maxLifetimeRemaining));
+        session.timeoutHandle = setTimeout(() => {
+            this.logger.warn("[VNC] Session timed out. Cleaning up.");
+            scopedCleanup("idle_timeout");
+        }, timeout);
+    }
+
+    matchesSessionId(sessionId) {
+        return typeof sessionId === "string" && this.vncSession?.sessionId === sessionId;
+    }
+
+    touchVncSession(req, res) {
+        if (!this.vncSession) return res.status(404).json({ message: "errorVncNoSession" });
+        if (!this.matchesSessionId(req.body?.sessionId)) {
+            return res.status(409).json({ message: "errorVncSessionMismatch" });
+        }
+        this._scheduleSessionTimeout(this.vncSession);
+        return res.json({ success: true });
+    }
+
+    async _verifyReauthIdentity(session) {
+        const { page, expectedAccountName } = session;
+        try {
+            const appsResponse = await page.goto("https://aistudio.google.com/apps", {
+                timeout: 30000,
+                waitUntil: "domcontentloaded",
+            });
+            // A Google login page can briefly redirect through AI Studio. Wait for the
+            // final /apps URL and rendered account switcher before accepting it.
+            await page.waitForTimeout(1000);
+            const appsUrl = new URL(page.url());
+            if (
+                (appsResponse && !appsResponse.ok()) ||
+                !["ai.studio", "aistudio.google.com"].includes(appsUrl.hostname) ||
+                (appsUrl.pathname !== "/apps" && !appsUrl.pathname.startsWith("/apps/")) ||
+                /sign in|登录/i.test(await page.title())
+            ) {
+                throw this._reauthError(400, "errorVncReauthNotAuthenticated");
+            }
+            const detectedAccount = await detectAccountEmail(page);
+            if (!detectedAccount) {
+                throw this._reauthError(400, "errorVncReauthNotAuthenticated");
+            }
+            if (detectedAccount !== expectedAccountName) {
+                throw this._reauthError(409, "errorVncReauthAccountMismatch");
+            }
+        } catch (error) {
+            if (error.messageKey) throw error;
+            this.logger.warn(`[VNC] Could not verify reauthentication: ${error.message}`);
+            throw this._reauthError(400, "errorVncReauthNotAuthenticated");
+        }
+    }
+
+    _writeAuthFileAtomically(filePath, authData) {
+        const temporaryPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+        let descriptor;
+        try {
+            descriptor = fs.openSync(temporaryPath, "wx", 0o600);
+            fs.writeFileSync(descriptor, JSON.stringify(authData, null, 2));
+            fs.fsyncSync(descriptor);
+            fs.closeSync(descriptor);
+            descriptor = null;
+            fs.renameSync(temporaryPath, filePath);
+        } finally {
+            if (descriptor !== undefined && descriptor !== null) fs.closeSync(descriptor);
+            if (fs.existsSync(temporaryPath)) fs.unlinkSync(temporaryPath);
+        }
+    }
+
+    async _saveReauthenticatedAccount(session) {
+        const { targetAuthIndex: index, expectedAccountName, context } = session;
+        const authSource = this.serverSystem.authSource;
+        const browserManager = this.serverSystem.browserManager;
+        if (this.vncSession !== session) {
+            throw this._reauthError(409, "errorVncNoSession");
+        }
+        await this._verifyReauthIdentity(session);
+
+        const filePath = path.join(process.cwd(), "configs", "auth", `auth-${index}.json`);
+        if (!fs.existsSync(filePath)) {
+            throw this._reauthError(404, "errorVncReauthAccountNotFound");
+        }
+        const previous = JSON.parse(fs.readFileSync(filePath, "utf8"));
+        if (
+            typeof previous.accountName !== "string" ||
+            previous.accountName.trim().toLowerCase() !== expectedAccountName
+        ) {
+            throw this._reauthError(409, "errorVncReauthAccountChanged");
+        }
+        const storageState = await context.storageState({ indexedDB: true });
+        if (!Array.isArray(storageState?.cookies) || !Array.isArray(storageState?.origins)) {
+            throw new Error("Browser did not return a valid storage state");
+        }
+        const updated = { ...previous, ...storageState, accountName: previous.accountName, expired: false };
+        const backupPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.backup`;
+        let replaced = false;
+        let suspended = false;
+        let keepBackup = false;
+        try {
+            await browserManager.suspendAuthUpdates(index);
+            suspended = true;
+            fs.copyFileSync(filePath, backupPath);
+            fs.chmodSync(backupPath, 0o600);
+            this._writeAuthFileAtomically(filePath, updated);
+            replaced = true;
+            authSource.reloadAuthSources(true);
+            if (authSource.expiredIndices.includes(index) || !authSource.availableIndices.includes(index)) {
+                throw new Error("Reauthenticated auth file did not pass validation");
+            }
+        } catch (error) {
+            try {
+                if (replaced && fs.existsSync(backupPath)) {
+                    fs.renameSync(backupPath, filePath);
+                    authSource.reloadAuthSources(true);
+                }
+            } catch (rollbackError) {
+                keepBackup = true;
+                this.logger.error(`[VNC] Could not roll back account #${index}: ${rollbackError.message}`);
+                throw rollbackError;
+            } finally {
+                if (suspended) browserManager.resumeAuthUpdates(index);
+            }
+            throw error;
+        } finally {
+            if (!keepBackup && fs.existsSync(backupPath)) fs.unlinkSync(backupPath);
+        }
+
+        // The new credential is already validated and committed. A transient browser
+        // restart failure must not restore the old expired credential.
+        let refreshPending = false;
+        try {
+            const refresh = await browserManager.refreshContextAfterReauth(index);
+            refreshPending = Boolean(refresh?.deferred);
+        } catch (error) {
+            refreshPending = true;
+            this.logger.warn(`[VNC] Account #${index} saved, but browser refresh is pending: ${error.message}`);
+        }
+        if (authSource.health.getStatus(index).mode !== "disabled") {
+            authSource.health.reset(index);
+        }
+        this.logger.info(`[VNC] Reauthenticated existing account #${index}`);
+        return {
+            accountName: previous.accountName,
+            accountNameMap: Object.fromEntries(authSource.accountNameMap),
+            availableIndices: authSource.availableIndices,
+            message: "vncAuthReauthSuccess",
+            reauthenticatedAuthIndex: index,
+            refreshPending,
+        };
     }
 
     async _cleanupVncSession(reason = "unknown", specificSession = null) {

@@ -242,9 +242,17 @@ class AuthRoutes {
             if (this._rejectIfSystemBusy(res)) return;
             return this.createAuth.saveAuthFile(req, res, next);
         });
+        app.post("/api/vnc/sessions/heartbeat", isAuthenticated, (req, res) =>
+            this.createAuth.touchVncSession(req, res)
+        );
         app.delete("/api/vnc/sessions", isAuthenticated, async (req, res) => {
+            const session = this.createAuth.vncSession;
+            if (!session) return res.sendStatus(204);
+            if (!this.createAuth.matchesSessionId(req.query.sessionId)) {
+                return res.status(409).json({ message: "errorVncSessionMismatch" });
+            }
             this.logger.info("[VNC] Received cleanup request from client (beacon).");
-            await this.createAuth._cleanupVncSession("client_beacon");
+            await this.createAuth._cleanupVncSession("client_beacon", session);
             res.sendStatus(204); // No content
         });
     }
