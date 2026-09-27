@@ -59,6 +59,7 @@ function setup(t, { email = "person@example.test", oldExpired = true, refreshErr
     );
     const authSource = new AuthSource(logger);
     const calls = [];
+    const authCredentialEpochs = new Map();
     let writesSuspended = false;
     const browserManager = {
         async refreshContextAfterReauth(index) {
@@ -76,7 +77,14 @@ function setup(t, { email = "person@example.test", oldExpired = true, refreshErr
             writesSuspended = true;
         },
     };
-    const createAuth = new CreateAuth({ authSource, browserManager, logger });
+    const createAuth = new CreateAuth({
+        advanceAuthCredentialEpoch(index) {
+            authCredentialEpochs.set(index, (authCredentialEpochs.get(index) || 0) + 1);
+        },
+        authSource,
+        browserManager,
+        logger,
+    });
     const session = {
         context: {
             storageState: async options => {
@@ -90,11 +98,19 @@ function setup(t, { email = "person@example.test", oldExpired = true, refreshErr
         targetAuthIndex: 3,
     };
     createAuth.vncSession = session;
-    return { authFile, authSource, calls, createAuth, session, writesSuspended: () => writesSuspended };
+    return {
+        authCredentialEpochs,
+        authFile,
+        authSource,
+        calls,
+        createAuth,
+        session,
+        writesSuspended: () => writesSuspended,
+    };
 }
 
 test("reauthentication replaces the same index and preserves manual disable", async t => {
-    const { authFile, authSource, calls, createAuth, session } = setup(t);
+    const { authCredentialEpochs, authFile, authSource, calls, createAuth, session } = setup(t);
     authSource.health.setDisabled(3, true);
 
     const result = await createAuth._saveReauthenticatedAccount(session);
@@ -107,6 +123,7 @@ test("reauthentication replaces the same index and preserves manual disable", as
     assert.equal(saved.cookies[0].name, "fresh");
     assert.equal(authSource.health.getStatus(3).mode, "disabled");
     assert.equal(authSource.expiredIndices.includes(3), false);
+    assert.equal(authCredentialEpochs.get(3), 1);
     assert.deepEqual(calls, ["suspend:3", "refresh:3"]);
     assert.equal(fs.readdirSync(path.dirname(authFile)).length, 1);
 });
@@ -184,7 +201,7 @@ test("a stale tab cannot save or extend a newer VNC session", async t => {
 });
 
 test("reauthentication rolls back if the replaced file cannot be reloaded", async t => {
-    const { authFile, authSource, calls, createAuth, session } = setup(t);
+    const { authCredentialEpochs, authFile, authSource, calls, createAuth, session } = setup(t);
     const before = fs.readFileSync(authFile, "utf8");
     const realReload = authSource.reloadAuthSources.bind(authSource);
     let reloads = 0;
@@ -196,6 +213,7 @@ test("reauthentication rolls back if the replaced file cannot be reloaded", asyn
     await assert.rejects(createAuth._saveReauthenticatedAccount(session), /synthetic reload failure/);
     assert.equal(fs.readFileSync(authFile, "utf8"), before);
     assert.equal(authSource.expiredIndices.includes(3), true);
+    assert.equal(authCredentialEpochs.has(3), false);
     assert.deepEqual(calls, ["suspend:3", "resume:3"]);
     assert.equal(fs.readdirSync(path.dirname(authFile)).length, 1);
 });

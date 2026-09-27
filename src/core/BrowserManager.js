@@ -549,15 +549,15 @@ class BrowserManager {
         }
     }
 
-    async suspendAuthUpdates(authIndex) {
+    async suspendAuthUpdates(authIndex, options = {}) {
+        if (!options.keepRecheckRunning && this._expiredRecheckIndex === authIndex) {
+            await this._stopExpiredRecheck();
+            if (this._expiredRecheckTask) await this._expiredRecheckTask;
+        }
         this._authUpdateSuspended.add(authIndex);
         this.authSource.setPendingRefresh(authIndex, true);
         const marking = this._markExpiredTasks.get(authIndex);
         if (marking) await marking;
-        if (this._expiredRecheckIndex === authIndex) {
-            await this._stopExpiredRecheck();
-            if (this._expiredRecheckTask) await this._expiredRecheckTask;
-        }
         const pending = this._authUpdateTasks.get(authIndex);
         if (pending) await pending;
     }
@@ -1054,14 +1054,23 @@ class BrowserManager {
 
     async _recheckNextExpiredAccount() {
         if (this._expiredRecheckTask || this._isSystemBusy()) return;
-        const expired = [...(this.authSource.expiredIndices || [])].sort((a, b) => a - b);
-        if (expired.length === 0) return;
+        const candidates = [
+            ...new Set([
+                ...(this.authSource.expiredIndices || []),
+                ...this.authSource.availableIndices.filter(
+                    index => this.authSource.health?.getStatus(index)?.mode === "reauth"
+                ),
+            ]),
+        ]
+            .filter(index => !this.authSource.pendingRefreshIndices?.has(index))
+            .sort((a, b) => a - b);
+        if (candidates.length === 0) return;
         const now = Date.now();
-        for (let offset = 0; offset < expired.length; offset++) {
-            const position = (this._expiredRecheckCursor + offset) % expired.length;
-            const authIndex = expired[position];
+        for (let offset = 0; offset < candidates.length; offset++) {
+            const position = (this._expiredRecheckCursor + offset) % candidates.length;
+            const authIndex = candidates[position];
             if ((this._expiredRecheckDueAt.get(authIndex) || 0) > now) continue;
-            this._expiredRecheckCursor = (position + 1) % expired.length;
+            this._expiredRecheckCursor = (position + 1) % candidates.length;
             await this.recheckExpiredAccount(authIndex);
             return;
         }
@@ -1071,16 +1080,33 @@ class BrowserManager {
         if (!Number.isInteger(authIndex) || !this.authSource.availableIndices.includes(authIndex)) {
             return { reason: "unavailable", recovered: false };
         }
-        if (!this.authSource.isExpired(authIndex)) {
+        if (this.authSource.pendingRefreshIndices?.has(authIndex)) {
+            return { reason: "busy", recovered: false };
+        }
+        if (!this.authSource.isExpired(authIndex) && this.authSource.health?.getStatus(authIndex)?.mode !== "reauth") {
             return { reason: "not_expired", recovered: false };
         }
         if (this._expiredRecheckTask) return { reason: "busy", recovered: false };
         this._expiredRecheckAborted = false;
-        const task = this._runExpiredRecheck(authIndex);
-        this._expiredRecheckTask = task;
         this._expiredRecheckIndex = authIndex;
+        const task = this._runExpiredRecheck(authIndex).then(async result => {
+            if (!result.refreshContext) return result;
+            try {
+                const refresh = await this.refreshContextAfterReauth(authIndex, { deferActivation: true });
+                return { ...result, activateAfterRecheck: refresh.activateAfterRecheck };
+            } catch (error) {
+                this.logger.warn(
+                    `[Auth Recheck] Verified auth #${authIndex}, but context refresh is pending: ${error.message}`
+                );
+                if (this.contexts.has(authIndex)) this.pendingContextClosures.set(authIndex, "reauth");
+                else this.resumeAuthUpdates(authIndex);
+                return result;
+            }
+        });
+        this._expiredRecheckTask = task;
+        let result;
         try {
-            const result = await task;
+            result = await task;
             if (result.reason === "recovered") {
                 this._expiredRecheckDueAt.delete(authIndex);
                 this._expiredRecheckFailures.delete(authIndex);
@@ -1096,11 +1122,24 @@ class BrowserManager {
                         )
                 );
             }
-            return result;
         } finally {
             if (this._expiredRecheckTask === task) this._expiredRecheckTask = null;
             if (this._expiredRecheckIndex === authIndex) this._expiredRecheckIndex = null;
         }
+        if (
+            result.recovered &&
+            !this._expiredRecheckAborted &&
+            (result.activateAfterRecheck || (this._currentAuthIndex < 0 && this.contexts.size === 0)) &&
+            !this._isSystemBusy() &&
+            this.authSource.getRotationIndices().includes(authIndex)
+        ) {
+            // The probe has released its temporary context and cleared its task.
+            // Start a service context so recovery from an all-expired startup becomes ready.
+            this.launchOrSwitchContext(authIndex).catch(error => {
+                this.logger.warn(`[Auth Recheck] Could not activate recovered auth #${authIndex}: ${error.message}`);
+            });
+        }
+        return { reason: result.reason, recovered: result.recovered };
     }
 
     async _runExpiredRecheck(authIndex) {
@@ -1134,8 +1173,14 @@ class BrowserManager {
 
         let context = null;
         let launchedBrowser = false;
+        let writeSuspended = false;
+        let committedHealthReauth = false;
         try {
-            if (!this.authSource.isExpired(authIndex) || this._expiredRecheckAborted) {
+            if (
+                (!this.authSource.isExpired(authIndex) &&
+                    this.authSource.health?.getStatus(authIndex)?.mode !== "reauth") ||
+                this._expiredRecheckAborted
+            ) {
                 return { reason: "busy", recovered: false };
             }
             if (!this.browser) {
@@ -1219,24 +1264,37 @@ class BrowserManager {
                 return { reason: "unavailable", recovered: false };
             }
             const storageState = await this._captureStorageState(context);
+            const healthOnlyReauth = !this.authSource.isExpired(authIndex);
+            if (healthOnlyReauth) {
+                writeSuspended = true;
+                await this.suspendAuthUpdates(authIndex, { keepRecheckRunning: true });
+                if (this._expiredRecheckAborted) return { reason: "busy", recovered: false };
+            }
             const restored = await this.authSource.unmarkAsExpired(authIndex, {
+                allowHealthReauth: true,
                 expectedContent: originalContent,
                 storageState,
             });
             if (!restored) return { reason: "unavailable", recovered: false };
+            committedHealthReauth = healthOnlyReauth;
             const healthMode = this.authSource.health?.getStatus(authIndex)?.mode;
             if (healthMode && healthMode !== "disabled" && healthMode !== "active") {
                 this.authSource.health.reset(authIndex);
             }
             this.logger.info(`[Auth Recheck] Auth #${authIndex} recovered and returned to rotation.`);
-            return { reason: "recovered", recovered: true };
+            return { reason: "recovered", recovered: true, refreshContext: healthOnlyReauth };
         } catch (error) {
-            if (isAuthExpiredError(error)) return { reason: "needs_login", recovered: false };
+            if (isAuthExpiredError(error)) {
+                if (this._expiredRecheckAborted) return { reason: "busy", recovered: false };
+                const marked = this.authSource.isExpired(authIndex) || (await this._markAccountExpired(authIndex));
+                return { reason: marked ? "needs_login" : "unavailable", recovered: false };
+            }
             if (!this._expiredRecheckAborted) {
                 this.logger.warn(`[Auth Recheck] Auth #${authIndex} could not be verified: ${error.message}`);
             }
             return { reason: this._expiredRecheckAborted ? "busy" : "unavailable", recovered: false };
         } finally {
+            if (writeSuspended && !committedHealthReauth) this.resumeAuthUpdates(authIndex);
             this._expiredRecheckContext = null;
             if (context) await context.close().catch(() => {});
             if (this.contexts.size === 0 && this.initializingContexts.size === 0 && this.browser && launchedBrowser) {
@@ -1258,7 +1316,7 @@ class BrowserManager {
         await this._expiredRecheckTask.catch(() => {});
     }
 
-    async refreshContextAfterReauth(authIndex) {
+    async refreshContextAfterReauth(authIndex, options = {}) {
         // Called after an atomic replacement of auth-{index}.json. The old browser context
         // must never save its stale state over the new credentials.
         this._authUpdateSuspended.add(authIndex);
@@ -1285,11 +1343,11 @@ class BrowserManager {
         }
         this.resumeAuthUpdates(authIndex);
         if (wasCurrent && !this.authSource.isExpired(authIndex)) {
-            await this.launchOrSwitchContext(authIndex);
+            if (!options.deferActivation) await this.launchOrSwitchContext(authIndex);
         } else if (!this._isSystemBusy() && this.browser) {
             await this.rebalanceContextPool();
         }
-        return { deferred: false };
+        return { activateAfterRecheck: options.deferActivation && wasCurrent, deferred: false };
     }
 
     /**

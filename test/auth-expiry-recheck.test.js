@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 
 const BrowserManager = require("../src/core/BrowserManager");
+const AccountHealth = require("../src/auth/AccountHealth");
 const AuthSource = require("../src/auth/AuthSource");
 const { detectAccountEmail } = require("../src/auth/AuthPageIdentity");
 const { isAuthExpiredError } = require("../src/utils/CustomErrors");
@@ -17,6 +18,7 @@ function loginPage(redirectAfterRetry) {
         goto: async () => {
             if (redirectAfterRetry) url = "https://ai.studio/apps/test";
         },
+        on() {},
         title: async () => (url.includes("accounts.google.com") ? "Sign in" : "AI Studio"),
         url: () => url,
         waitForTimeout: async () => {},
@@ -37,6 +39,95 @@ function identityPage(email) {
         title: async () => "Google AI Studio",
         url: () => url,
         waitForTimeout: async () => {},
+    };
+}
+
+function healthOnlyRecheck(t, page) {
+    const warnings = [];
+    const probeLogger = {
+        ...logger,
+        error: message => warnings.push(message),
+        warn: message => warnings.push(message),
+    };
+    const originalCwd = process.cwd();
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "auth-health-recheck-"));
+    t.after(() => {
+        process.chdir(originalCwd);
+        fs.rmSync(directory, { force: true, recursive: true });
+    });
+    fs.mkdirSync(path.join(directory, "configs", "auth"), { recursive: true });
+    const filePath = path.join(directory, "configs", "auth", "auth-15.json");
+    fs.writeFileSync(
+        filePath,
+        JSON.stringify({ accountName: "account@example.com", cookies: [{ name: "old" }], origins: [] })
+    );
+    process.chdir(directory);
+
+    const health = Object.create(AccountHealth.prototype);
+    health.accounts = {};
+    health.logger = logger;
+    health.now = Date.now;
+    health._save = () => {};
+    health.recordFailure(15, 401, "first-request");
+    health.recordFailure(15, 401, "second-request");
+
+    const authSource = Object.create(AuthSource.prototype);
+    authSource.logger = probeLogger;
+    authSource.availableIndices = [15];
+    authSource.expiredIndices = [];
+    authSource.pendingRefreshIndices = new Set();
+    authSource.accountNameMap = new Map([[15, "account@example.com"]]);
+    authSource.canonicalIndexMap = new Map();
+    authSource.health = health;
+    authSource._buildRotationIndices();
+
+    let contextClosed = false;
+    let probeCount = 0;
+    const manager = Object.create(BrowserManager.prototype);
+    manager._backgroundPreloadTask = null;
+    manager._expiredRecheckCursor = 0;
+    manager._expiredRecheckDueAt = new Map();
+    manager._expiredRecheckFailures = new Map();
+    manager._markExpiredTasks = new Map();
+    manager._authUpdateSuspended = new Set();
+    manager._authUpdateTasks = new Map();
+    manager._wsInitState = new Map();
+    manager.authSource = authSource;
+    manager.browser = {
+        newContext: async () => {
+            probeCount++;
+            return {
+                addInitScript: async () => {},
+                close: async () => {
+                    contextClosed = true;
+                },
+                newPage: async () => page,
+            };
+        },
+    };
+    manager.config = {};
+    manager.contexts = new Map();
+    manager.initializingContexts = new Set();
+    manager.pendingContextClosures = new Map();
+    manager.logger = probeLogger;
+    manager.stickyProxyManager = { getProxyForAuth: () => null };
+    manager.targetUrl = "https://ai.studio/apps/test";
+    manager._isSystemBusy = () => false;
+    manager._hasActiveQueueForAuth = () => false;
+    manager._navigateAndWakeUpPage = async () => {};
+    manager._waitForWebSocketInit = async () => true;
+    manager._captureStorageState = async () => ({ cookies: [{ name: "renewed" }], origins: [] });
+    manager._getPrivacyProtectionScript = () => "";
+    manager.rebalanceContextPool = async () => {};
+
+    return {
+        authSource,
+        filePath,
+        health,
+        manager,
+        probeCount: () => probeCount,
+        warnings,
+        wasContextClosed: () => contextClosed,
     };
 }
 
@@ -168,6 +259,145 @@ test("expired recheck leaves the account excluded while a request is active", as
     const result = await manager.recheckExpiredAccount(15);
     assert.deepEqual(result, { reason: "busy", recovered: false });
     assert.equal(manager.contexts.has(1), true);
+});
+
+test("health-only reauth retry verifies the browser before restoring rotation", async t => {
+    const { authSource, filePath, health, manager, warnings, wasContextClosed } = healthOnlyRecheck(
+        t,
+        identityPage("account@example.com")
+    );
+    let staleContextClosed = false;
+    let reactivated = null;
+    manager._currentAuthIndex = 15;
+    manager.contexts.set(2, {});
+    manager.contexts.set(15, {});
+    manager.closeContext = async index => {
+        assert.equal(manager._authUpdateSuspended.has(index), true);
+        assert.equal(authSource.pendingRefreshIndices.has(index), true);
+        staleContextClosed = true;
+        manager.contexts.delete(index);
+        manager._currentAuthIndex = -1;
+    };
+    manager.launchOrSwitchContext = async index => {
+        assert.equal(manager._expiredRecheckTask, null);
+        reactivated = index;
+    };
+    assert.equal(health.getStatus(15).mode, "reauth");
+    assert.deepEqual(authSource.getRotationIndices(), []);
+    assert.deepEqual(
+        await manager.recheckExpiredAccount(15),
+        { reason: "recovered", recovered: true },
+        warnings.join("\n")
+    );
+    assert.equal(health.getStatus(15).mode, "active");
+    assert.deepEqual(authSource.getRotationIndices(), [15]);
+    assert.equal(JSON.parse(fs.readFileSync(filePath, "utf-8")).cookies[0].name, "renewed");
+    assert.equal(wasContextClosed(), true);
+    assert.equal(staleContextClosed, true);
+    assert.equal(reactivated, 15);
+    assert.equal(manager.contexts.has(2), true);
+});
+
+test("health-only reauth retry marks confirmed login as expired", async t => {
+    const { authSource, filePath, health, manager, warnings } = healthOnlyRecheck(t, loginPage(false));
+
+    assert.deepEqual(
+        await manager.recheckExpiredAccount(15),
+        { reason: "needs_login", recovered: false },
+        warnings.join("\n")
+    );
+    assert.equal(JSON.parse(fs.readFileSync(filePath, "utf-8")).expired, true);
+    assert.equal(authSource.isExpired(15), true);
+    assert.equal(health.getStatus(15).mode, "reauth");
+    assert.deepEqual(authSource.getRotationIndices(), []);
+});
+
+test("health-only reauth retry leaves an unverifiable account excluded", async t => {
+    const { authSource, filePath, health, manager } = healthOnlyRecheck(t, identityPage("other@example.com"));
+    const originalContent = fs.readFileSync(filePath, "utf-8");
+
+    assert.deepEqual(await manager.recheckExpiredAccount(15), { reason: "unavailable", recovered: false });
+    assert.equal(fs.readFileSync(filePath, "utf-8"), originalContent);
+    assert.equal(health.getStatus(15).mode, "reauth");
+    assert.deepEqual(authSource.getRotationIndices(), []);
+});
+
+test("background recheck probes health-only reauth accounts with backoff", async t => {
+    const { health, manager, probeCount } = healthOnlyRecheck(t, identityPage("other@example.com"));
+
+    await manager._recheckNextExpiredAccount();
+    assert.equal(probeCount(), 1);
+    assert.equal(health.getStatus(15).mode, "reauth");
+    assert.ok(manager._expiredRecheckDueAt.get(15) > Date.now());
+    await manager._recheckNextExpiredAccount();
+    assert.equal(probeCount(), 1);
+});
+
+test("recovered account activates after an all-expired startup probe finishes", async () => {
+    const manager = Object.create(BrowserManager.prototype);
+    manager._currentAuthIndex = -1;
+    manager._expiredRecheckDueAt = new Map();
+    manager._expiredRecheckFailures = new Map();
+    manager._expiredRecheckTask = null;
+    manager._expiredRecheckIndex = null;
+    manager.authSource = {
+        availableIndices: [15],
+        getRotationIndices: () => [15],
+        isExpired: () => true,
+    };
+    manager.contexts = new Map();
+    manager.logger = logger;
+    manager._isSystemBusy = () => false;
+    manager._runExpiredRecheck = async () => ({ reason: "recovered", recovered: true });
+    let activated = null;
+    manager.launchOrSwitchContext = async index => {
+        assert.equal(manager._expiredRecheckTask, null);
+        activated = index;
+    };
+
+    assert.deepEqual(await manager.recheckExpiredAccount(15), { reason: "recovered", recovered: true });
+    assert.equal(activated, 15);
+});
+
+test("credential replacement waits for a verified recheck context refresh", async () => {
+    let refreshStarted;
+    let finishRefresh;
+    const started = new Promise(resolve => {
+        refreshStarted = resolve;
+    });
+    const manager = Object.create(BrowserManager.prototype);
+    manager._currentAuthIndex = 2;
+    manager._expiredRecheckDueAt = new Map();
+    manager._expiredRecheckFailures = new Map();
+    manager._authUpdateSuspended = new Set();
+    manager._authUpdateTasks = new Map();
+    manager._markExpiredTasks = new Map();
+    manager.authSource = {
+        availableIndices: [2, 15],
+        isExpired: index => index === 15,
+        setPendingRefresh: () => {},
+    };
+    manager.contexts = new Map([[2, {}]]);
+    manager.logger = logger;
+    manager._runExpiredRecheck = async () => ({ reason: "recovered", recovered: true, refreshContext: true });
+    manager.refreshContextAfterReauth = () => {
+        refreshStarted();
+        return new Promise(resolve => {
+            finishRefresh = resolve;
+        });
+    };
+
+    const checking = manager.recheckExpiredAccount(15);
+    await started;
+    let replacementReady = false;
+    const replacement = manager.suspendAuthUpdates(15).then(() => {
+        replacementReady = true;
+    });
+    await Promise.resolve();
+    assert.equal(replacementReady, false);
+    finishRefresh({ deferred: false });
+    await Promise.all([checking, replacement]);
+    assert.equal(replacementReady, true);
 });
 
 test("single-context pool can use one temporary idle probe without evicting the current account", async t => {

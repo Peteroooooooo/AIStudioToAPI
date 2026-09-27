@@ -6,6 +6,7 @@ const path = require("node:path");
 
 const AccountHealth = require("../src/auth/AccountHealth");
 const ConnectionRegistry = require("../src/core/ConnectionRegistry");
+const ProxyServerSystem = require("../src/core/ProxyServerSystem");
 
 const logger = { debug() {}, error() {}, info() {}, warn() {} };
 
@@ -97,6 +98,46 @@ test("backend outcome belongs to its queue account and stale responses are ignor
     );
     assert.equal(health.isAvailable(1), false);
     assert.equal(health.isAvailable(2), true);
+});
+
+test("late outcomes from the old credential do not quarantine a reauthenticated account", t => {
+    const { health } = fixture(t);
+    const system = Object.create(ProxyServerSystem.prototype);
+    system.authCredentialEpochs = new Map();
+    system.authSource = { health };
+    system.browserManager = { rebalanceContextPool: async () => {} };
+    system.logger = logger;
+    system.requestHandler = { cacheManager: { consumeCachedAttemptOutcome: () => false } };
+
+    const registry = new ConnectionRegistry(logger, null, null, null, index => system.getAuthCredentialEpoch(index));
+    registry.on("backendOutcome", outcome => system._recordBackendOutcome(outcome));
+    registry.createMessageQueue("old-1", 3, "old-attempt-1");
+    registry.createMessageQueue("old-2", 3, "old-attempt-2");
+
+    system.advanceAuthCredentialEpoch(3);
+    health.reset(3);
+    for (const [requestId, requestAttemptId] of [
+        ["old-1", "old-attempt-1"],
+        ["old-2", "old-attempt-2"],
+    ]) {
+        registry._handleIncomingMessage(
+            JSON.stringify({
+                event_type: "error",
+                request_attempt_id: requestAttemptId,
+                request_id: requestId,
+                status: 401,
+            }),
+            3
+        );
+    }
+    assert.equal(health.getStatus(3).mode, "active");
+
+    registry.createMessageQueue("new-1", 3, "new-attempt-1");
+    registry._handleIncomingMessage(
+        JSON.stringify({ event_type: "error", request_attempt_id: "new-attempt-1", request_id: "new-1", status: 429 }),
+        3
+    );
+    assert.equal(health.getStatus(3).mode, "cooldown");
 });
 
 test("token chunks from a stale or wrong-account attempt are discarded", () => {
