@@ -215,11 +215,10 @@
                 <article class="usage-kpi">
                     <span :title="t('usageCachedInputTokens')">{{ t("usageCachedTokensCard") }}</span>
                     <strong>{{ formatTokenCount(overview.summary?.tokenUsage?.cachedInputTokens) }}</strong>
-                </article>
-                <article class="usage-kpi">
-                    <span :title="t('usageCacheReadRate')">{{ t("usageCacheRateCard") }}</span>
-                    <strong>{{ formatOptionalPercent(overview.summary?.cacheReadRate) }}</strong>
-                    <small>{{ cacheCoverageLabel(overview.summary) }}</small>
+                    <small :title="cacheCoverageLabel(overview.summary)"
+                        >{{ t("usageCacheRateCard") }}
+                        {{ formatOptionalPercent(overview.summary?.cacheReadRate) }}</small
+                    >
                 </article>
             </div>
             <div v-if="filters.accountKey" class="usage-summary-meta">
@@ -1796,7 +1795,7 @@ defineExpose({ focusRequest, refresh, refreshAfterImport });
 }
 .usage-kpis {
     display: grid;
-    grid-template-columns: repeat(7, minmax(0, 1fr));
+    grid-template-columns: repeat(6, minmax(0, 1fr));
 }
 .usage-kpi {
     display: flex;
@@ -2209,29 +2208,16 @@ defineExpose({ focusRequest, refresh, refreshAfterImport });
 }
 @media (max-width: 1400px) {
     .usage-kpis {
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-    }
-    .usage-kpi:nth-child(4) {
-        border-right: 0;
-    }
-    .usage-kpi:nth-child(n + 5) {
-        border-top: 1px solid @border-light;
-    }
-}
-@media (max-width: 1000px) {
-    .usage-kpis {
         grid-template-columns: repeat(3, minmax(0, 1fr));
     }
-    .usage-kpi:nth-child(4) {
-        border-right: 1px solid @border-light;
-    }
-    .usage-kpi:nth-child(3),
-    .usage-kpi:nth-child(6) {
+    .usage-kpi:nth-child(3) {
         border-right: 0;
     }
     .usage-kpi:nth-child(n + 4) {
         border-top: 1px solid @border-light;
     }
+}
+@media (max-width: 1000px) {
     .usage-overview-grid {
         grid-template-columns: 1fr;
     }
