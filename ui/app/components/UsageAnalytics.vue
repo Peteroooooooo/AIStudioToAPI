@@ -212,15 +212,18 @@
                     <strong>{{ formatTokenCount(overview.summary?.tokenUsage?.totalTokens) }}</strong>
                     <small>{{ tokenCoverageLabel(overview.summary) }}</small>
                 </article>
+                <article class="usage-kpi">
+                    <span :title="t('usageCachedInputTokens')">{{ t("usageCachedTokensCard") }}</span>
+                    <strong>{{ formatTokenCount(overview.summary?.tokenUsage?.cachedInputTokens) }}</strong>
+                </article>
+                <article class="usage-kpi">
+                    <span :title="t('usageCacheReadRate')">{{ t("usageCacheRateCard") }}</span>
+                    <strong>{{ formatOptionalPercent(overview.summary?.cacheReadRate) }}</strong>
+                    <small>{{ cacheCoverageLabel(overview.summary) }}</small>
+                </article>
             </div>
-            <div class="usage-summary-meta">
-                <span v-if="filters.accountKey">{{ t("usageSelectedAccountScope") }}</span>
-                <span
-                    >{{ t("usageCachedInputTokens") }}
-                    {{ formatTokenCount(overview.summary?.tokenUsage?.cachedInputTokens) }}</span
-                >
-                <span>{{ t("usageCacheReadRate") }} {{ formatOptionalPercent(overview.summary?.cacheReadRate) }}</span>
-                <span>{{ cacheCoverageLabel(overview.summary) }}</span>
+            <div v-if="filters.accountKey" class="usage-summary-meta">
+                <span>{{ t("usageSelectedAccountScope") }}</span>
             </div>
         </div>
 
@@ -1793,7 +1796,7 @@ defineExpose({ focusRequest, refresh, refreshAfterImport });
 }
 .usage-kpis {
     display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(7, minmax(0, 1fr));
 }
 .usage-kpi {
     display: flex;
@@ -1815,6 +1818,7 @@ defineExpose({ focusRequest, refresh, refreshAfterImport });
     font-size: clamp(1.25rem, 1.8vw, 1.7rem);
     line-height: 1.1;
     font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
 }
 .usage-kpi small {
     color: @text-secondary;
@@ -2203,11 +2207,26 @@ defineExpose({ focusRequest, refresh, refreshAfterImport });
     white-space: pre-wrap;
     overflow-wrap: anywhere;
 }
+@media (max-width: 1400px) {
+    .usage-kpis {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+    .usage-kpi:nth-child(4) {
+        border-right: 0;
+    }
+    .usage-kpi:nth-child(n + 5) {
+        border-top: 1px solid @border-light;
+    }
+}
 @media (max-width: 1000px) {
     .usage-kpis {
         grid-template-columns: repeat(3, minmax(0, 1fr));
     }
-    .usage-kpi:nth-child(3) {
+    .usage-kpi:nth-child(4) {
+        border-right: 1px solid @border-light;
+    }
+    .usage-kpi:nth-child(3),
+    .usage-kpi:nth-child(6) {
         border-right: 0;
     }
     .usage-kpi:nth-child(n + 4) {
@@ -2241,9 +2260,6 @@ defineExpose({ focusRequest, refresh, refreshAfterImport });
     }
     .usage-kpi:nth-child(n + 3) {
         border-top: 1px solid @border-light;
-    }
-    .usage-summary-meta {
-        gap: 4px 12px;
     }
     .usage-tabs {
         display: grid;
