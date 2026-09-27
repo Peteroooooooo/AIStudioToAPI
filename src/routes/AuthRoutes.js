@@ -173,7 +173,9 @@ class AuthRoutes {
                     authSuccess = true;
                 }
             } else {
-                if (submittedPassword && this.serverSystem.config.apiKeys.includes(submittedPassword)) {
+                // Imported API keys preserve older installations' console login.
+                // Newly generated client keys never grant console admin access.
+                if (submittedPassword && this.serverSystem.apiKeyStore?.match(submittedPassword)?.source === "legacy") {
                     authSuccess = true;
                 }
             }

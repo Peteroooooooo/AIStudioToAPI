@@ -43,9 +43,9 @@
 
 3. 配置文件：
 
-   首次启动会生成 `data/config.json`，以后统一以这个文件为准。已有 `.env` 或 Portainer 环境变量只在首次生成文件时导入一次；之后请在控制台“设置”页或配置文件中修改。API 密钥、控制台密码、监听端口等启动项编辑文件后需重启进程。
+   首次启动会生成 `data/config.json`，以后统一以这个文件为准。已有 `.env` 或 Portainer 环境变量只在首次生成文件时导入一次；之后请在控制台“设置”页或配置文件中修改。控制台密码、监听端口等启动项编辑文件后需重启进程。
 
-   如果服务可从公网访问，请设置自己的 `API_KEYS` 和控制台密码，不要使用默认密钥 `123456`。
+   首次启动前请将 `.env.example` 复制为 `.env` 并设置 `WEB_CONSOLE_PASSWORD`。登录后在“设置 → API Keys”生成客户端密钥，可随时复制或撤销；修改密钥无需重启。旧版 `API_KEYS` 和 `data/config.json` 中的密钥会自动迁移，原密钥继续有效。旧部署如未设置独立控制台密码，需先在 `data/config.json` 的 `startup.webConsolePassword` 设置密码并重启，才能管理 API 密钥。
 
 4. 启动服务：
 
@@ -112,10 +112,10 @@ docker run -d \
   -p 7860:7860 \
   -v /path/to/auth:/app/configs/auth \
   -v /path/to/data:/app/data \
-  -e API_KEYS=your-api-key-1,your-api-key-2 \
+  -e WEB_CONSOLE_PASSWORD=your-console-password \
   -e TZ=Asia/Shanghai \
   --restart unless-stopped \
-  ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.5
+  ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.6
 ```
 
 参数说明：
@@ -123,7 +123,7 @@ docker run -d \
 - `-p 7860:7860`：API 服务器端口（如果使用反向代理，强烈建议改成 `127.0.0.1:7860`）
 - `-v /path/to/auth:/app/configs/auth`：挂载包含认证文件的目录
 - `-v /path/to/data:/app/data`：挂载统计和账号健康状态持久化目录
-- `-e API_KEYS`：用于身份验证的 API 密钥列表（使用逗号分隔）
+- `-e WEB_CONSOLE_PASSWORD`：首次启动时设置网页控制台密码；登录后在设置页生成 API 密钥
 - `-e TZ=Asia/Shanghai`：时区设置（可选，默认使用系统时区）
 
 ##### 📦 方式 2：Docker Compose
@@ -135,7 +135,7 @@ name: aistudio-to-api
 
 services:
   app:
-    image: ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.5
+    image: ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.6
     container_name: aistudio-to-api
     ports:
       # API 服务器端口（如果使用反向代理，强烈建议改成 127.0.0.1:7860）
@@ -147,8 +147,8 @@ services:
       # 挂载统计数据持久化目录
       - ./data:/app/data
     environment:
-      # 用于身份验证的 API 密钥列表（使用逗号分隔）
-      API_KEYS: your-api-key-1,your-api-key-2
+      # 首次启动时设置网页控制台密码；API 密钥在设置页生成
+      WEB_CONSOLE_PASSWORD: your-console-password
       # 时区设置（可选，默认使用系统时区）
       TZ: Asia/Shanghai
 ```
@@ -171,7 +171,7 @@ services:
      -p 7860:7860 \
      -v /path/to/auth:/app/configs/auth \
      -v /path/to/data:/app/data \
-     -e API_KEYS=your-api-key-1,your-api-key-2 \
+     -e WEB_CONSOLE_PASSWORD=your-console-password \
      -e TZ=Asia/Shanghai \
      --restart unless-stopped \
      aistudio-to-api
@@ -261,7 +261,7 @@ services:
 
 - 先部署并启动 AIStudioToAPI，确保 Gemini 原生 API 地址可访问，例如 `http://localhost:7860/v1beta`。
 - 在 AMC WebUI 中进入 **设置 -> API 配置**，启用“自定义 API 配置”，并将 Gemini 兼容 Base URL 填为 AIStudioToAPI 的 `/v1beta` 地址。
-- AMC WebUI 中填写的 API Key 应与 AIStudioToAPI 部署时配置的 `API_KEYS` 对应。
+- 在 AIStudioToAPI 的“设置 → API Keys”生成密钥，复制到 AMC WebUI 的 API Key 输入框。
 
 ## 🧰 相关配置
 
@@ -271,20 +271,20 @@ services:
 
 #### 📱 应用配置
 
-| 变量名                      | 描述                                                                                                                           | 默认值               |
-| :-------------------------- | :----------------------------------------------------------------------------------------------------------------------------- | :------------------- |
-| `API_KEYS`                  | 用于身份验证的有效 API 密钥列表（使用逗号分隔）。                                                                              | `123456`             |
-| `WEB_CONSOLE_USERNAME`      | 网页控制台登录的用户名（可选）。如果同时设置用户名和密码，登录时需要输入两者。                                                 | 无                   |
-| `WEB_CONSOLE_PASSWORD`      | 网页控制台登录的密码（可选）。如果只设置密码，登录页面仅要求输入密码；如果两者都不设置，系统将使用 `API_KEYS` 进行控制台登录。 | 无                   |
-| `PORT`                      | API 服务器端口。                                                                                                               | `7860`               |
-| `HOST`                      | 服务器监听的主机地址。                                                                                                         | `0.0.0.0`            |
-| `ICON_URL`                  | 用于自定义控制台的 favicon 图标。支持 ICO, PNG, SVG 等格式。                                                                   | `/AIStudio_logo.svg` |
-| `SECURE_COOKIES`            | 是否启用安全 Cookie。`true` 表示仅支持 HTTPS 协议访问控制台。                                                                  | `false`              |
-| `RATE_LIMIT_MAX_ATTEMPTS`   | 时间窗口内控制台允许的最大失败登录尝试次数（设为 `0` 禁用）。                                                                  | `5`                  |
-| `RATE_LIMIT_WINDOW_MINUTES` | 速率限制的时间窗口长度（分钟）。                                                                                               | `15`                 |
-| `CHECK_UPDATE`              | 是否在页面加载时检查版本更新（设为 `false` 禁用）。                                                                            | `true`               |
-| `LOG_LEVEL`                 | 日志输出等级。设为 `DEBUG` 启用详细调试日志。                                                                                  | `INFO`               |
-| `TZ`                        | 日志和显示时间使用的时区，例如 `Asia/Shanghai`。留空时默认使用系统时区。                                                       | 系统时区             |
+| 变量名                      | 描述                                                                                              | 默认值               |
+| :-------------------------- | :------------------------------------------------------------------------------------------------ | :------------------- |
+| `API_KEYS`                  | 仅供旧部署首次迁移：逗号分隔的客户端密钥。新部署请在设置页生成。                                  | 无                   |
+| `WEB_CONSOLE_USERNAME`      | 网页控制台登录的用户名（可选）。如果同时设置用户名和密码，登录时需要输入两者。                    | 无                   |
+| `WEB_CONSOLE_PASSWORD`      | 网页控制台登录密码。新部署应在首次启动前设置；旧部署未设置时仍可用迁移来的旧 API 密钥登录控制台。 | 无                   |
+| `PORT`                      | API 服务器端口。                                                                                  | `7860`               |
+| `HOST`                      | 服务器监听的主机地址。                                                                            | `0.0.0.0`            |
+| `ICON_URL`                  | 用于自定义控制台的 favicon 图标。支持 ICO, PNG, SVG 等格式。                                      | `/AIStudio_logo.svg` |
+| `SECURE_COOKIES`            | 是否启用安全 Cookie。`true` 表示仅支持 HTTPS 协议访问控制台。                                     | `false`              |
+| `RATE_LIMIT_MAX_ATTEMPTS`   | 时间窗口内控制台允许的最大失败登录尝试次数（设为 `0` 禁用）。                                     | `5`                  |
+| `RATE_LIMIT_WINDOW_MINUTES` | 速率限制的时间窗口长度（分钟）。                                                                  | `15`                 |
+| `CHECK_UPDATE`              | 是否在页面加载时检查版本更新（设为 `false` 禁用）。                                               | `true`               |
+| `LOG_LEVEL`                 | 日志输出等级。设为 `DEBUG` 启用详细调试日志。                                                     | `INFO`               |
+| `TZ`                        | 日志和显示时间使用的时区，例如 `Asia/Shanghai`。留空时默认使用系统时区。                          | 系统时区             |
 
 #### 🌐 代理配置
 

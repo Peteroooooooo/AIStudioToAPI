@@ -369,6 +369,8 @@
                     </div>
                 </section>
 
+                <ApiKeysSettings :t="t" />
+
                 <div class="settings-secondary-grid">
                     <section class="status-card settings-information-card" aria-labelledby="startup-config-title">
                         <div class="settings-card-heading">
@@ -388,14 +390,9 @@
                                 <dd>{{ runtimeConfig.startup.host }}:{{ runtimeConfig.startup.httpPort }}</dd>
                             </div>
                             <div>
-                                <dt>{{ t("consoleApiKeysConfigured") }}</dt>
-                                <dd>{{ runtimeConfig.startup.apiKeyCount }}</dd>
-                            </div>
-                            <div>
                                 <dt>{{ t("consoleConsoleCredentials") }}</dt>
                                 <dd>
                                     {{
-                                        runtimeConfig.startup.consoleUsernameConfigured &&
                                         runtimeConfig.startup.consolePasswordConfigured
                                             ? t("consoleConfigured")
                                             : t("consoleNotConfigured")
@@ -518,6 +515,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch, w
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox, ElNotification } from "element-plus";
 import AccountsView from "../components/AccountsView.vue";
+import ApiKeysSettings from "../components/ApiKeysSettings.vue";
 import DashboardView from "../components/DashboardView.vue";
 import LogsView from "../components/LogsView.vue";
 import UsageAnalytics from "../components/UsageAnalytics.vue";

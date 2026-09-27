@@ -23,11 +23,7 @@ const CACHE_DEFAULTS = Object.freeze({
 const isValidStartupValue = (key, value) => {
     switch (key) {
         case "apiKeys":
-            return (
-                Array.isArray(value) &&
-                value.length > 0 &&
-                value.every(item => typeof item === "string" && item.trim().length > 0)
-            );
+            return Array.isArray(value) && value.every(item => typeof item === "string" && item.trim().length > 0);
         case "httpPort":
             return Number.isInteger(value) && value >= 1 && value <= 65535;
         case "initialAuthIndex":
@@ -76,7 +72,7 @@ const STARTUP_KEYS = [
     "webConsolePassword",
     "webConsoleUsername",
 ];
-const REQUIRED_STARTUP_KEYS = ["apiKeys", "host", "httpPort", "sessionSecret", "webConsolePassword"];
+const REQUIRED_STARTUP_KEYS = ["host", "httpPort", "sessionSecret", "webConsolePassword"];
 
 const validateStartup = startup => {
     if (!startup || typeof startup !== "object" || Array.isArray(startup)) {
@@ -301,16 +297,10 @@ class ConfigLoader {
         config.apiKeys = Array.isArray(config.apiKeys)
             ? config.apiKeys.map(key => String(key).trim()).filter(Boolean)
             : [];
-        if (config.apiKeys.length > 0) {
-            config.apiKeySource = "Custom";
-        } else if (importLegacyEnv) {
-            config.apiKeys = ["123456"];
-            config.apiKeySource = "Default";
-            this.logger.info("[System] No API key set, using default password: 123456");
-        } else {
-            throw new Error("data/config.json must configure at least one API key.");
-        }
-        config.startup = Object.fromEntries(STARTUP_KEYS.map(key => [key, config[key]]));
+        if (config.apiKeys.length > 0) config.apiKeySource = "Legacy migration";
+        config.startup = Object.fromEntries(
+            STARTUP_KEYS.filter(key => key !== "apiKeys").map(key => [key, config[key]])
+        );
         LoggingService.setLevel(config.logLevel);
         LoggingService.setTimezone(config.timezone);
 

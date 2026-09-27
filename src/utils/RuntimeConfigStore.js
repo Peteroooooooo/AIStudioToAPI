@@ -165,6 +165,7 @@ class RuntimeConfigStore {
             this._apply(saved.settings);
             const previousStartup = this.fileExtras.startup || {};
             const completedStartup = { ...(this.config.startup || {}), ...previousStartup };
+            delete completedStartup.apiKeys;
             const previousFile = JSON.parse(content);
             const missingManagedFields = [...Object.keys(CACHE_DEFAULTS), "logLevel"].some(
                 key => !Object.hasOwn(previousFile.settings, key) || !Object.hasOwn(previousFile.resetDefaults, key)
@@ -198,6 +199,7 @@ class RuntimeConfigStore {
             fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
             const temporaryPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
             this.fileExtras.startup = { ...this.config.startup };
+            delete this.fileExtras.startup.apiKeys;
             validateStartup(this.fileExtras.startup);
             const content = this._makeContent(this.settings, this.revision);
             try {
@@ -231,6 +233,9 @@ class RuntimeConfigStore {
             throw new RuntimeConfigValidationError("Config file was removed; current settings remain active.");
         }
         const saved = this._parseFile(content);
+        if (Object.hasOwn(saved.fileExtras.startup || {}, "apiKeys")) {
+            throw new RuntimeConfigValidationError("API keys belong in data/api-keys.json, not data/config.json.");
+        }
 
         const before = this.getState().effective;
         this.defaults = saved.defaults;
@@ -267,7 +272,7 @@ class RuntimeConfigStore {
             effective: Object.fromEntries(FIELDS.map(key => [key, this.config[key]])),
             revision: this.revision,
             startup: {
-                apiKeyCount: Array.isArray(activeStartup.apiKeys) ? activeStartup.apiKeys.length : 0,
+                apiKeyCount: this.apiKeyStore?.list().count || 0,
                 consolePasswordConfigured: Boolean(activeStartup.webConsolePassword),
                 consoleUsernameConfigured: Boolean(activeStartup.webConsoleUsername),
                 host: activeStartup.host || this.config.host,
