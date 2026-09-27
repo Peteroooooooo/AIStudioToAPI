@@ -637,7 +637,12 @@ class RequestHandler {
             return false;
         }
 
-        if (this.currentAuthIndex >= 0 && !this.authSource.health.isAvailable(this.currentAuthIndex)) {
+        if (
+            this.currentAuthIndex >= 0 &&
+            (!this.authSource.health.isAvailable(this.currentAuthIndex) ||
+                this.authSource.isExpired?.(this.currentAuthIndex) ||
+                this.authSource.pendingRefreshIndices?.has(this.currentAuthIndex))
+        ) {
             sendError(503, "No healthy account is active. Check account health in the dashboard.");
             return false;
         }
@@ -663,7 +668,12 @@ class RequestHandler {
     async _ensureBrowserBackedRequestReady(res, options = {}) {
         const { logPrefix = "Request", waitErrorType = null, waitOptions } = options;
 
-        if (this.currentAuthIndex >= 0 && !this.authSource.health.isAvailable(this.currentAuthIndex)) {
+        if (
+            this.currentAuthIndex >= 0 &&
+            (!this.authSource.health.isAvailable(this.currentAuthIndex) ||
+                this.authSource.isExpired?.(this.currentAuthIndex) ||
+                this.authSource.pendingRefreshIndices?.has(this.currentAuthIndex))
+        ) {
             if (this.authSource.getRotationIndices().length === 0) {
                 this._sendErrorResponse(res, 503, "All accounts are in cooldown, need reauthentication, or disabled.");
                 return false;
@@ -676,6 +686,13 @@ class RequestHandler {
                     this._sendErrorResponse(res, 503, "No healthy account could be activated.");
                     return false;
                 }
+            }
+            if (
+                this.authSource.isExpired?.(this.currentAuthIndex) ||
+                this.authSource.pendingRefreshIndices?.has(this.currentAuthIndex)
+            ) {
+                this._sendErrorResponse(res, 503, "Account reauthentication is finishing; retry shortly.");
+                return false;
             }
         }
 

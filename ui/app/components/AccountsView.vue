@@ -244,6 +244,24 @@
                                         {{ t("usageDetails") }}
                                     </button>
                                     <button
+                                        v-if="canRetryWithoutReauth(account)"
+                                        type="button"
+                                        class="accounts-text-button"
+                                        :disabled="isBusy"
+                                        @click="emit('health', account)"
+                                    >
+                                        {{ t("accountsRetryWithoutReauth") }}
+                                    </button>
+                                    <button
+                                        v-if="canReauthenticate(account)"
+                                        type="button"
+                                        class="accounts-text-button"
+                                        :disabled="isBusy"
+                                        @click="emit('reauth', account.index)"
+                                    >
+                                        {{ t("accountsReauthenticate") }}
+                                    </button>
+                                    <button
                                         type="button"
                                         class="accounts-text-button"
                                         :disabled="isBusy || account.index === currentAuthIndex || !account.isRotation"
@@ -317,6 +335,24 @@
                     <div class="accounts-card-actions">
                         <button type="button" class="accounts-text-button" @click="openDetails(account)">
                             {{ t("usageDetails") }}
+                        </button>
+                        <button
+                            v-if="canRetryWithoutReauth(account)"
+                            type="button"
+                            class="accounts-text-button"
+                            :disabled="isBusy"
+                            @click="emit('health', account)"
+                        >
+                            {{ t("accountsRetryWithoutReauth") }}
+                        </button>
+                        <button
+                            v-if="canReauthenticate(account)"
+                            type="button"
+                            class="accounts-text-button"
+                            :disabled="isBusy"
+                            @click="emit('reauth', account.index)"
+                        >
+                            {{ t("accountsReauthenticate") }}
                         </button>
                         <button
                             type="button"
@@ -397,13 +433,13 @@
                 <p class="accounts-detail-note">{{ t("accountsRangeNote") }}</p>
                 <div class="accounts-detail-actions">
                     <button
-                        v-if="selectedAccount.health?.mode === 'reauth'"
+                        v-if="canReauthenticate(selectedAccount)"
                         type="button"
                         class="accounts-button accounts-button-primary"
                         :disabled="isBusy"
-                        @click="emit('add')"
+                        @click="emit('reauth', selectedAccount.index)"
                     >
-                        {{ t("accountsOpenVncLogin") }}
+                        {{ t("accountsReauthenticate") }}
                     </button>
                     <button
                         type="button"
@@ -489,6 +525,7 @@ const emit = defineEmits([
     "delete",
     "download",
     "health",
+    "reauth",
     "refresh",
     "switch",
     "upload",
@@ -538,11 +575,13 @@ const healthLabel = account => {
     if (tone === "disabled") return t("healthDisabled");
     return tone === "ready" ? t("accountsAvailable") : t("accountsExcluded");
 };
+const canReauthenticate = account => !account.isInvalid && (account.isExpired || account.health?.mode === "reauth");
+const canRetryWithoutReauth = account => canReauthenticate(account) && account.health?.mode !== "disabled";
 const healthActionLabel = account => {
     const mode = account.health?.mode;
     if (mode === "disabled") return t("healthEnable");
+    if (account.isExpired || mode === "reauth") return t("accountsRetryWithoutReauth");
     if (mode === "cooldown") return t("accountsClearCooldown");
-    if (mode === "reauth") return t("accountsRetryWithoutReauth");
     return t("healthDisable");
 };
 const displayName = account => account.name || (account.isInvalid ? t("jsonFormatError") : t("unnamedAccount"));

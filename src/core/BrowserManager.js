@@ -7,11 +7,13 @@
 
 const fs = require("fs");
 const path = require("path");
+const { randomUUID } = require("crypto");
 const { firefox } = require("playwright");
 const os = require("os");
 
 const { getProxySummary, parseProxyConfig, withoutLegacyProxyEnv } = require("../utils/ProxyUtils");
 const StickyProxyManager = require("../utils/StickyProxyManager");
+const { detectAccountEmail } = require("../auth/AuthPageIdentity");
 const {
     AuthExpiredError,
     isAuthExpiredError,
@@ -20,6 +22,12 @@ const {
 } = require("../utils/CustomErrors");
 
 const WS_INIT_TIMEOUT_MS = 120000;
+const LOGIN_CONFIRM_WAIT_MS = 1500;
+const EXPIRED_RECHECK_SCHEDULER_MS = 60 * 1000;
+const EXPIRED_RECHECK_INTERVAL_MS = 15 * 60 * 1000;
+const EXPIRED_RECHECK_MAX_BACKOFF_MS = 6 * 60 * 60 * 1000;
+const EXPIRED_RECHECK_WS_TIMEOUT_MS = 60000;
+const AUTH_IDENTITY_URL = "https://aistudio.google.com/apps";
 const FIREFOX_DOH_DISABLED_PREFS = {
     "network.trr.mode": 5,
     "network.trr.uri": "",
@@ -65,6 +73,17 @@ class BrowserManager {
         this._onAuthQueuesDrained = null;
         this._isSystemBusyProvider = null;
         this.pendingContextClosures = new Map();
+        this._closingPendingContexts = new Map();
+        this._authUpdateSuspended = new Set();
+        this._authUpdateTasks = new Map();
+        this._markExpiredTasks = new Map();
+        this._expiredRecheckTask = null;
+        this._expiredRecheckIndex = null;
+        this._expiredRecheckContext = null;
+        this._expiredRecheckAborted = false;
+        this._expiredRecheckDueAt = new Map();
+        this._expiredRecheckFailures = new Map();
+        this._expiredRecheckCursor = 0;
 
         // Background wakeup service status (instance-level, tracks this.page)
         // Prevents multiple BackgroundWakeup instances from running simultaneously
@@ -122,6 +141,20 @@ class BrowserManager {
             "toolkit.telemetry.enabled": false, // Disable telemetry
             "toolkit.telemetry.unified": false, // Disable unified telemetry
         };
+
+        this._expiredRecheckTimer = setInterval(async () => {
+            try {
+                await this._drainPendingReauthClosures();
+            } catch (error) {
+                this.logger.warn(`[Auth Recheck] Pending context refresh failed: ${error.message}`);
+            }
+            try {
+                await this._recheckNextExpiredAccount();
+            } catch (error) {
+                this.logger.warn(`[Auth Recheck] Background check failed: ${error.message}`);
+            }
+        }, EXPIRED_RECHECK_SCHEDULER_MS);
+        this._expiredRecheckTimer.unref?.();
     }
 
     get currentAuthIndex() {
@@ -444,6 +477,27 @@ class BrowserManager {
      * @param {number} authIndex - The auth index to update
      */
     async _updateAuthFile(authIndex) {
+        if (this._authUpdateSuspended.has(authIndex)) return;
+        const previous = this._authUpdateTasks.get(authIndex);
+        const write = () => {
+            if (!this._authUpdateSuspended.has(authIndex)) return this._writeAuthFileFromContext(authIndex);
+        };
+        const task = previous ? previous.catch(() => {}).then(write) : Promise.resolve(write());
+        this._authUpdateTasks.set(authIndex, task);
+        try {
+            await task;
+        } finally {
+            if (this._authUpdateTasks.get(authIndex) === task) this._authUpdateTasks.delete(authIndex);
+        }
+    }
+
+    async _captureStorageState(context) {
+        // A partial fallback would overwrite existing IndexedDB credentials in the
+        // auth file. Keep the previous snapshot unchanged if complete capture fails.
+        return context.storageState({ indexedDB: true });
+    }
+
+    async _writeAuthFileFromContext(authIndex) {
         // Retrieve the target account's context from the multi-context Map to avoid cross-contamination of auth data by using this.context
         const contextData = this.contexts.get(authIndex);
         if (!contextData || !contextData.context) return;
@@ -459,6 +513,8 @@ class BrowserManager {
 
             // Read original file content to preserve all fields (e.g. accountName, custom fields)
             // Relies on AuthSource validation (checks valid index AND file existence)
+            const storageState = await this._captureStorageState(contextData.context);
+            if (this._authUpdateSuspended.has(authIndex) || this.contexts.get(authIndex) !== contextData) return;
             const authData = this.authSource.getAuth(authIndex);
             if (!authData) {
                 this.logger.warn(
@@ -466,8 +522,6 @@ class BrowserManager {
                 );
                 return;
             }
-
-            const storageState = await contextData.context.storageState();
 
             // Merge new credentials into existing data
             authData.cookies = storageState.cookies;
@@ -477,11 +531,54 @@ class BrowserManager {
             // This preserves the "missing state" as requested.
 
             // Overwrite the file with merged data
-            await fs.promises.writeFile(authFilePath, JSON.stringify(authData, null, 2));
+            const temporaryPath = `${authFilePath}.${process.pid}.${randomUUID()}.tmp`;
+            try {
+                await fs.promises.writeFile(temporaryPath, JSON.stringify(authData, null, 2), {
+                    flag: "wx",
+                    mode: 0o600,
+                });
+                if (this._authUpdateSuspended.has(authIndex) || this.contexts.get(authIndex) !== contextData) return;
+                await fs.promises.rename(temporaryPath, authFilePath);
+            } finally {
+                await fs.promises.unlink(temporaryPath).catch(() => {});
+            }
 
             this.logger.info(`[Auth Update] 💾 Successfully updated auth credentials for account #${authIndex}`);
         } catch (error) {
             this.logger.error(`[Auth Update] ❌ Failed to update auth file: ${error.message}`);
+        }
+    }
+
+    async suspendAuthUpdates(authIndex) {
+        this._authUpdateSuspended.add(authIndex);
+        this.authSource.setPendingRefresh(authIndex, true);
+        const marking = this._markExpiredTasks.get(authIndex);
+        if (marking) await marking;
+        if (this._expiredRecheckIndex === authIndex) {
+            await this._stopExpiredRecheck();
+            if (this._expiredRecheckTask) await this._expiredRecheckTask;
+        }
+        const pending = this._authUpdateTasks.get(authIndex);
+        if (pending) await pending;
+    }
+
+    resumeAuthUpdates(authIndex) {
+        this._authUpdateSuspended.delete(authIndex);
+        this.authSource.setPendingRefresh(authIndex, false);
+    }
+
+    async _markAccountExpired(authIndex) {
+        const previous = this._markExpiredTasks.get(authIndex);
+        const mark = () => {
+            if (this._authUpdateSuspended.has(authIndex)) return false;
+            return this.authSource.markAsExpired(authIndex);
+        };
+        const task = previous ? previous.catch(() => {}).then(mark) : Promise.resolve(mark());
+        this._markExpiredTasks.set(authIndex, task);
+        try {
+            return await task;
+        } finally {
+            if (this._markExpiredTasks.get(authIndex) === task) this._markExpiredTasks.delete(authIndex);
         }
     }
 
@@ -878,33 +975,27 @@ class BrowserManager {
      * Detects: cookie expiration, region restrictions, 403 errors, page load failures
      * @param {Page} page - The page object to check
      * @param {string} logPrefix - Log prefix for messages (e.g., "[Browser]" or "[Reconnect]")
-     * @param {number} authIndex - The auth index being checked (default: -1). When >= 0 and a login redirect is detected, this method will await this.authSource.markAsExpired(authIndex) to mark the auth as expired.
+     * @param {number} authIndex - The auth index being checked (default: -1). A confirmed login redirect marks it expired.
      * @throws {Error} If any error condition is detected
      */
     async _checkPageStatusAndErrors(page, logPrefix = "[Browser]", authIndex = -1) {
-        const currentUrl = page.url();
-        let pageTitle = "";
-        try {
-            pageTitle = await page.title();
-        } catch (e) {
-            this.logger.warn(`${logPrefix} Unable to get page title: ${e.message}`);
-        }
+        let { currentUrl, pageTitle } = await this._readPageIdentity(page, logPrefix);
 
         this.logger.debug(`${logPrefix} [Diagnostic] URL: ${currentUrl}`);
         this.logger.debug(`${logPrefix} [Diagnostic] Title: "${pageTitle}"`);
 
         // Check for various error conditions
-        if (
-            currentUrl.includes("accounts.google.com") ||
-            currentUrl.includes("ServiceLogin") ||
-            pageTitle.includes("Sign in") ||
-            pageTitle.includes("登录")
-        ) {
-            // Mark auth as expired if authIndex is provided
-            if (authIndex >= 0 && this.authSource) {
-                await this.authSource.markAsExpired(authIndex);
+        if (this._isLoginPage(currentUrl, pageTitle)) {
+            const confirmed = await this._confirmLoginRequired(page, logPrefix);
+            if (!confirmed) {
+                ({ currentUrl, pageTitle } = await this._readPageIdentity(page, logPrefix));
+            } else {
+                // Mark auth as expired if authIndex is provided
+                if (authIndex >= 0 && this.authSource) {
+                    await this._markAccountExpired(authIndex);
+                }
+                throw new AuthExpiredError();
             }
-            throw new AuthExpiredError();
         }
 
         if (pageTitle.includes("Available regions") || pageTitle.includes("not available")) {
@@ -920,6 +1011,285 @@ class BrowserManager {
         if (currentUrl === "about:blank") {
             throw new Error("🚨 Page load failed (about:blank), possibly network timeout or browser crash.");
         }
+    }
+
+    async _readPageIdentity(page, logPrefix) {
+        const currentUrl = page.url();
+        let pageTitle = "";
+        try {
+            pageTitle = await page.title();
+        } catch (error) {
+            this.logger.warn(`${logPrefix} Unable to get page title: ${error.message}`);
+        }
+        return { currentUrl, pageTitle };
+    }
+
+    _isLoginPage(currentUrl, pageTitle) {
+        let googleLoginHost = false;
+        try {
+            googleLoginHost = new URL(currentUrl).hostname === "accounts.google.com";
+        } catch (_error) {
+            // A failed/blank navigation is handled by the caller, not treated as expired credentials.
+        }
+        return (
+            googleLoginHost ||
+            currentUrl.includes("ServiceLogin") ||
+            pageTitle.includes("Sign in") ||
+            pageTitle.includes("登录")
+        );
+    }
+
+    async _confirmLoginRequired(page, logPrefix) {
+        await page.waitForTimeout(LOGIN_CONFIRM_WAIT_MS);
+        let identity = await this._readPageIdentity(page, logPrefix);
+        if (!this._isLoginPage(identity.currentUrl, identity.pageTitle)) return false;
+
+        // A single redirect can be part of a normal sign-in handshake. Retry the app once
+        // before persisting an Expired flag; a network failure is not proof of expired auth.
+        await page.goto(this.targetUrl, { timeout: 45000, waitUntil: "domcontentloaded" });
+        await page.waitForTimeout(LOGIN_CONFIRM_WAIT_MS);
+        identity = await this._readPageIdentity(page, logPrefix);
+        return this._isLoginPage(identity.currentUrl, identity.pageTitle);
+    }
+
+    async _recheckNextExpiredAccount() {
+        if (this._expiredRecheckTask || this._isSystemBusy()) return;
+        const expired = [...(this.authSource.expiredIndices || [])].sort((a, b) => a - b);
+        if (expired.length === 0) return;
+        const now = Date.now();
+        for (let offset = 0; offset < expired.length; offset++) {
+            const position = (this._expiredRecheckCursor + offset) % expired.length;
+            const authIndex = expired[position];
+            if ((this._expiredRecheckDueAt.get(authIndex) || 0) > now) continue;
+            this._expiredRecheckCursor = (position + 1) % expired.length;
+            await this.recheckExpiredAccount(authIndex);
+            return;
+        }
+    }
+
+    async recheckExpiredAccount(authIndex) {
+        if (!Number.isInteger(authIndex) || !this.authSource.availableIndices.includes(authIndex)) {
+            return { reason: "unavailable", recovered: false };
+        }
+        if (!this.authSource.isExpired(authIndex)) {
+            return { reason: "not_expired", recovered: false };
+        }
+        if (this._expiredRecheckTask) return { reason: "busy", recovered: false };
+        this._expiredRecheckAborted = false;
+        const task = this._runExpiredRecheck(authIndex);
+        this._expiredRecheckTask = task;
+        this._expiredRecheckIndex = authIndex;
+        try {
+            const result = await task;
+            if (result.reason === "recovered") {
+                this._expiredRecheckDueAt.delete(authIndex);
+                this._expiredRecheckFailures.delete(authIndex);
+            } else if (result.reason === "needs_login" || result.reason === "unavailable") {
+                const failures = (this._expiredRecheckFailures.get(authIndex) || 0) + 1;
+                this._expiredRecheckFailures.set(authIndex, failures);
+                this._expiredRecheckDueAt.set(
+                    authIndex,
+                    Date.now() +
+                        Math.min(
+                            EXPIRED_RECHECK_INTERVAL_MS * 2 ** Math.min(failures - 1, 5),
+                            EXPIRED_RECHECK_MAX_BACKOFF_MS
+                        )
+                );
+            }
+            return result;
+        } finally {
+            if (this._expiredRecheckTask === task) this._expiredRecheckTask = null;
+            if (this._expiredRecheckIndex === authIndex) this._expiredRecheckIndex = null;
+        }
+    }
+
+    async _runExpiredRecheck(authIndex) {
+        if (this._isSystemBusy() || this.initializingContexts.size > 0 || this._backgroundPreloadTask) {
+            return { reason: "busy", recovered: false };
+        }
+        if ([...this.contexts.keys()].some(index => this._hasActiveQueueForAuth(index))) {
+            return { reason: "busy", recovered: false };
+        }
+
+        let originalContent;
+        let savedAuth;
+        let expectedAccountName;
+        try {
+            const authFilePath = path.join(process.cwd(), "configs", "auth", `auth-${authIndex}.json`);
+            originalContent = await fs.promises.readFile(authFilePath, "utf-8");
+            savedAuth = JSON.parse(originalContent);
+            expectedAccountName =
+                typeof savedAuth.accountName === "string" ? savedAuth.accountName.trim().toLowerCase() : null;
+            if (!expectedAccountName || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(expectedAccountName)) {
+                return { reason: "unavailable", recovered: false };
+            }
+        } catch (error) {
+            this.logger.warn(`[Auth Recheck] Auth #${authIndex} could not be read: ${error.message}`);
+            return { reason: "unavailable", recovered: false };
+        }
+
+        // Never evict a loaded context for this background check: a new request could
+        // start on it after the idle check. Use one temporary context in the same
+        // browser, then close it before the check completes.
+
+        let context = null;
+        let launchedBrowser = false;
+        try {
+            if (!this.authSource.isExpired(authIndex) || this._expiredRecheckAborted) {
+                return { reason: "busy", recovered: false };
+            }
+            if (!this.browser) {
+                await this._ensureBrowser();
+                launchedBrowser = true;
+            }
+            const stickyProxy = this.stickyProxyManager.getProxyForAuth(authIndex);
+            const proxyConfig = stickyProxy
+                ? stickyProxy.proxy
+                : parseProxyConfig(this.config.proxyUrl, this.config.proxyBypass);
+            context = await this.browser.newContext({
+                storageState: savedAuth,
+                ...(proxyConfig ? { proxy: proxyConfig } : {}),
+            });
+            this._expiredRecheckContext = context;
+            if (this._expiredRecheckAborted) return { reason: "busy", recovered: false };
+
+            await context.addInitScript(this._getPrivacyProtectionScript(authIndex));
+
+            const page = await context.newPage();
+            const wsState = { failed: false, success: false };
+            page.on("console", msg => {
+                const message = msg.text();
+                if (message.includes("Connection successful")) wsState.success = true;
+                if (message.includes("WebSocket initialization failed")) wsState.failed = true;
+            });
+            await this._navigateAndWakeUpPage(page, `[Auth Recheck#${authIndex}]`);
+            await this._checkPageStatusAndErrors(page, `[Auth Recheck#${authIndex}]`);
+            if (this._expiredRecheckAborted) return { reason: "busy", recovered: false };
+
+            // Verify the same readiness signal used by normal context initialization.
+            // Merely not being on a login page is insufficient to restore an account.
+            const previousWsState = this._wsInitState.get(authIndex);
+            this._wsInitState.set(authIndex, wsState);
+            let ready;
+            try {
+                ready = await this._waitForWebSocketInit(
+                    page,
+                    `[Auth Recheck#${authIndex}]`,
+                    EXPIRED_RECHECK_WS_TIMEOUT_MS,
+                    authIndex,
+                    false
+                );
+            } finally {
+                if (previousWsState) this._wsInitState.set(authIndex, previousWsState);
+                else this._wsInitState.delete(authIndex);
+            }
+            if (!ready || this._expiredRecheckAborted) return { reason: "unavailable", recovered: false };
+            await this._checkPageStatusAndErrors(page, `[Auth Recheck#${authIndex}]`);
+            const pageUrl = new URL(page.url());
+            if (!(
+                ["ai.studio", "aistudio.google.com"].includes(pageUrl.hostname) &&
+                (pageUrl.pathname === "/apps" || pageUrl.pathname.startsWith("/apps/"))
+            )) {
+                return { reason: "unavailable", recovered: false };
+            }
+
+            // The generic apps page exposes Google's selected account in its account
+            // switcher. Check identity there after the target app has proved readiness.
+            await page.goto(AUTH_IDENTITY_URL, { timeout: 30000, waitUntil: "domcontentloaded" });
+            await page.waitForTimeout(1000);
+            const identity = await this._readPageIdentity(page, `[Auth Recheck#${authIndex}]`);
+            let identityUrl;
+            try {
+                identityUrl = new URL(identity.currentUrl);
+            } catch (_error) {
+                return { reason: "unavailable", recovered: false };
+            }
+            if (
+                this._isLoginPage(identity.currentUrl, identity.pageTitle) ||
+                !["ai.studio", "aistudio.google.com"].includes(identityUrl.hostname) ||
+                !["/apps", "/apps/"].includes(identityUrl.pathname)
+            ) {
+                return { reason: "unavailable", recovered: false };
+            }
+            const detectedAccount = await detectAccountEmail(page);
+            if (detectedAccount !== expectedAccountName) {
+                this.logger.warn(
+                    `[Auth Recheck] Auth #${authIndex} identity could not be confirmed; keeping it excluded.`
+                );
+                return { reason: "unavailable", recovered: false };
+            }
+            const storageState = await this._captureStorageState(context);
+            const restored = await this.authSource.unmarkAsExpired(authIndex, {
+                expectedContent: originalContent,
+                storageState,
+            });
+            if (!restored) return { reason: "unavailable", recovered: false };
+            const healthMode = this.authSource.health?.getStatus(authIndex)?.mode;
+            if (healthMode && healthMode !== "disabled" && healthMode !== "active") {
+                this.authSource.health.reset(authIndex);
+            }
+            this.logger.info(`[Auth Recheck] Auth #${authIndex} recovered and returned to rotation.`);
+            return { reason: "recovered", recovered: true };
+        } catch (error) {
+            if (isAuthExpiredError(error)) return { reason: "needs_login", recovered: false };
+            if (!this._expiredRecheckAborted) {
+                this.logger.warn(`[Auth Recheck] Auth #${authIndex} could not be verified: ${error.message}`);
+            }
+            return { reason: this._expiredRecheckAborted ? "busy" : "unavailable", recovered: false };
+        } finally {
+            this._expiredRecheckContext = null;
+            if (context) await context.close().catch(() => {});
+            if (this.contexts.size === 0 && this.initializingContexts.size === 0 && this.browser && launchedBrowser) {
+                await this.closeBrowser();
+            } else if (!this._isSystemBusy() && this.browser) {
+                this.rebalanceContextPool().catch(error => {
+                    this.logger.warn(`[Auth Recheck] Pool rebalance failed: ${error.message}`);
+                });
+            }
+        }
+    }
+
+    async _stopExpiredRecheck() {
+        if (!this._expiredRecheckTask) return;
+        this._expiredRecheckAborted = true;
+        if (this._expiredRecheckContext) {
+            await this._expiredRecheckContext.close().catch(() => {});
+        }
+        await this._expiredRecheckTask.catch(() => {});
+    }
+
+    async refreshContextAfterReauth(authIndex) {
+        // Called after an atomic replacement of auth-{index}.json. The old browser context
+        // must never save its stale state over the new credentials.
+        this._authUpdateSuspended.add(authIndex);
+        this.authSource.setPendingRefresh(authIndex, true);
+        if (this._hasActiveQueueForAuth(authIndex)) {
+            this.pendingContextClosures.set(authIndex, "reauth");
+            return { deferred: true };
+        }
+        const wasCurrent = authIndex === this._currentAuthIndex;
+        try {
+            if (this.contexts.has(authIndex)) await this.closeContext(authIndex);
+        } catch (error) {
+            this.logger.warn(`[Auth Recheck] Could not close stale context #${authIndex}: ${error.message}`);
+            if (this.contexts.has(authIndex)) {
+                this.pendingContextClosures.set(authIndex, "reauth");
+                const retry = setTimeout(() => {
+                    this._closePendingContextIfIdle(authIndex).catch(retryError => {
+                        this.logger.warn(`[Auth Recheck] Deferred context refresh failed: ${retryError.message}`);
+                    });
+                }, 5000);
+                retry.unref?.();
+                return { deferred: true };
+            }
+        }
+        this.resumeAuthUpdates(authIndex);
+        if (wasCurrent && !this.authSource.isExpired(authIndex)) {
+            await this.launchOrSwitchContext(authIndex);
+        } else if (!this._isSystemBusy() && this.browser) {
+            await this.rebalanceContextPool();
+        }
+        return { deferred: false };
     }
 
     /**
@@ -1317,7 +1687,15 @@ class BrowserManager {
     }
 
     async launchBrowserForVNC(extraArgs = {}) {
-        const stickyProxy = this.stickyProxyManager.reserveProxyForNewAccount("VNC account binding");
+        const targetAuthIndex = Number.isInteger(extraArgs.targetAuthIndex) ? extraArgs.targetAuthIndex : null;
+        const existingAuth = targetAuthIndex === null ? null : this.authSource.getAuth(targetAuthIndex);
+        if (targetAuthIndex !== null && !existingAuth) {
+            throw new Error(`Auth #${targetAuthIndex} does not exist for reauthentication.`);
+        }
+        const stickyProxy =
+            targetAuthIndex === null
+                ? this.stickyProxyManager.reserveProxyForNewAccount("VNC account binding")
+                : this.stickyProxyManager.getProxyForAuth(targetAuthIndex);
         this.logger.info("🚀 [VNC] Launching a new, separate, headful browser instance for VNC session...");
         const browserExecutablePath = this._getBrowserExecutablePath();
         if (!fs.existsSync(browserExecutablePath)) {
@@ -1361,6 +1739,10 @@ class BrowserManager {
                 hasTouch: true,
                 userAgent: "Mozilla/5.0 (Android 10; Mobile; rv:128.0) Gecko/128.0 Firefox/128.0",
             };
+        }
+
+        if (existingAuth) {
+            contextOptions.storageState = existingAuth;
         }
 
         const context = await vncBrowser.newContext(
@@ -1581,6 +1963,9 @@ class BrowserManager {
         if (!this.pendingContextClosures.has(authIndex)) {
             return false;
         }
+        if (this.pendingContextClosures.get(authIndex) === "reauth") {
+            return false;
+        }
         this.pendingContextClosures.delete(authIndex);
         this.logger.info(`[ContextPool] Cancelled pending close for context #${authIndex} (${reason}).`);
         return true;
@@ -1605,6 +1990,9 @@ class BrowserManager {
     }
 
     async _closeContextForPoolIfPossible(authIndex, reason) {
+        if (this.pendingContextClosures.get(authIndex) === "reauth") {
+            return this._closePendingContextIfIdle(authIndex);
+        }
         if (this._hasActiveQueueForAuth(authIndex)) {
             return this._scheduleContextClosureWhenIdle(authIndex, reason);
         }
@@ -1615,17 +2003,33 @@ class BrowserManager {
     }
 
     async _closePendingContextIfIdle(authIndex) {
+        const pending = this._closingPendingContexts.get(authIndex);
+        if (pending) return pending;
+        const task = this._closePendingContextIfIdleImpl(authIndex);
+        this._closingPendingContexts.set(authIndex, task);
+        try {
+            return await task;
+        } finally {
+            if (this._closingPendingContexts.get(authIndex) === task) this._closingPendingContexts.delete(authIndex);
+        }
+    }
+
+    async _closePendingContextIfIdleImpl(authIndex) {
         if (!this.pendingContextClosures.has(authIndex)) {
             return false;
         }
-        if (authIndex === this._currentAuthIndex) {
+        if (authIndex === this._currentAuthIndex && this.pendingContextClosures.get(authIndex) !== "reauth") {
             this.logger.debug(
                 `[ContextPool] Skipping pending close for context #${authIndex} because it is active again as current.`
             );
             return false;
         }
         if (!this.contexts.has(authIndex)) {
+            const pendingReason = this.pendingContextClosures.get(authIndex);
             this.pendingContextClosures.delete(authIndex);
+            if (pendingReason === "reauth") {
+                this.resumeAuthUpdates(authIndex);
+            }
             return false;
         }
 
@@ -1637,11 +2041,28 @@ class BrowserManager {
         }
 
         const pendingReason = this.pendingContextClosures.get(authIndex);
+        const wasCurrent = authIndex === this._currentAuthIndex;
         this.pendingContextClosures.delete(authIndex);
         this.logger.info(
             `[ContextPool] Closing deferred context #${authIndex} now that all queues are drained (reason: ${pendingReason}).`
         );
-        await this.closeContext(authIndex);
+        try {
+            await this.closeContext(authIndex);
+        } catch (error) {
+            if (this.contexts.has(authIndex)) this.pendingContextClosures.set(authIndex, pendingReason);
+            else if (pendingReason === "reauth") {
+                this.resumeAuthUpdates(authIndex);
+            }
+            this.logger.warn(`[ContextPool] Deferred close for #${authIndex} failed: ${error.message}`);
+            return false;
+        }
+        if (pendingReason === "reauth") {
+            this.resumeAuthUpdates(authIndex);
+        }
+        if (pendingReason === "reauth" && wasCurrent && !this.authSource.isExpired(authIndex)) {
+            await this.launchOrSwitchContext(authIndex);
+            return true;
+        }
         if (this._isSystemBusy()) {
             this.logger.info("[ContextPool] Skipping rebalance after deferred close because system is busy.");
             return true;
@@ -1654,6 +2075,13 @@ class BrowserManager {
 
     async _flushPendingContextClosures() {
         for (const authIndex of [...this.pendingContextClosures.keys()]) {
+            await this._closePendingContextIfIdle(authIndex);
+        }
+    }
+
+    async _drainPendingReauthClosures() {
+        for (const [authIndex, reason] of [...this.pendingContextClosures.entries()]) {
+            if (reason !== "reauth") continue;
             await this._closePendingContextIfIdle(authIndex);
         }
     }
@@ -1754,6 +2182,7 @@ class BrowserManager {
      * @param {number} targetAuthIndex - The account index we're about to switch to
      */
     async preCleanupForSwitch(targetAuthIndex) {
+        await this._stopExpiredRecheck();
         const maxContexts = this.config.maxContexts;
         const isUnlimited = maxContexts === 0;
 
@@ -2013,7 +2442,7 @@ class BrowserManager {
 
         // Preload candidates if ready and initializing contexts still leave room in the pool
         const poolOccupancy = this.contexts.size + this.initializingContexts.size;
-        if (candidates.length > 0 && (isUnlimited || poolOccupancy < maxContexts)) {
+        if (!this._expiredRecheckContext && candidates.length > 0 && (isUnlimited || poolOccupancy < maxContexts)) {
             this._preloadBackgroundContexts(candidates, isUnlimited ? 0 : maxContexts);
         }
     }
@@ -2264,6 +2693,16 @@ class BrowserManager {
             throw new Error(`Invalid authIndex: ${authIndex}. Must be >= 0.`);
         }
 
+        if (!this.contexts.has(authIndex)) await this._stopExpiredRecheck();
+        if (this.pendingContextClosures.get(authIndex) === "reauth") {
+            if (this._hasActiveQueueForAuth(authIndex)) {
+                throw new Error(
+                    `Account #${authIndex} is finishing its previous requests before reauthentication takes effect.`
+                );
+            }
+            await this._closePendingContextIfIdle(authIndex);
+        }
+
         this._cancelPendingContextClosure(authIndex, "context_reused");
 
         // [Auth Switch] Save current auth data before switching
@@ -2304,58 +2743,34 @@ class BrowserManager {
             } else {
                 // Quick auth status check without navigation
                 try {
-                    const currentUrl = contextData.page.url();
-                    const pageTitle = await contextData.page.title();
-
-                    // Check if redirected to login page (auth expired)
-                    if (
-                        currentUrl.includes("accounts.google.com") ||
-                        currentUrl.includes("ServiceLogin") ||
-                        pageTitle.includes("Sign in") ||
-                        pageTitle.includes("登录")
-                    ) {
-                        this.logger.error(
-                            `[FastSwitch] Account #${authIndex} auth expired (redirected to login), marking as expired...`
-                        );
-                        // Mark auth as expired
-                        await this.authSource.markAsExpired(authIndex);
-                        // Clean up the expired context
-                        await this.closeContext(authIndex);
-                        // Don't retry initialization - auth is expired, it will fail again
-                        throw new AuthExpiredError();
-                    } else {
-                        // Page is alive and auth is valid, proceed with fast switch
-                        // If this account was marked as expired but is now valid, restore it
-                        if (this.authSource.isExpired(authIndex)) {
-                            this.logger.info(
-                                `[FastSwitch] Account #${authIndex} was expired but is now valid, restoring...`
-                            );
-                            await this.authSource.unmarkAsExpired(authIndex);
-                            // Note: rebalanceContextPool() will be called by the caller (AuthSwitcher)
-                        }
-
-                        // Stop background tasks for old context
-                        if (this._currentAuthIndex >= 0 && this.contexts.has(this._currentAuthIndex)) {
-                            const oldContextData = this.contexts.get(this._currentAuthIndex);
-                            if (oldContextData.healthMonitorInterval) {
-                                clearInterval(oldContextData.healthMonitorInterval);
-                                oldContextData.healthMonitorInterval = null;
-                            }
-                        }
-
-                        // Switch to new context
-                        this._activateContext(contextData.context, contextData.page, authIndex);
-                        await this._flushPendingContextClosures();
-
-                        this.logger.info(`✅ [FastSwitch] Switched to account #${authIndex} instantly!`);
-                        return;
+                    await this._checkPageStatusAndErrors(contextData.page, `[FastSwitch#${authIndex}]`, authIndex);
+                    if (this.authSource.isExpired(authIndex)) {
+                        this.logger.info(`[FastSwitch] Account #${authIndex} recovered; restoring rotation.`);
+                        await this.authSource.unmarkAsExpired(authIndex);
                     }
+
+                    // Page is alive and auth is valid, proceed with fast switch
+                    // Stop background tasks for old context
+                    if (this._currentAuthIndex >= 0 && this.contexts.has(this._currentAuthIndex)) {
+                        const oldContextData = this.contexts.get(this._currentAuthIndex);
+                        if (oldContextData.healthMonitorInterval) {
+                            clearInterval(oldContextData.healthMonitorInterval);
+                            oldContextData.healthMonitorInterval = null;
+                        }
+                    }
+
+                    // Switch to new context
+                    this._activateContext(contextData.context, contextData.page, authIndex);
+                    await this._flushPendingContextClosures();
+
+                    this.logger.info(`✅ [FastSwitch] Switched to account #${authIndex} instantly!`);
+                    return;
                 } catch (error) {
                     // Check if this is an auth expiration error
                     const isAuthExpired = isAuthExpiredError(error);
 
                     if (isAuthExpired) {
-                        // Auth is expired, don't retry - just throw the error
+                        await this.closeContext(authIndex);
                         throw error;
                     }
 
@@ -2603,6 +3018,20 @@ class BrowserManager {
      * @param {number} authIndex - The auth index to close
      */
     async closeContext(authIndex) {
+        const pendingReauth = this.pendingContextClosures.get(authIndex) === "reauth";
+        try {
+            return await this._closeContextImpl(authIndex);
+        } finally {
+            if (pendingReauth && !this.contexts.has(authIndex) && !this.initializingContexts.has(authIndex)) {
+                this.pendingContextClosures.delete(authIndex);
+                this.resumeAuthUpdates(authIndex);
+            } else if (pendingReauth) {
+                this.pendingContextClosures.set(authIndex, "reauth");
+            }
+        }
+    }
+
+    async _closeContextImpl(authIndex) {
         this.pendingContextClosures.delete(authIndex);
 
         // If context is being initialized in background, signal abort and wait
@@ -2625,6 +3054,23 @@ class BrowserManager {
         }
 
         const contextData = this.contexts.get(authIndex);
+
+        // A still-valid context may have received renewed cookies. Save before discarding it,
+        // but never overwrite a newly reauthenticated file with an old context snapshot.
+        if (
+            !this._authUpdateSuspended.has(authIndex) &&
+            !this.authSource.isExpired(authIndex) &&
+            !contextData.page?.isClosed()
+        ) {
+            try {
+                const identity = await this._readPageIdentity(contextData.page, `[Context#${authIndex}]`);
+                if (!this._isLoginPage(identity.currentUrl, identity.pageTitle)) await this._updateAuthFile(authIndex);
+            } catch (error) {
+                this.logger.warn(
+                    `[Auth Update] Could not save auth #${authIndex} before context close: ${error.message}`
+                );
+            }
+        }
 
         // Stop health monitor for this context
         if (contextData.healthMonitorInterval) {
@@ -2694,6 +3140,10 @@ class BrowserManager {
             }
         }
 
+        for (const authIndex of [...(this.authSource.pendingRefreshIndices || [])]) {
+            this.resumeAuthUpdates(authIndex);
+        }
+
         // Reset all references
         this.contexts.clear();
         this.initializingContexts.clear();
@@ -2724,11 +3174,26 @@ class BrowserManager {
             this.healthMonitorInterval = null;
         }
 
-        if (this.browser) {
+        const browser = this.browser;
+        if (browser) {
             this.logger.debug("[Browser] Closing main browser instance and all contexts...");
+            for (const authIndex of this.contexts.keys()) {
+                if (this.authSource.isExpired(authIndex) || this._authUpdateSuspended.has(authIndex)) continue;
+                const page = this.contexts.get(authIndex)?.page;
+                if (!page || page.isClosed()) continue;
+                try {
+                    const identity = await this._readPageIdentity(page, `[Context#${authIndex}]`);
+                    if (!this._isLoginPage(identity.currentUrl, identity.pageTitle))
+                        await this._updateAuthFile(authIndex);
+                } catch (error) {
+                    this.logger.warn(
+                        `[Auth Update] Could not save auth #${authIndex} before browser close: ${error.message}`
+                    );
+                }
+            }
             try {
                 // Give close() 5 seconds, otherwise force proceed
-                const closePromise = this.browser.close();
+                const closePromise = browser.close();
                 // Attach a catch handler to prevent unhandled rejection if timeout wins
                 closePromise.catch(() => {
                     // Silently ignore - the timeout will handle this
@@ -2738,9 +3203,13 @@ class BrowserManager {
                 this.logger.warn(`[Browser] Error during close (ignored): ${e.message}`);
             }
 
-            this.browser = null;
-            this._cleanupAllContexts();
-            this.logger.debug("[Browser] Main browser instance and all contexts closed, currentAuthIndex reset to -1.");
+            if (this.browser === browser) {
+                this.browser = null;
+                this._cleanupAllContexts();
+                this.logger.debug(
+                    "[Browser] Main browser instance and all contexts closed, currentAuthIndex reset to -1."
+                );
+            }
         }
 
         // Reset flag after close is complete

@@ -1,6 +1,7 @@
 /**
  * A small end-to-end check against a locally running development server.
- * Reads the API key and port from the ignored data/config.json file; never prints the key.
+ * Reads the API key from the ignored managed key store (or legacy config) and the
+ * port from data/config.json; never prints the key.
  */
 const fs = require("fs");
 const path = require("path");
@@ -17,11 +18,13 @@ const effort = option("--effort");
 const useResponses = args.includes("--responses");
 const port = startup.httpPort;
 const baseUrl = `http://127.0.0.1:${port}`;
-const apiKey = startup.apiKeys?.[0]?.trim();
+const keyStorePath = path.resolve(__dirname, "../../data/api-keys.json");
+const managedKeys = fs.existsSync(keyStorePath) ? JSON.parse(fs.readFileSync(keyStorePath, "utf8")).keys : [];
+const apiKey = managedKeys?.[0]?.key || startup.apiKeys?.[0]?.trim();
 const timeoutMs = Number(process.env.SMOKE_TIMEOUT_MS || 130000);
 
 if (!apiKey || !Number.isInteger(port) || port < 1 || port > 65535 || !Number.isFinite(timeoutMs)) {
-    console.error("Local smoke check needs a valid API key and port in data/config.json.");
+    console.error("Local smoke check needs a valid API key in data/api-keys.json and port in data/config.json.");
     process.exit(2);
 }
 

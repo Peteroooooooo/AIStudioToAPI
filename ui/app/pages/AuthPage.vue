@@ -7,6 +7,11 @@
 
 <template>
     <div v-cloak class="vnc-app">
+        <div v-if="isReauthentication && targetAuthIndex !== null" class="vnc-reauth-banner" role="status">
+            <strong>{{ t("authReauthTitle", { index: targetAuthIndex }) }}</strong>
+            <span v-if="reauthAccountName">{{ t("authReauthExpectedAccount", { name: reauthAccountName }) }}</span>
+            <span>{{ t("authReauthHint") }}</span>
+        </div>
         <div id="vnc-container">
             <div id="vnc-surface" />
             <div v-if="statusTitle" class="vnc-status" :class="`is-${statusTone}`">
@@ -158,8 +163,8 @@
                     class="vnc-bar-button is-save"
                     type="button"
                     :disabled="!isConnected || isSaving"
-                    :aria-label="t('authSaveSession')"
-                    :title="t('authSaveSession')"
+                    :aria-label="saveButtonLabel"
+                    :title="saveButtonLabel"
                     @click="saveAuth()"
                 >
                     <svg
@@ -197,7 +202,7 @@
             </template>
             <div class="vnc-dialog-body">
                 <p class="vnc-dialog-text">
-                    {{ t("authSessionNoticeText") }}
+                    {{ isReauthentication ? t("authReauthNoticeText") : t("authSessionNoticeText") }}
                 </p>
                 <el-checkbox v-model="skipIntro">
                     {{ t("authDontShowAgain") }}
@@ -245,6 +250,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
+import { useRoute } from "vue-router";
 import escapeHtml from "../utils/escapeHtml";
 import I18n from "../utils/i18n";
 import { useTheme } from "../utils/useTheme";
@@ -252,6 +258,8 @@ import { useTheme } from "../utils/useTheme";
 const hasInitialized = ref(false);
 const isConnected = ref(false);
 const isSaving = ref(false);
+const reauthAccountName = ref("");
+const vncSessionId = ref(null);
 const langVersion = ref(0);
 const rfb = ref(null);
 const showIntroDialog = ref(false);
@@ -263,6 +271,19 @@ const statusTitle = ref("");
 const statusTone = ref("info");
 const textInput = ref("");
 const textInputRef = ref(null);
+let sessionHeartbeatTimer = null;
+let isUnmounted = false;
+const route = useRoute();
+const isReauthentication = computed(() => route.query.reauth !== undefined);
+const targetAuthIndex = computed(() => {
+    const raw = route.query.reauth;
+    if (typeof raw !== "string" || !/^(0|[1-9]\d*)$/.test(raw)) return null;
+    const index = Number(raw);
+    return Number.isSafeInteger(index) ? index : null;
+});
+const saveButtonLabel = computed(() =>
+    isReauthentication.value ? t("authReauthSave", { index: targetAuthIndex.value }) : t("authSaveSession")
+);
 
 // Initialize theme
 useTheme();
@@ -302,13 +323,40 @@ const toggleLanguage = async () => {
     await I18n.toggleLang();
 };
 
+const stopSessionHeartbeat = () => {
+    if (sessionHeartbeatTimer !== null) window.clearInterval(sessionHeartbeatTimer);
+    sessionHeartbeatTimer = null;
+};
+
+const startSessionHeartbeat = () => {
+    stopSessionHeartbeat();
+    sessionHeartbeatTimer = window.setInterval(() => {
+        const sessionId = vncSessionId.value;
+        if (!isConnected.value || !sessionId) return;
+        fetch("/api/vnc/sessions/heartbeat", {
+            body: JSON.stringify({ sessionId }),
+            headers: { "Content-Type": "application/json" },
+            method: "POST",
+        })
+            .then(response => {
+                if (response.status !== 409 || vncSessionId.value !== sessionId) return;
+                stopSessionHeartbeat();
+                isConnected.value = false;
+                setStatus({ reload: true, title: { key: "authSessionReplaced" }, tone: "error" });
+            })
+            .catch(() => {});
+    }, 60000);
+};
+
 const cleanupSession = () => {
-    if (navigator.sendBeacon) {
-        fetch("/api/vnc/sessions", {
-            keepalive: true,
-            method: "DELETE",
-        }).catch(() => {});
-    }
+    stopSessionHeartbeat();
+    const sessionId = vncSessionId.value;
+    vncSessionId.value = null;
+    if (!sessionId) return;
+    fetch(`/api/vnc/sessions?sessionId=${encodeURIComponent(sessionId)}`, {
+        keepalive: true,
+        method: "DELETE",
+    }).catch(() => {});
 };
 
 const clearStatus = () => {
@@ -335,7 +383,7 @@ const goBack = () => {
         window.history.back();
         return;
     }
-    window.location.href = "/";
+    window.location.href = isReauthentication.value ? "/?view=accounts" : "/";
 };
 
 const handleIntroCancel = () => {
@@ -392,6 +440,8 @@ const loadVncClient = async (vncContainer, vncSurface) => {
         return;
     }
 
+    if (isUnmounted) return;
+
     setStatus({ title: { key: "authRequestingSession" } });
 
     try {
@@ -399,7 +449,11 @@ const loadVncClient = async (vncContainer, vncSurface) => {
         const initialHeight = vncContainer.clientHeight;
 
         const response = await fetch("/api/vnc/sessions", {
-            body: JSON.stringify({ height: initialHeight, width: initialWidth }),
+            body: JSON.stringify({
+                height: initialHeight,
+                width: initialWidth,
+                ...(isReauthentication.value ? { targetAuthIndex: targetAuthIndex.value } : {}),
+            }),
             headers: { "Content-Type": "application/json" },
             method: "POST",
         });
@@ -417,11 +471,25 @@ const loadVncClient = async (vncContainer, vncSurface) => {
         if (data.error) {
             throw new Error(getApiErrorMessage(data) || data.error);
         }
+        if (typeof data.sessionId !== "string" || !data.sessionId) {
+            throw new Error(t("authSessionIdMissing"));
+        }
+        vncSessionId.value = data.sessionId;
+        if (isUnmounted) {
+            cleanupSession();
+            return;
+        }
+        if (isReauthentication.value) {
+            if (data.targetAuthIndex !== targetAuthIndex.value) {
+                throw new Error(t("authReauthTargetMismatch"));
+            }
+            reauthAccountName.value = typeof data.accountName === "string" ? data.accountName : "";
+        }
 
         vncSurface.innerHTML = "";
 
         const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-        const wsUrl = `${protocol}://${window.location.host}/vnc`;
+        const wsUrl = `${protocol}://${window.location.host}/vnc?sessionId=${encodeURIComponent(data.sessionId)}`;
 
         const rfbOptions = { shared: true };
         if (data.password) {
@@ -432,10 +500,12 @@ const loadVncClient = async (vncContainer, vncSurface) => {
 
         rfb.value.addEventListener("connect", () => {
             isConnected.value = true;
+            startSessionHeartbeat();
             clearStatus();
         });
 
         rfb.value.addEventListener("disconnect", e => {
+            stopSessionHeartbeat();
             // Check if we never connected (immediate failure)
             if (!isConnected.value) {
                 console.warn("[VNC] Connection failed immediately. Likely WebSocket handshake failure (400/404).");
@@ -462,6 +532,7 @@ const loadVncClient = async (vncContainer, vncSurface) => {
         });
 
         rfb.value.addEventListener("securityfailure", e => {
+            stopSessionHeartbeat();
             console.error("[VNC] Security failure:", e);
             isConnected.value = false;
             setStatus({
@@ -511,11 +582,15 @@ const saveAuth = async (accountName = null) => {
     if (!ensureConnected()) {
         return;
     }
+    if (!vncSessionId.value) {
+        ElMessage.error(t("authSessionIdMissing"));
+        return;
+    }
 
     isSaving.value = true;
 
     try {
-        const body = JSON.stringify(accountName ? { accountName } : {});
+        const body = JSON.stringify({ ...(accountName ? { accountName } : {}), sessionId: vncSessionId.value });
         const headers = { "Content-Type": "application/json" };
 
         const response = await fetch("/api/vnc/auth", {
@@ -527,13 +602,30 @@ const saveAuth = async (accountName = null) => {
         const data = await response.json();
 
         if (data.message === "vncAuthSaveSuccess") {
+            stopSessionHeartbeat();
+            vncSessionId.value = null;
             ElMessage.success(t("authSaveSuccess").replace("{accountName}", data.accountName));
             sessionStorage.setItem("newAuthInfo", JSON.stringify(data));
             window.location.href = "/";
             return;
         }
 
+        if (data.message === "vncAuthReauthSuccess") {
+            stopSessionHeartbeat();
+            vncSessionId.value = null;
+            sessionStorage.setItem(
+                "reauthResult",
+                JSON.stringify({ index: data.reauthenticatedAuthIndex, refreshPending: data.refreshPending === true })
+            );
+            window.location.href = "/?view=accounts";
+            return;
+        }
+
         if (data.message === "errorVncEmailFetchFailed") {
+            if (isReauthentication.value) {
+                ElMessage.error(t("authReauthVerifyFailed"));
+                return;
+            }
             isSaving.value = false;
             try {
                 const result = await ElMessageBox.prompt(t("authEnterAccountName"), t("authAccountNameTitle"), {
@@ -613,13 +705,18 @@ const startVncIfNeeded = () => {
 };
 
 onMounted(() => {
-    document.title = t("authPageTitle");
+    document.title = t(isReauthentication.value ? "authReauthPageTitle" : "authPageTitle");
 
     // Listen for language changes
     I18n.onChange(() => {
         langVersion.value++;
-        document.title = t("authPageTitle");
+        document.title = t(isReauthentication.value ? "authReauthPageTitle" : "authPageTitle");
     });
+
+    if (isReauthentication.value && targetAuthIndex.value === null) {
+        setStatus({ title: { key: "authReauthInvalidIndex" }, tone: "error" });
+        return;
+    }
 
     if (isIntroDismissed()) {
         startVncIfNeeded();
@@ -630,12 +727,36 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+    isUnmounted = true;
     window.removeEventListener("unload", cleanupSession);
+    cleanupSession();
+    rfb.value?.disconnect();
 });
 </script>
 
 <style lang="less" scoped>
 @import "../styles/variables.less";
+
+.vnc-reauth-banner {
+    position: fixed;
+    top: 20px;
+    left: 20px;
+    z-index: 1000;
+    display: grid;
+    gap: 3px;
+    max-width: min(420px, calc(100vw - 40px));
+    padding: 12px 16px;
+    border: 1px solid @vnc-overlay-border;
+    border-radius: @border-radius-md;
+    background: @vnc-overlay-card-bg;
+    box-shadow: @vnc-overlay-shadow;
+    color: @vnc-overlay-text;
+    font-size: @font-size-small;
+}
+
+.vnc-reauth-banner span {
+    color: @vnc-overlay-muted;
+}
 
 #vnc-container {
     background: @vnc-surface-gradient;
