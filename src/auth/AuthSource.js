@@ -381,7 +381,10 @@ class AuthSource {
             return false;
         }
 
-        if (!this.expiredIndices.includes(index)) {
+        if (
+            !this.expiredIndices.includes(index) &&
+            !(options.allowHealthReauth && options.storageState && this.health?.getStatus(index)?.mode === "reauth")
+        ) {
             this.logger.debug(`[Auth] Auth #${index} is not marked as expired`);
             return false;
         }

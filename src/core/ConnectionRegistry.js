@@ -21,13 +21,22 @@ class ConnectionRegistry extends EventEmitter {
      * @param {Object} logger - Logger instance
      * @param {Function} [onConnectionLostCallback] - Optional callback to invoke when connection is lost after grace period
      * @param {Function} [getCurrentAuthIndex] - Function to get current auth index
+     * @param {Object} [browserManager] - Browser manager for connection recovery
+     * @param {Function} [getAuthCredentialEpoch] - Current credential generation for an account
      */
-    constructor(logger, onConnectionLostCallback = null, getCurrentAuthIndex = null, browserManager = null) {
+    constructor(
+        logger,
+        onConnectionLostCallback = null,
+        getCurrentAuthIndex = null,
+        browserManager = null,
+        getAuthCredentialEpoch = null
+    ) {
         super();
         this.logger = logger;
         this.onConnectionLostCallback = onConnectionLostCallback;
         this.getCurrentAuthIndex = getCurrentAuthIndex;
         this.browserManager = browserManager;
+        this.getAuthCredentialEpoch = getAuthCredentialEpoch;
         // Map: authIndex -> WebSocket connection
         this.connectionsByAuth = new Map();
         // Map: requestId -> { queue: MessageQueue, authIndex: number, createdAt: number }
@@ -301,6 +310,7 @@ class ConnectionRegistry extends EventEmitter {
                     if (!entry.backendFailureReported) {
                         entry.backendFailureReported = true;
                         this.emit("backendOutcome", {
+                            authCredentialEpoch: entry.authCredentialEpoch,
                             authIndex: entry.authIndex,
                             requestAttemptId: entry.requestAttemptId,
                             requestId,
@@ -310,6 +320,7 @@ class ConnectionRegistry extends EventEmitter {
                     }
                 } else if (parsedMessage.event_type === "stream_close" && !entry.backendFailed) {
                     this.emit("backendOutcome", {
+                        authCredentialEpoch: entry.authCredentialEpoch,
                         authIndex: entry.authIndex,
                         requestAttemptId: entry.requestAttemptId,
                         requestId,
@@ -496,6 +507,7 @@ class ConnectionRegistry extends EventEmitter {
         const queue = new MessageQueue();
         // Add timestamp for stale queue detection
         this.messageQueues.set(requestId, {
+            authCredentialEpoch: this.getAuthCredentialEpoch?.(authIndex) ?? 0,
             authIndex,
             createdAt: Date.now(),
             queue,

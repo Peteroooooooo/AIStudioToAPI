@@ -82,6 +82,7 @@ class ProxyServerSystem extends EventEmitter {
         configLoader._printConfiguration(this.config);
 
         this.authSource = new AuthSource(this.logger);
+        this.authCredentialEpochs = new Map();
         this.browserManager = new BrowserManager(this.logger, this.config, this.authSource);
         this.usageStatsService = new UsageStatsService(
             this.authSource,
@@ -138,7 +139,8 @@ class ProxyServerSystem extends EventEmitter {
                 }
             },
             () => this.browserManager.currentAuthIndex,
-            this.browserManager
+            this.browserManager,
+            authIndex => this.getAuthCredentialEpoch(authIndex)
         );
         this.usageStatsService.connectionRegistry = this.connectionRegistry;
         this.connectionRegistry.on("backendChunk", ({ requestId, requestAttemptId, data }) => {
@@ -151,27 +153,7 @@ class ProxyServerSystem extends EventEmitter {
         this.connectionRegistry.on("backendAttemptEvent", event => {
             this.usageStatsService.recordBackendAttemptEvent(event);
         });
-        this.connectionRegistry.on("backendOutcome", outcome => {
-            if (outcome.requestId?.startsWith("cache_resource_")) return;
-            if (this.requestHandler?.cacheManager.consumeCachedAttemptOutcome(outcome)) return;
-            if (outcome.success) {
-                this.authSource.health.recordSuccess(outcome.authIndex);
-            } else {
-                const wasAvailable = this.authSource.health.isAvailable(outcome.authIndex);
-                const status = this.authSource.health.recordFailure(
-                    outcome.authIndex,
-                    outcome.status,
-                    outcome.requestId
-                );
-                if (wasAvailable && status.mode !== "active") {
-                    setImmediate(() => {
-                        this.browserManager.rebalanceContextPool().catch(error => {
-                            this.logger.error(`[Auth] Could not rebalance after account quarantine: ${error.message}`);
-                        });
-                    });
-                }
-            }
-        });
+        this.connectionRegistry.on("backendOutcome", outcome => this._recordBackendOutcome(outcome));
 
         // Set ConnectionRegistry reference in BrowserManager to avoid circular dependency
         this.browserManager.setConnectionRegistry(this.connectionRegistry);
@@ -189,6 +171,35 @@ class ProxyServerSystem extends EventEmitter {
         this.httpServer = null;
         this.wsServer = null;
         this.webRoutes = new WebRoutes(this);
+    }
+
+    getAuthCredentialEpoch(authIndex) {
+        return this.authCredentialEpochs.get(authIndex) || 0;
+    }
+
+    advanceAuthCredentialEpoch(authIndex) {
+        this.authCredentialEpochs.set(authIndex, this.getAuthCredentialEpoch(authIndex) + 1);
+    }
+
+    _recordBackendOutcome(outcome) {
+        if (outcome.requestId?.startsWith("cache_resource_")) return;
+        if (this.requestHandler?.cacheManager.consumeCachedAttemptOutcome(outcome)) return;
+        // Requests started with the previous credential may finish after VNC reauth.
+        // Their failures must not quarantine the newly saved credential.
+        if (outcome.authCredentialEpoch !== this.getAuthCredentialEpoch(outcome.authIndex)) return;
+        if (outcome.success) {
+            this.authSource.health.recordSuccess(outcome.authIndex);
+        } else {
+            const wasAvailable = this.authSource.health.isAvailable(outcome.authIndex);
+            const status = this.authSource.health.recordFailure(outcome.authIndex, outcome.status, outcome.requestId);
+            if (wasAvailable && status.mode !== "active") {
+                setImmediate(() => {
+                    this.browserManager.rebalanceContextPool().catch(error => {
+                        this.logger.error(`[Auth] Could not rebalance after account quarantine: ${error.message}`);
+                    });
+                });
+            }
+        }
     }
 
     async start(initialAuthIndex = null) {

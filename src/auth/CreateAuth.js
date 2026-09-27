@@ -727,6 +727,8 @@ class CreateAuth {
             if (!keepBackup && fs.existsSync(backupPath)) fs.unlinkSync(backupPath);
         }
 
+        this.serverSystem.advanceAuthCredentialEpoch(index);
+
         // The new credential is already validated and committed. A transient browser
         // restart failure must not restore the old expired credential.
         let refreshPending = false;
