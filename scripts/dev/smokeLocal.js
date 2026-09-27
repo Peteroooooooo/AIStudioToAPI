@@ -56,8 +56,8 @@ const main = async () => {
     const prompt = "Reply with the single word OK.";
     const route = useResponses ? "/v1/responses" : "/v1/chat/completions";
     const payload = useResponses
-        ? { input: prompt, max_output_tokens: 64, model, stream: false }
-        : { max_tokens: 64, messages: [{ content: prompt, role: "user" }], model, stream: false };
+        ? { input: prompt, max_output_tokens: 512, model, stream: false }
+        : { max_tokens: 512, messages: [{ content: prompt, role: "user" }], model, stream: false };
     if (effort) {
         if (useResponses) payload.reasoning = { effort };
         else payload.reasoning_effort = effort;
