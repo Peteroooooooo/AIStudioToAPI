@@ -69,6 +69,156 @@ test("Responses API primitive function output becomes an object", async () => {
     assert.deepEqual(response, { result: true });
 });
 
+test("Responses allowed_tools preserves selected function schemas and maps auto/required modes", async () => {
+    const spawnAgent = {
+        description: "Start a child agent",
+        name: "spawn_agent",
+        parameters: {
+            properties: { message: { type: "string" }, task_name: { type: "string" } },
+            required: ["task_name", "message"],
+            type: "object",
+        },
+        type: "function",
+    };
+    const otherTool = { name: "other_tool", parameters: { type: "object" }, type: "function" };
+
+    for (const [mode, geminiMode] of [
+        ["auto", "AUTO"],
+        ["required", "ANY"],
+    ]) {
+        const { googleRequest } = await converter.translateOpenAIResponseToGoogle({
+            input: "Delegate this task.",
+            model: "gemini-3.8-flash",
+            tool_choice: { mode, tools: [{ name: "spawn_agent", type: "function" }], type: "allowed_tools" },
+            tools: [spawnAgent, otherTool],
+        });
+
+        assert.deepEqual(googleRequest.tools, [
+            {
+                functionDeclarations: [
+                    {
+                        description: "Start a child agent",
+                        name: "spawn_agent",
+                        parameters: {
+                            properties: { message: { type: "STRING" }, task_name: { type: "STRING" } },
+                            required: ["task_name", "message"],
+                            type: "OBJECT",
+                        },
+                    },
+                ],
+            },
+        ]);
+        assert.deepEqual(googleRequest.toolConfig, { functionCallingConfig: { mode: geminiMode } });
+    }
+});
+
+test("Responses namespace functions round-trip through Gemini and full-history tool output", async () => {
+    const tools = [
+        {
+            description: "Coordinate child agents",
+            name: "collaboration",
+            tools: [
+                {
+                    description: "Start a child agent",
+                    name: "spawn_agent",
+                    parameters: {
+                        properties: { message: { encrypted: true, type: "string" }, task_name: { type: "string" } },
+                        required: ["task_name", "message"],
+                        type: "object",
+                    },
+                    type: "function",
+                },
+                { name: "wait_agent", parameters: { type: "object" }, type: "function" },
+            ],
+            type: "namespace",
+        },
+    ];
+    const { googleRequest } = await converter.translateOpenAIResponseToGoogle({
+        input: "Start an agent.",
+        model: "gemini-3.8-flash",
+        tool_choice: "auto",
+        tools,
+    });
+    assert.deepEqual(
+        googleRequest.tools[0].functionDeclarations.map(tool => tool.name),
+        ["collaboration__spawn_agent", "collaboration__wait_agent"]
+    );
+    assert.deepEqual(googleRequest.tools[0].functionDeclarations[0].parameters, {
+        properties: { message: { type: "STRING" }, task_name: { type: "STRING" } },
+        required: ["task_name", "message"],
+        type: "OBJECT",
+    });
+    const selected = await converter.translateOpenAIResponseToGoogle({
+        input: "Start an agent.",
+        model: "gemini-3.8-flash",
+        tool_choice: {
+            mode: "required",
+            tools: [{ name: "spawn_agent", namespace: "collaboration", type: "function" }],
+            type: "allowed_tools",
+        },
+        tools,
+    });
+    assert.deepEqual(
+        selected.googleRequest.tools[0].functionDeclarations.map(tool => tool.name),
+        ["collaboration__spawn_agent"]
+    );
+    assert.deepEqual(selected.googleRequest.toolConfig, { functionCallingConfig: { mode: "ANY" } });
+
+    const googleResponse = {
+        candidates: [
+            {
+                content: {
+                    parts: [
+                        {
+                            functionCall: {
+                                args: { message: "Investigate", task_name: "probe" },
+                                name: "collaboration__spawn_agent",
+                            },
+                        },
+                    ],
+                    role: "model",
+                },
+                finishReason: "STOP",
+            },
+        ],
+    };
+    const nonStream = converter.convertGoogleToResponseAPINonStream(googleResponse, "gemini-3.8-flash", { tools });
+    const functionCall = nonStream.output.find(item => item.type === "function_call");
+    assert.equal(functionCall.name, "spawn_agent");
+    assert.equal(functionCall.namespace, "collaboration");
+
+    const streamState = { responseDefaults: { tools } };
+    const events = converter.translateGoogleToResponseAPIStream(
+        JSON.stringify(googleResponse),
+        "gemini-3.8-flash",
+        streamState
+    );
+    const doneItem = events
+        .split("\n\n")
+        .filter(Boolean)
+        .map(frame => JSON.parse(frame.split("\ndata: ")[1]))
+        .find(event => event.type === "response.output_item.done" && event.item.type === "function_call");
+    assert.equal(doneItem.item.name, "spawn_agent");
+    assert.equal(doneItem.item.namespace, "collaboration");
+
+    const continuation = await converter.translateOpenAIResponseToGoogle({
+        input: [
+            {
+                arguments: functionCall.arguments,
+                call_id: functionCall.call_id,
+                name: functionCall.name,
+                namespace: functionCall.namespace,
+                type: "function_call",
+            },
+            { call_id: functionCall.call_id, output: "OK", type: "function_call_output" },
+        ],
+        model: "gemini-3.8-flash",
+        tools,
+    });
+    assert.equal(continuation.googleRequest.contents[0].parts[0].functionCall.name, "collaboration__spawn_agent");
+    assert.equal(continuation.googleRequest.contents[1].parts[0].functionResponse.name, "collaboration__spawn_agent");
+});
+
 test("Gemini 3.8 Flash defaults to HIGH across Chat, Responses, and Claude requests", async () => {
     const chat = await converter.translateOpenAIToGoogle({
         messages: [{ content: "hello", role: "user" }],
