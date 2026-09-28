@@ -43,12 +43,14 @@ class FormatConverter {
         reasoningEffort = null,
         thinkingConfig = null,
         forceThinking = false,
+        gemini38FlashThinkingLevel = null,
         includeThoughtsWhenReasoning = false,
     }) {
         const config = thinkingConfig ? { ...thinkingConfig } : {};
         const model = String(modelName || "")
             .replace(/^models\//i, "")
             .toLowerCase();
+        const forcedLevel = model === "gemini-3.8-flash" ? gemini38FlashThinkingLevel : null;
         const explicitLevel = config.thinkingLevel ?? config.thinking_level ?? null;
         const effortLevels = {
             high: "HIGH",
@@ -60,7 +62,7 @@ class FormatConverter {
             xhigh: "HIGH",
         };
         let effortLevel = null;
-        if (reasoningEffort !== null && reasoningEffort !== undefined && reasoningEffort !== "") {
+        if (!forcedLevel && reasoningEffort !== null && reasoningEffort !== undefined && reasoningEffort !== "") {
             const effort = String(reasoningEffort).toLowerCase();
             if (!Object.hasOwn(effortLevels, effort)) {
                 const error = new Error(`Unsupported reasoning effort: ${reasoningEffort}`);
@@ -71,6 +73,7 @@ class FormatConverter {
         }
 
         const thinkingLevel =
+            forcedLevel ||
             modelThinkingLevel ||
             effortLevel ||
             (typeof explicitLevel === "string" ? explicitLevel.toUpperCase() : explicitLevel) ||
@@ -81,6 +84,10 @@ class FormatConverter {
             throw error;
         }
         delete config.thinking_level;
+        if (forcedLevel) {
+            delete config.thinkingBudget;
+            delete config.thinking_budget;
+        }
         if (thinkingLevel) config.thinkingLevel = thinkingLevel;
         if ((forceThinking || includeThoughtsWhenReasoning) && config.includeThoughts === undefined) {
             config.includeThoughts = true;
@@ -1003,6 +1010,7 @@ class FormatConverter {
         const reasoningEffort = openaiBody.reasoning_effort ?? extraBody.reasoning_effort;
         thinkingConfig = FormatConverter.resolveThinkingConfig({
             forceThinking: this.serverSystem.config.forceThinking,
+            gemini38FlashThinkingLevel: this.serverSystem.config.gemini38FlashThinkingLevel,
             includeThoughtsWhenReasoning: reasoningEffort !== null && reasoningEffort !== undefined,
             modelName: cleanModelName,
             modelThinkingLevel,
@@ -2589,6 +2597,7 @@ class FormatConverter {
 
         thinkingConfig = FormatConverter.resolveThinkingConfig({
             forceThinking: this.serverSystem.config.forceThinking,
+            gemini38FlashThinkingLevel: this.serverSystem.config.gemini38FlashThinkingLevel,
             modelName: cleanModelName,
             modelThinkingLevel,
             thinkingConfig,
@@ -3441,6 +3450,7 @@ class FormatConverter {
         const reasoning = responseBody.reasoning;
         const thinkingConfig = FormatConverter.resolveThinkingConfig({
             forceThinking: this.serverSystem.config.forceThinking,
+            gemini38FlashThinkingLevel: this.serverSystem.config.gemini38FlashThinkingLevel,
             includeThoughtsWhenReasoning: Boolean(reasoning),
             modelName: cleanModelName,
             modelThinkingLevel,

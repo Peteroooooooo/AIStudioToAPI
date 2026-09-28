@@ -4361,9 +4361,9 @@ class RequestHandler {
         this.logger.debug(`[Proxy] Debug: incoming Gemini Body (Google Native) = ${JSON.stringify(bodyObj, null, 2)}`);
 
         // Parse model suffixes from model name in native Gemini generation requests
-        // Only handle generation requests: /v1beta/models/{modelName}:generateContent or :streamGenerateContent
+        // Only handle generation requests on /v1 or /v1beta model paths.
         const modelPathMatch = cleanPath.match(
-            /^(\/v1beta\/models\/)([^:]+)(:(generateContent|streamGenerateContent).*)$/
+            /^(\/v1(?:beta)?\/models\/)([^:]+)(:(generateContent|streamGenerateContent).*)$/
         );
         let modelThinkingLevel = null;
         let nativeModelName = null;
@@ -4421,6 +4421,7 @@ class RequestHandler {
         if (nativeModelName && req.method === "POST" && bodyObj?.contents) {
             const thinkingConfig = FormatConverter.resolveThinkingConfig({
                 forceThinking: this.config.forceThinking,
+                gemini38FlashThinkingLevel: this.config.gemini38FlashThinkingLevel,
                 modelName: nativeModelName,
                 modelThinkingLevel,
                 thinkingConfig: bodyObj.generationConfig?.thinkingConfig,

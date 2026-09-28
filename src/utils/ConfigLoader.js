@@ -118,6 +118,7 @@ class ConfigLoader {
             forceThinking: false,
             forceUrlContext: false,
             forceWebSearch: false,
+            gemini38FlashThinkingLevel: "HIGH",
             host: "0.0.0.0",
             httpPort: 7860,
             iconUrl: "/AIStudio_logo.svg",
@@ -341,6 +342,7 @@ class ConfigLoader {
         this.logger.info(`  Stream Timeout: ${config.streamTimeoutMs}ms`);
         this.logger.info(`  Fake/Non-Stream Timeout: ${config.fakeStreamTimeoutMs}ms`);
         this.logger.info(`  Force Thinking: ${config.forceThinking}`);
+        this.logger.info(`  Gemini 3.8 Flash Thinking Level: ${config.gemini38FlashThinkingLevel}`);
         this.logger.info(`  Force Code Execution: ${config.forceCodeExecution}`);
         this.logger.info(`  Force Web Search: ${config.forceWebSearch}`);
         this.logger.info(`  Force URL Context: ${config.forceUrlContext}`);

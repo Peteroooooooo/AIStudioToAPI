@@ -25,6 +25,7 @@ function initialConfig() {
         forceThinking: false,
         forceUrlContext: false,
         forceWebSearch: false,
+        gemini38FlashThinkingLevel: "HIGH",
         immediateSwitchStatusCodes: [429, 503],
         logLevel: "INFO",
         maxContexts: 2,
@@ -67,13 +68,21 @@ test("file is seeded once, page edits persist, and reset uses the saved initial 
         assert.equal(initial.revision, 0);
         assert.equal(JSON.stringify(initial).includes("test-console-password"), false);
 
-        await store.update({ forceThinking: true, logLevel: "DEBUG", maxContexts: 1, maxRetries: 4 });
+        await store.update({
+            forceThinking: true,
+            gemini38FlashThinkingLevel: "MEDIUM",
+            logLevel: "DEBUG",
+            maxContexts: 1,
+            maxRetries: 4,
+        });
         assert.equal(config.maxContexts, 1);
         assert.equal(config.maxRetries, 4);
         assert.equal(config.forceThinking, true);
+        assert.equal(config.gemini38FlashThinkingLevel, "MEDIUM");
         assert.equal(config.logLevel, "DEBUG");
         const saved = JSON.parse(fs.readFileSync(store.filePath, "utf8"));
         assert.equal(saved.settings.maxContexts, 1);
+        assert.equal(saved.settings.gemini38FlashThinkingLevel, "MEDIUM");
         assert.equal(Object.hasOwn(saved.startup, "apiKeys"), false);
 
         store.close();
@@ -83,9 +92,11 @@ test("file is seeded once, page edits persist, and reset uses the saved initial 
         try {
             assert.equal(changedEnvironment.maxContexts, 1);
             assert.equal(changedEnvironment.logLevel, "DEBUG");
+            assert.equal(changedEnvironment.gemini38FlashThinkingLevel, "MEDIUM");
             assert.equal(restarted.getState().defaults.maxContexts, 2);
             await restarted.reset();
             assert.equal(changedEnvironment.maxContexts, 2);
+            assert.equal(changedEnvironment.gemini38FlashThinkingLevel, "HIGH");
             assert.deepEqual(restarted.getState().effective, restarted.getState().defaults);
         } finally {
             restarted.close();
@@ -137,6 +148,9 @@ test("invalid edits leave the effective and saved settings unchanged", async () 
         const content = fs.readFileSync(store.filePath, "utf8");
         assert.throws(() => store.update({ maxContexts: -1 }), /maxContexts/);
         assert.throws(() => store.update({ apiKeys: ["should-not-save"] }), /Unknown runtime setting/);
+        for (const level of ["minimal", "low", "MAX", null, 1]) {
+            assert.throws(() => store.update({ gemini38FlashThinkingLevel: level }), /gemini38FlashThinkingLevel/);
+        }
         assert.equal(config.maxContexts, 2);
         assert.equal(fs.readFileSync(store.filePath, "utf8"), content);
     } finally {
@@ -183,11 +197,18 @@ test("manual config file saves hot-load valid settings and reject invalid files"
         saved.settings.retryDelay = 750;
         saved.settings.cacheTtlSeconds = 1800;
         saved.settings.cacheEnabled = false;
+        saved.settings.gemini38FlashThinkingLevel = "LOW";
         fs.writeFileSync(store.filePath, JSON.stringify(saved));
-        await waitFor(() => config.retryDelay === 750 && config.cacheTtlSeconds === 1800);
+        await waitFor(
+            () =>
+                config.retryDelay === 750 &&
+                config.cacheTtlSeconds === 1800 &&
+                config.gemini38FlashThinkingLevel === "LOW"
+        );
         assert.equal(config.cacheEnabled, false);
         assert.ok(changed.includes("retryDelay"));
         assert.ok(changed.includes("cacheEnabled"));
+        assert.ok(changed.includes("gemini38FlashThinkingLevel"));
 
         const revision = store.getState().revision;
         saved.settings.maxRetries = 0;
@@ -209,7 +230,7 @@ test("manual config file saves hot-load valid settings and reject invalid files"
     }
 });
 
-test("older config files gain cache settings without losing saved values", () => {
+test("older config files gain new runtime settings without losing saved values", () => {
     const { directory, store } = temporaryStore();
     try {
         store.close();
@@ -222,6 +243,7 @@ test("older config files gain cache settings without losing saved values", () =>
             "cacheMinTokens",
             "cacheRenewWindowSeconds",
             "cacheTtlSeconds",
+            "gemini38FlashThinkingLevel",
         ]) {
             delete saved.settings[key];
             delete saved.resetDefaults[key];
@@ -234,10 +256,13 @@ test("older config files gain cache settings without losing saved values", () =>
             assert.equal(config.maxContexts, 7);
             assert.equal(config.cacheEnabled, true);
             assert.equal(config.cacheTtlSeconds, 3600);
+            assert.equal(config.gemini38FlashThinkingLevel, "HIGH");
             const migrated = JSON.parse(fs.readFileSync(store.filePath, "utf8"));
             assert.equal(migrated.settings.maxContexts, 7);
             assert.equal(migrated.settings.cacheEnabled, true);
             assert.equal(migrated.resetDefaults.cacheTtlSeconds, 3600);
+            assert.equal(migrated.settings.gemini38FlashThinkingLevel, "HIGH");
+            assert.equal(migrated.resetDefaults.gemini38FlashThinkingLevel, "HIGH");
         } finally {
             restarted.close();
         }
