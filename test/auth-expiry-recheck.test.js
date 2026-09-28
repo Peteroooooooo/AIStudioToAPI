@@ -9,6 +9,7 @@ const AccountHealth = require("../src/auth/AccountHealth");
 const AuthSource = require("../src/auth/AuthSource");
 const { detectAccountEmail } = require("../src/auth/AuthPageIdentity");
 const { isAuthExpiredError } = require("../src/utils/CustomErrors");
+const StatusRoutes = require("../src/routes/StatusRoutes");
 
 const logger = { debug() {}, error() {}, info() {}, warn() {} };
 
@@ -163,7 +164,7 @@ test("persistent sign-in after retry marks the account expired once", async () =
     assert.equal(marks, 1);
 });
 
-test("expired recheck keeps loaded contexts and restores only after app readiness", async t => {
+test("expired recheck runs beside an unrelated request and preload without evicting loaded contexts", async t => {
     const originalCwd = process.cwd();
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "auth-recheck-"));
     t.after(() => {
@@ -197,7 +198,7 @@ test("expired recheck keeps loaded contexts and restores only after app readines
         newPage: async () => page,
     };
     const manager = Object.create(BrowserManager.prototype);
-    manager._backgroundPreloadTask = null;
+    manager._backgroundPreloadTask = Promise.resolve();
     manager._currentAuthIndex = 1;
     manager._expiredRecheckDueAt = new Map();
     manager._expiredRecheckFailures = new Map();
@@ -207,19 +208,23 @@ test("expired recheck keeps loaded contexts and restores only after app readines
     manager._wsInitState = new Map();
     manager.authSource = authSource;
     manager.browser = { newContext: async () => context };
-    manager.config = { maxContexts: 2 };
+    manager.config = { maxContexts: 3 };
     manager.contexts = new Map([
         [1, {}],
         [2, {}],
     ]);
-    manager.initializingContexts = new Set();
+    manager.initializingContexts = new Set([3]);
     manager.logger = logger;
     manager.stickyProxyManager = { getProxyForAuth: () => null };
-    manager._isSystemBusy = () => false;
-    manager._hasActiveQueueForAuth = () => false;
+    let systemBusy = true;
+    manager._isSystemBusy = () => systemBusy;
+    manager._hasActiveQueueForAuth = index => index === 1;
     manager._navigateAndWakeUpPage = async () => {};
     manager._checkPageStatusAndErrors = async () => {};
-    manager._waitForWebSocketInit = async () => true;
+    manager._waitForWebSocketInit = async () => {
+        systemBusy = false;
+        return true;
+    };
     manager._captureStorageState = async () => ({ cookies: [{ name: "renewed" }], origins: [] });
     manager._getPrivacyProtectionScript = () => "";
     manager.closeContext = async index => {
@@ -243,22 +248,138 @@ test("expired recheck keeps loaded contexts and restores only after app readines
     if (process.platform !== "win32") assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
 });
 
-test("expired recheck leaves the account excluded while a request is active", async () => {
+test("expired recheck leaves the account excluded while its own request is active", async () => {
     const manager = Object.create(BrowserManager.prototype);
     manager._backgroundPreloadTask = null;
     manager._currentAuthIndex = 1;
     manager._expiredRecheckDueAt = new Map();
     manager._expiredRecheckFailures = new Map();
-    manager._hasActiveQueueForAuth = () => true;
+    manager._hasActiveQueueForAuth = index => index === 15;
     manager._isSystemBusy = () => false;
     manager.authSource = { availableIndices: [1, 15], isExpired: () => true };
     manager.config = { maxContexts: 1 };
-    manager.contexts = new Map([[1, {}]]);
+    manager.contexts = new Map([
+        [1, {}],
+        [15, {}],
+    ]);
     manager.initializingContexts = new Set();
     manager.logger = logger;
     const result = await manager.recheckExpiredAccount(15);
     assert.deepEqual(result, { reason: "busy", recovered: false });
     assert.equal(manager.contexts.has(1), true);
+});
+
+test("manual recheck route delegates despite a global switch busy flag", async () => {
+    let recheckHandler;
+    const register = (route, ...handlers) => {
+        if (route === "/api/accounts/:index/recheck") recheckHandler = handlers.at(-1);
+    };
+    const app = { delete() {}, get() {}, post: register, put() {} };
+    const routes = Object.create(StatusRoutes.prototype);
+    routes.config = {};
+    routes.logger = logger;
+    routes.serverSystem = {
+        authSource: { initialIndices: [15] },
+        browserManager: {
+            recheckExpiredAccount: async index => {
+                assert.equal(index, 15);
+                return { reason: "recovered", recovered: true };
+            },
+        },
+        requestHandler: { isSystemBusy: true },
+    };
+    routes.setupRoutes(app, () => {});
+
+    let status = 200;
+    let payload;
+    const response = {
+        json(value) {
+            payload = value;
+            return this;
+        },
+        status(value) {
+            status = value;
+            return this;
+        },
+    };
+    await recheckHandler({ params: { index: "15" } }, response);
+    assert.equal(status, 200);
+    assert.deepEqual(payload, { needsReauth: false, reason: "recovered", recovered: true });
+});
+
+test("switching to another loaded account leaves an in-flight recheck running", async t => {
+    const { manager } = healthOnlyRecheck(t, identityPage("account@example.com"));
+    manager.authSource.availableIndices.push(1, 2);
+    manager.config.maxContexts = 2;
+    manager.contexts.set(1, {});
+    manager.contexts.set(2, { context: {}, page: { isClosed: () => false } });
+    manager._currentAuthIndex = 1;
+    manager._isSystemBusy = () => true;
+    manager._checkPageStatusAndErrors = async () => {};
+    manager._activateContext = (_context, _page, index) => {
+        manager._currentAuthIndex = index;
+    };
+    manager._flushPendingContextClosures = async () => {};
+
+    let probeStarted;
+    let releaseProbe;
+    const started = new Promise(resolve => {
+        probeStarted = resolve;
+    });
+    const held = new Promise(resolve => {
+        releaseProbe = resolve;
+    });
+    manager._navigateAndWakeUpPage = async () => {
+        probeStarted();
+        await held;
+    };
+
+    const checking = manager.recheckExpiredAccount(15);
+    await started;
+    await manager.preCleanupForSwitch(2);
+    await manager.launchOrSwitchContext(2);
+    assert.equal(manager._expiredRecheckAborted, false);
+    assert.equal(manager._expiredRecheckIndex, 15);
+    assert.equal(manager._currentAuthIndex, 2);
+    releaseProbe();
+    assert.deepEqual(await checking, { reason: "recovered", recovered: true });
+});
+
+test("closing the last service context keeps the browser until its probe finishes", async t => {
+    const { manager } = healthOnlyRecheck(t, identityPage("account@example.com"));
+    let browserClosed = false;
+    manager.browser.close = async () => {
+        browserClosed = true;
+    };
+    manager._cleanupAllContexts = () => {};
+    manager.abortedContexts = new Set();
+    manager.contexts.set(2, {
+        context: { close: async () => {} },
+        page: { isClosed: () => true },
+    });
+    manager._currentAuthIndex = 2;
+    manager.launchOrSwitchContext = async () => {};
+
+    let probeStarted;
+    let releaseProbe;
+    const started = new Promise(resolve => {
+        probeStarted = resolve;
+    });
+    const held = new Promise(resolve => {
+        releaseProbe = resolve;
+    });
+    manager._navigateAndWakeUpPage = async () => {
+        probeStarted();
+        await held;
+    };
+
+    const checking = manager.recheckExpiredAccount(15);
+    await started;
+    await manager.closeContext(2);
+    assert.equal(browserClosed, false);
+    releaseProbe();
+    assert.deepEqual(await checking, { reason: "recovered", recovered: true });
+    assert.equal(browserClosed, true);
 });
 
 test("health-only reauth retry verifies the browser before restoring rotation", async t => {
