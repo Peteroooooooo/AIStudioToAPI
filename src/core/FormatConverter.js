@@ -349,6 +349,42 @@ class FormatConverter {
         );
     }
 
+    _responseFunctionTools(tools) {
+        const functions = [];
+        const byGeminiName = new Map();
+        const byOpenAIName = new Map();
+        const addFunction = (tool, namespace = null, namespaceDescription = "") => {
+            const definition = tool?.function && typeof tool.function === "object" ? tool.function : tool;
+            if (tool?.type !== "function" || typeof definition?.name !== "string" || !definition.name) return;
+
+            const key = JSON.stringify([namespace, definition.name]);
+            if (byOpenAIName.has(key)) return;
+            const baseName = `${namespace ? `${namespace}__` : ""}${definition.name}`
+                .replace(/[^A-Za-z0-9_.-]/g, "_")
+                .replace(/^[^A-Za-z_]/, "_");
+            let geminiName = baseName.slice(0, 64);
+            let suffix = 2;
+            while (byGeminiName.has(geminiName)) {
+                const ending = `_${suffix++}`;
+                geminiName = `${baseName.slice(0, 64 - ending.length)}${ending}`;
+            }
+
+            const entry = { definition, geminiName, name: definition.name, namespace, namespaceDescription };
+            functions.push(entry);
+            byGeminiName.set(geminiName, entry);
+            byOpenAIName.set(key, entry);
+        };
+
+        for (const tool of Array.isArray(tools) ? tools : []) {
+            if (tool?.type === "namespace" && typeof tool.name === "string" && Array.isArray(tool.tools)) {
+                for (const nested of tool.tools) addFunction(nested, tool.name, tool.description || "");
+            } else {
+                addFunction(tool);
+            }
+        }
+        return { byGeminiName, byOpenAIName, functions };
+    }
+
     ensureServerSideToolInvocations(geminiBody, logPrefix = "[Adapter]") {
         if (!this.hasGeminiBuiltInTools(geminiBody) || !this.hasGeminiFunctionDeclarations(geminiBody)) {
             return geminiBody;
@@ -481,7 +517,8 @@ class FormatConverter {
                 "readOnly",
                 "writeOnly",
                 "deprecated",
-                "discriminator"
+                "discriminator",
+                "encrypted"
             );
 
             // ONLY Filter metadata keywords if NOT a property name (isProperties is false)
@@ -1466,6 +1503,7 @@ class FormatConverter {
             streamState.reasoningSummaryText = "";
             streamState.reasoningSummaryPartAdded = false;
             streamState.completed = false;
+            streamState.responseFunctions = this._responseFunctionTools(streamState.responseDefaults?.tools);
         };
 
         const buildResponseObject = (overrides = {}) => ({
@@ -1791,6 +1829,11 @@ class FormatConverter {
                         }
                     } else if (part?.functionCall) {
                         const funcCall = part.functionCall;
+                        const responseFunction = streamState.responseFunctions.byGeminiName.get(funcCall.name);
+                        const responseName = responseFunction?.name || funcCall.name;
+                        const responseNamespace = responseFunction?.namespace
+                            ? { namespace: responseFunction.namespace }
+                            : {};
                         const itemId = `fc_${this._generateRequestId()}`;
                         const callId = `call_${this._generateRequestId()}`;
                         const outputIndex = streamState.nextOutputIndex++;
@@ -1801,7 +1844,8 @@ class FormatConverter {
                                 arguments: "",
                                 call_id: callId,
                                 id: itemId,
-                                name: funcCall.name,
+                                name: responseName,
+                                ...responseNamespace,
                                 status: "in_progress",
                                 type: "function_call",
                             },
@@ -1811,7 +1855,8 @@ class FormatConverter {
                         pushEvent("response.function_call_arguments.done", {
                             arguments: args,
                             item_id: itemId,
-                            name: funcCall.name,
+                            name: responseName,
+                            ...responseNamespace,
                             output_index: outputIndex,
                         });
 
@@ -1819,7 +1864,8 @@ class FormatConverter {
                             arguments: args,
                             call_id: callId,
                             id: itemId,
-                            name: funcCall.name,
+                            name: responseName,
+                            ...responseNamespace,
                             status: "completed",
                             type: "function_call",
                         };
@@ -2078,6 +2124,7 @@ class FormatConverter {
         }
 
         const output = [];
+        const responseFunctions = this._responseFunctionTools(responseDefaults?.tools);
         let messageContent = "";
         let reasoningContent = "";
         if (candidate.content && Array.isArray(candidate.content.parts)) {
@@ -2098,12 +2145,14 @@ class FormatConverter {
                 } else if (part.functionCall) {
                     // Function call
                     const funcCall = part.functionCall;
+                    const responseFunction = responseFunctions.byGeminiName.get(funcCall.name);
                     const callId = `call_${this._generateRequestId()}`;
                     output.push({
                         arguments: JSON.stringify(funcCall.args || {}),
                         call_id: callId,
                         id: `fc-${this._generateRequestId()}`,
-                        name: funcCall.name,
+                        name: responseFunction?.name || funcCall.name,
+                        ...(responseFunction?.namespace ? { namespace: responseFunction.namespace } : {}),
                         status: "completed",
                         type: "function_call",
                     });
@@ -3193,6 +3242,10 @@ class FormatConverter {
         }
 
         const googleContents = [];
+        const responseFunctions = this._responseFunctionTools(responseBody.tools);
+        const geminiFunctionName = (name, namespace) =>
+            responseFunctions.byOpenAIName.get(JSON.stringify([namespace || null, name]))?.geminiName ||
+            (namespace ? `${namespace}__${name}` : name);
         let systemInstructionText = "";
 
         const safeParseJSON = (value, fallbackKey) => {
@@ -3285,7 +3338,7 @@ class FormatConverter {
                     typeof item.call_id === "string" &&
                     typeof item.name === "string"
                 ) {
-                    callIdToName[item.call_id] = item.name;
+                    callIdToName[item.call_id] = geminiFunctionName(item.name, item.namespace);
                 }
             }
 
@@ -3310,7 +3363,7 @@ class FormatConverter {
                         const functionCallPart = {
                             functionCall: {
                                 args: safeParseJSON(rawArgs, "unparsed_arguments"),
-                                name: item.name,
+                                name: geminiFunctionName(item.name, item.namespace),
                             },
                             thoughtSignature: FormatConverter.DUMMY_THOUGHT_SIGNATURE,
                         };
@@ -3324,7 +3377,7 @@ class FormatConverter {
                     } else if (item.type === "function_call_output") {
                         // Function output (tool result from user)
                         const functionName =
-                            item.name ||
+                            (item.name && geminiFunctionName(item.name, item.namespace)) ||
                             (typeof item.call_id === "string" ? callIdToName[item.call_id] : undefined) ||
                             "unknown_function";
                         const parsedOutput = safeParseJSON(item.output, "unparsed_output");
@@ -3472,24 +3525,47 @@ class FormatConverter {
             "web_search_preview",
         ]);
 
-        // Convert tools
-        // `tool_choice: {type:"allowed_tools", tools:[...]}` can provide the effective tool set.
-        let effectiveTools = responseBody.tools;
-        if (
+        // allowed_tools contains selectors, not full definitions. Namespace functions
+        // are flattened with a reversible name map shared by request and response conversion.
+        const allowedTools =
             toolChoice &&
             typeof toolChoice === "object" &&
             toolChoice.type === "allowed_tools" &&
-            Array.isArray(toolChoice.tools) &&
-            toolChoice.tools.length > 0
-        ) {
-            effectiveTools = toolChoice.tools;
-        }
-
-        const tools = effectiveTools;
-        if (tools && Array.isArray(tools) && tools.length > 0) {
+            Array.isArray(toolChoice.tools)
+                ? toolChoice.tools
+                : null;
+        const isAllowedFunction = entry =>
+            !allowedTools ||
+            allowedTools.some(allowed => {
+                if (allowed?.type === "namespace") return allowed.name === entry.namespace;
+                if (allowed?.type !== "function") return false;
+                if (allowed.namespace) return allowed.namespace === entry.namespace && allowed.name === entry.name;
+                return allowed.name === entry.geminiName || allowed.name === entry.name;
+            });
+        const tools = Array.isArray(responseBody.tools)
+            ? responseBody.tools.filter(
+                  tool =>
+                      tool?.type !== "namespace" &&
+                      tool?.type !== "function" &&
+                      (!allowedTools || allowedTools.some(allowed => allowed?.type === tool.type))
+              )
+            : [];
+        if (responseFunctions.functions.length > 0 || tools.length > 0) {
             const functionDeclarations = [];
             let hasCodeExecution = false;
             let hasWebSearch = false;
+
+            for (const entry of responseFunctions.functions.filter(isAllowedFunction)) {
+                const declaration = { name: entry.geminiName };
+                const description = [entry.namespaceDescription, entry.definition.description]
+                    .filter(Boolean)
+                    .join("\n");
+                if (description) declaration.description = description;
+                if (entry.definition.parameters) {
+                    declaration.parameters = this._convertSchemaToGemini(entry.definition.parameters);
+                }
+                functionDeclarations.push(declaration);
+            }
 
             for (const tool of tools) {
                 if (tool.type === "web_search_preview" || tool.type === "web_search") {
@@ -3502,23 +3578,6 @@ class FormatConverter {
                     this.logger.debug(
                         "[Adapter] computer_use_preview tool detected but not supported by Gemini, skipping..."
                     );
-                } else if (tool.type === "function") {
-                    // Custom function tool (Responses API: {type:"function", name, description, parameters})
-                    // Also accept Chat Completions style: {type:"function", function:{name, description, parameters}}
-                    const funcDef = tool.function && typeof tool.function === "object" ? tool.function : tool;
-                    if (!funcDef || !funcDef.name) continue;
-                    const declaration = {
-                        name: funcDef.name,
-                    };
-
-                    if (funcDef.description) {
-                        declaration.description = funcDef.description;
-                    }
-
-                    if (funcDef.parameters) {
-                        declaration.parameters = this._convertSchemaToGemini(funcDef.parameters);
-                    }
-                    functionDeclarations.push(declaration);
                 }
             }
 
@@ -3591,8 +3650,8 @@ class FormatConverter {
                 }
             } else if (typeof toolChoice === "object") {
                 if (toolChoice.type === "allowed_tools") {
-                    // Constrain available tools. We already used toolChoice.tools as effectiveTools above.
-                    // Gemini functionCallingConfig only applies to function declarations, not hosted/built-in tools.
+                    // Declarations are already filtered to the allowed names. Gemini
+                    // functionCallingConfig only applies to function declarations.
                     const allowedToolsHaveHostedTool =
                         Array.isArray(tools) && tools.some(t => t && responseHostedToolTypes.has(t.type));
                     if (hasFunctionDeclarations() && !allowedToolsHaveHostedTool) {
@@ -3600,16 +3659,6 @@ class FormatConverter {
                             functionCallingConfig.mode = "AUTO";
                         } else if (toolChoice.mode === "required") {
                             functionCallingConfig.mode = "ANY";
-                        }
-
-                        const names = Array.isArray(tools)
-                            ? tools
-                                  .filter(t => t && typeof t === "object" && t.type === "function")
-                                  .map(t => (t.function && typeof t.function === "object" ? t.function.name : t.name))
-                                  .filter(Boolean)
-                            : [];
-                        if (names.length > 0) {
-                            functionCallingConfig.allowedFunctionNames = names;
                         }
                     }
                 } else if (toolChoice.type === "custom") {
@@ -3623,7 +3672,9 @@ class FormatConverter {
                     const funcName = toolChoice.name;
                     if (typeof funcName === "string" && funcName) {
                         functionCallingConfig.mode = "ANY";
-                        functionCallingConfig.allowedFunctionNames = [funcName];
+                        functionCallingConfig.allowedFunctionNames = [
+                            geminiFunctionName(funcName, toolChoice.namespace),
+                        ];
                     }
                 } else if (toolChoice.type === "web_search_preview" || toolChoice.type === "web_search") {
                     ensureGoogleSearchTool();
