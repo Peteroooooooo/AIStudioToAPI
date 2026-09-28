@@ -15,6 +15,7 @@ const SAFETY_THRESHOLDS = new Set([
     "BLOCK_NONE",
     "OFF",
 ]);
+const RUNTIME_DEFAULTS = Object.freeze({ ...CACHE_DEFAULTS, gemini38FlashThinkingLevel: "HIGH" });
 
 const NUMERIC_LIMITS = Object.freeze({
     cacheCheckpointTokens: [1024, 100000],
@@ -42,6 +43,7 @@ const BOOLEAN_FIELDS = new Set([
 const FIELDS = Object.freeze([
     ...Object.keys(NUMERIC_LIMITS),
     ...BOOLEAN_FIELDS,
+    "gemini38FlashThinkingLevel",
     "logLevel",
     "safetySettingsThreshold",
     "streamingMode",
@@ -61,7 +63,7 @@ class RuntimeConfigStore {
         this.logger = logger;
         this.filePath = path.join(dataDir, "config.json");
         this.onChange = onChange;
-        this.defaults = Object.fromEntries(FIELDS.map(key => [key, config[key] ?? CACHE_DEFAULTS[key]]));
+        this.defaults = Object.fromEntries(FIELDS.map(key => [key, config[key] ?? RUNTIME_DEFAULTS[key]]));
         this.settings = { ...this.defaults };
         this.fileExtras = {};
         this.revision = 0;
@@ -112,6 +114,8 @@ class RuntimeConfigStore {
                 throw new RuntimeConfigValidationError("logLevel must be INFO or DEBUG.");
             } else if (key === "safetySettingsThreshold" && !SAFETY_THRESHOLDS.has(value)) {
                 throw new RuntimeConfigValidationError("Invalid safetySettingsThreshold.");
+            } else if (key === "gemini38FlashThinkingLevel" && !["LOW", "MEDIUM", "HIGH"].includes(value)) {
+                throw new RuntimeConfigValidationError("gemini38FlashThinkingLevel must be LOW, MEDIUM, or HIGH.");
             }
             result[key] = value;
         }
@@ -133,13 +137,13 @@ class RuntimeConfigStore {
         validateStartup(saved.startup);
         // Add newly managed fields without changing values already saved by the user.
         const previousLogLevel = saved.startup?.logLevel ?? this.config.logLevel;
-        const cacheDefaults = Object.fromEntries(Object.keys(CACHE_DEFAULTS).map(key => [key, this.defaults[key]]));
+        const managedDefaults = Object.fromEntries(Object.keys(RUNTIME_DEFAULTS).map(key => [key, this.defaults[key]]));
         const defaults = this._validateComplete({
-            ...cacheDefaults,
+            ...managedDefaults,
             logLevel: previousLogLevel,
             ...saved.resetDefaults,
         });
-        const settings = this._validateComplete({ ...cacheDefaults, logLevel: previousLogLevel, ...saved.settings });
+        const settings = this._validateComplete({ ...managedDefaults, logLevel: previousLogLevel, ...saved.settings });
         const fileExtras = Object.fromEntries(
             Object.entries(saved).filter(([key]) => !["version", "revision", "resetDefaults", "settings"].includes(key))
         );
@@ -167,7 +171,7 @@ class RuntimeConfigStore {
             const completedStartup = { ...(this.config.startup || {}), ...previousStartup };
             delete completedStartup.apiKeys;
             const previousFile = JSON.parse(content);
-            const missingManagedFields = [...Object.keys(CACHE_DEFAULTS), "logLevel"].some(
+            const missingManagedFields = [...Object.keys(RUNTIME_DEFAULTS), "logLevel"].some(
                 key => !Object.hasOwn(previousFile.settings, key) || !Object.hasOwn(previousFile.resetDefaults, key)
             );
             if (JSON.stringify(completedStartup) !== JSON.stringify(previousStartup) || missingManagedFields) {

@@ -185,3 +185,70 @@ test("native Gemini requests use the same default and preserve explicit settings
     assert.equal(suffix.path, "/v1beta/models/gemini-3.8-flash:generateContent");
     assert.equal(suffix.body.generationConfig.thinkingConfig.thinkingLevel, "LOW");
 });
+
+test("the saved Gemini 3.8 Flash level overrides every request format and updates immediately", async () => {
+    const config = { gemini38FlashThinkingLevel: "LOW", safetySettingsThreshold: "OFF", streamingMode: "real" };
+    const forcedConverter = new FormatConverter(logger, { config });
+    const handler = new RequestHandler({ config }, {}, logger, {}, config, {});
+
+    for (const level of ["LOW", "MEDIUM", "HIGH"]) {
+        config.gemini38FlashThinkingLevel = level;
+        const chat = await forcedConverter.translateOpenAIToGoogle({
+            extra_body: { thinkingConfig: { includeThoughts: false, thinkingLevel: "HIGH" } },
+            messages: [{ content: "hello", role: "user" }],
+            model: "gemini-3.8-flash(minimal)",
+            reasoning_effort: "unsupported",
+        });
+        assert.deepEqual(chat.googleRequest.generationConfig.thinkingConfig, {
+            includeThoughts: false,
+            thinkingLevel: level,
+        });
+
+        const responses = await forcedConverter.translateOpenAIResponseToGoogle({
+            input: "hello",
+            model: "gemini-3.8-flash(low)",
+            reasoning: { effort: "minimal" },
+        });
+        assert.equal(responses.googleRequest.generationConfig.thinkingConfig.thinkingLevel, level);
+
+        const claude = await forcedConverter.translateClaudeToGoogle({
+            max_tokens: 100,
+            messages: [{ content: "hello", role: "user" }],
+            model: "gemini-3.8-flash(high)",
+            thinking: { type: "enabled" },
+        });
+        assert.equal(claude.googleRequest.generationConfig.thinkingConfig.thinkingLevel, level);
+
+        for (const [path, expectedPath] of [
+            ["/v1beta/models/gemini-3.8-flash(low):generateContent", "/v1beta/models/gemini-3.8-flash:generateContent"],
+            ["/v1/models/gemini-3.8-flash:streamGenerateContent", "/v1/models/gemini-3.8-flash:streamGenerateContent"],
+        ]) {
+            const native = handler._buildProxyRequest(
+                {
+                    body: {
+                        contents: [{ parts: [{ text: "hello" }], role: "user" }],
+                        generationConfig: {
+                            thinkingConfig: { includeThoughts: false, thinkingBudget: 1000, thinkingLevel: "HIGH" },
+                        },
+                    },
+                    headers: {},
+                    method: "POST",
+                    path,
+                },
+                "test-request"
+            );
+            assert.equal(native.path, expectedPath);
+            assert.deepEqual(JSON.parse(native.body).generationConfig.thinkingConfig, {
+                includeThoughts: false,
+                thinkingLevel: level,
+            });
+        }
+    }
+
+    const other = await forcedConverter.translateOpenAIResponseToGoogle({
+        input: "hello",
+        model: "gemini-3.6-flash(low)",
+        reasoning: { effort: "high" },
+    });
+    assert.equal(other.googleRequest.generationConfig.thinkingConfig.thinkingLevel, "LOW");
+});
