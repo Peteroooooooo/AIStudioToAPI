@@ -45,6 +45,7 @@ class BrowserManager {
         this.stickyProxyManager = new StickyProxyManager(logger, authSource, { proxyBypass: config.proxyBypass });
         this.stickyProxyManager.isEnabled();
         this.browser = null;
+        this._browserLaunchTask = null;
 
         // Multi-context architecture: Store all initialized contexts
         // Map: authIndex -> {context, page, healthMonitorInterval}
@@ -80,7 +81,9 @@ class BrowserManager {
         this._expiredRecheckTask = null;
         this._expiredRecheckIndex = null;
         this._expiredRecheckContext = null;
+        this._expiredRecheckBrowser = null;
         this._expiredRecheckAborted = false;
+        this._recheckBrowserOrphaned = false;
         this._expiredRecheckDueAt = new Map();
         this._expiredRecheckFailures = new Map();
         this._expiredRecheckCursor = 0;
@@ -1053,7 +1056,7 @@ class BrowserManager {
     }
 
     async _recheckNextExpiredAccount() {
-        if (this._expiredRecheckTask || this._isSystemBusy()) return;
+        if (this._expiredRecheckTask) return;
         const candidates = [
             ...new Set([
                 ...(this.authSource.expiredIndices || []),
@@ -1143,10 +1146,7 @@ class BrowserManager {
     }
 
     async _runExpiredRecheck(authIndex) {
-        if (this._isSystemBusy() || this.initializingContexts.size > 0 || this._backgroundPreloadTask) {
-            return { reason: "busy", recovered: false };
-        }
-        if ([...this.contexts.keys()].some(index => this._hasActiveQueueForAuth(index))) {
+        if (this.initializingContexts.has(authIndex) || this._hasActiveQueueForAuth(authIndex)) {
             return { reason: "busy", recovered: false };
         }
 
@@ -1172,6 +1172,7 @@ class BrowserManager {
         // browser, then close it before the check completes.
 
         let context = null;
+        let probeBrowser = null;
         let launchedBrowser = false;
         let writeSuspended = false;
         let committedHealthReauth = false;
@@ -1183,15 +1184,36 @@ class BrowserManager {
             ) {
                 return { reason: "busy", recovered: false };
             }
+            // A probe shares the browser process, but its page and WebSocket must not
+            // overlap a request or context initialization for the same account.
+            if (
+                this.initializingContexts.has(authIndex) ||
+                this._hasActiveQueueForAuth(authIndex) ||
+                this.isClosingIntentionally ||
+                (!this.browser &&
+                    (this._isSystemBusy() || this.initializingContexts.size > 0 || this._backgroundPreloadTask))
+            ) {
+                return { reason: "busy", recovered: false };
+            }
             if (!this.browser) {
                 await this._ensureBrowser();
                 launchedBrowser = true;
+            }
+            probeBrowser = this.browser;
+            // Allow at most one temporary probe beyond the configured service pool.
+            // A switch may already have overflowed the pool while requests drain.
+            if (
+                this.config.maxContexts > 0 &&
+                this.contexts.size + this.initializingContexts.size > this.config.maxContexts
+            ) {
+                return { reason: "busy", recovered: false };
             }
             const stickyProxy = this.stickyProxyManager.getProxyForAuth(authIndex);
             const proxyConfig = stickyProxy
                 ? stickyProxy.proxy
                 : parseProxyConfig(this.config.proxyUrl, this.config.proxyBypass);
-            context = await this.browser.newContext({
+            this._expiredRecheckBrowser = probeBrowser;
+            context = await probeBrowser.newContext({
                 storageState: savedAuth,
                 ...(proxyConfig ? { proxy: proxyConfig } : {}),
             });
@@ -1264,6 +1286,7 @@ class BrowserManager {
                 return { reason: "unavailable", recovered: false };
             }
             const storageState = await this._captureStorageState(context);
+            if (this._expiredRecheckAborted) return { reason: "busy", recovered: false };
             const healthOnlyReauth = !this.authSource.isExpired(authIndex);
             if (healthOnlyReauth) {
                 writeSuspended = true;
@@ -1297,9 +1320,19 @@ class BrowserManager {
             if (writeSuspended && !committedHealthReauth) this.resumeAuthUpdates(authIndex);
             this._expiredRecheckContext = null;
             if (context) await context.close().catch(() => {});
-            if (this.contexts.size === 0 && this.initializingContexts.size === 0 && this.browser && launchedBrowser) {
+            if (this._expiredRecheckBrowser === probeBrowser) this._expiredRecheckBrowser = null;
+            const closeWhenIdle = launchedBrowser || this._recheckBrowserOrphaned;
+            this._recheckBrowserOrphaned = false;
+            if (
+                closeWhenIdle &&
+                this.contexts.size === 0 &&
+                this.initializingContexts.size === 0 &&
+                this.browser === probeBrowser &&
+                !this._isSystemBusy() &&
+                !this._backgroundPreloadTask
+            ) {
                 await this.closeBrowser();
-            } else if (!this._isSystemBusy() && this.browser) {
+            } else if (!this._isSystemBusy() && !this.isClosingIntentionally && this.browser) {
                 this.rebalanceContextPool().catch(error => {
                     this.logger.warn(`[Auth Recheck] Pool rebalance failed: ${error.message}`);
                 });
@@ -1924,7 +1957,18 @@ class BrowserManager {
      */
     async _ensureBrowser() {
         if (this.browser) return;
+        if (this._browserLaunchTask) return this._browserLaunchTask;
 
+        const launchTask = this._launchBrowser();
+        this._browserLaunchTask = launchTask;
+        try {
+            await launchTask;
+        } finally {
+            if (this._browserLaunchTask === launchTask) this._browserLaunchTask = null;
+        }
+    }
+
+    async _launchBrowser() {
         const isStickyProxyEnabled = this.stickyProxyManager.isEnabled();
         const proxyConfig = isStickyProxyEnabled
             ? null
@@ -2240,7 +2284,7 @@ class BrowserManager {
      * @param {number} targetAuthIndex - The account index we're about to switch to
      */
     async preCleanupForSwitch(targetAuthIndex) {
-        await this._stopExpiredRecheck();
+        if (this._expiredRecheckIndex === targetAuthIndex) await this._stopExpiredRecheck();
         const maxContexts = this.config.maxContexts;
         const isUnlimited = maxContexts === 0;
 
@@ -2751,7 +2795,7 @@ class BrowserManager {
             throw new Error(`Invalid authIndex: ${authIndex}. Must be >= 0.`);
         }
 
-        if (!this.contexts.has(authIndex)) await this._stopExpiredRecheck();
+        if (this._expiredRecheckIndex === authIndex) await this._stopExpiredRecheck();
         if (this.pendingContextClosures.get(authIndex) === "reauth") {
             if (this._hasActiveQueueForAuth(authIndex)) {
                 throw new Error(
@@ -3104,9 +3148,17 @@ class BrowserManager {
             // Context doesn't exist (was never initialized or was aborted)
             // Still check if we need to close the browser
             // Only close if there are no contexts AND no contexts being initialized
-            if (this.contexts.size === 0 && this.initializingContexts.size === 0 && this.browser) {
-                this.logger.info(`[Browser] All contexts closed, closing browser instance...`);
-                await this.closeBrowser();
+            if (
+                this.contexts.size === 0 &&
+                this.initializingContexts.size === 0 &&
+                this.browser &&
+                !this.isClosingIntentionally
+            ) {
+                if (this._expiredRecheckBrowser === this.browser) this._recheckBrowserOrphaned = true;
+                else {
+                    this.logger.info(`[Browser] All contexts closed, closing browser instance...`);
+                    await this.closeBrowser();
+                }
             }
             return;
         }
@@ -3141,6 +3193,14 @@ class BrowserManager {
         // This ensures that when context.close() triggers WebSocket disconnect,
         // _removeConnection will see that the context is already gone and skip reconnect logic
         this.contexts.delete(authIndex);
+        if (
+            this.contexts.size === 0 &&
+            this.initializingContexts.size === 0 &&
+            this.browser &&
+            this._expiredRecheckBrowser === this.browser
+        ) {
+            this._recheckBrowserOrphaned = true;
+        }
 
         // Proactively close message queues BEFORE closing context to prevent race condition
         // Race condition: context.close() triggers async WebSocket 'close' event, which calls _removeConnection()
@@ -3178,9 +3238,17 @@ class BrowserManager {
         // If this was the last context, close the browser to free resources
         // This ensures a clean state when all accounts are deleted
         // Only close if there are no contexts AND no contexts being initialized
-        if (this.contexts.size === 0 && this.initializingContexts.size === 0 && this.browser) {
-            this.logger.info(`[Browser] All contexts closed, closing browser instance...`);
-            await this.closeBrowser();
+        if (
+            this.contexts.size === 0 &&
+            this.initializingContexts.size === 0 &&
+            this.browser &&
+            !this.isClosingIntentionally
+        ) {
+            if (this._expiredRecheckBrowser === this.browser) this._recheckBrowserOrphaned = true;
+            else {
+                this.logger.info(`[Browser] All contexts closed, closing browser instance...`);
+                await this.closeBrowser();
+            }
         }
     }
 

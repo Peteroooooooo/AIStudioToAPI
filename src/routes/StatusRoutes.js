@@ -349,7 +349,6 @@ class StatusRoutes {
         });
 
         app.post("/api/accounts/:index/recheck", isAuthenticated, async (req, res) => {
-            if (this._rejectIfSystemBusy(res)) return;
             const index = Number(req.params.index);
             if (
                 !Number.isSafeInteger(index) ||
