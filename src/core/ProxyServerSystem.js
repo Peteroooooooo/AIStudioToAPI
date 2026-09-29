@@ -25,6 +25,8 @@ const UsageStatsService = require("./UsageStatsService");
 const ConfigLoader = require("../utils/ConfigLoader");
 const { RuntimeConfigStore } = require("../utils/RuntimeConfigStore");
 const { ManagedApiKeyStore } = require("../utils/ManagedApiKeyStore");
+const { ModelCatalogStore } = require("../utils/ModelCatalogStore");
+const { createModelAccessMiddleware } = require("./ModelAccessMiddleware");
 const WebRoutes = require("../routes/WebRoutes");
 
 /**
@@ -78,12 +80,14 @@ class ProxyServerSystem extends EventEmitter {
             }
         );
         this.runtimeConfig.apiKeyStore = this.apiKeyStore;
+        this.modelCatalogStore = new ModelCatalogStore(this.config, this.logger, path.join(process.cwd(), "data"));
         LoggingService.setLevel(this.config.logLevel);
         configLoader._printConfiguration(this.config);
 
         this.authSource = new AuthSource(this.logger);
         this.authCredentialEpochs = new Map();
         this.browserManager = new BrowserManager(this.logger, this.config, this.authSource);
+        this.modelCatalogStore.setNativeCatalogFetcher(() => this.browserManager.fetchNativeModelCatalog());
         this.usageStatsService = new UsageStatsService(
             this.authSource,
             this.logger,
@@ -562,11 +566,12 @@ class ProxyServerSystem extends EventEmitter {
 
         // API authentication middleware
         app.use(this._createAuthMiddleware());
+        app.use(createModelAccessMiddleware(this.modelCatalogStore));
 
         // API routes
         app.get(["/v1/models"], (req, res) => {
             // OpenAI format
-            const models = this.config.modelList.map(model => ({
+            const models = this.modelCatalogStore.getPublicModels().map(model => ({
                 context_window: model.inputTokenLimit,
                 created: Math.floor(Date.now() / 1000),
                 id: model.name.replace("models/", ""),
@@ -582,7 +587,7 @@ class ProxyServerSystem extends EventEmitter {
         });
 
         app.get(["/v1beta/models"], (req, res) => {
-            res.status(200).json({ models: this.config.modelList });
+            res.status(200).json({ models: this.modelCatalogStore.getPublicModels() });
         });
 
         app.post("/v1/chat/completions", (req, res) => {
@@ -718,6 +723,7 @@ class ProxyServerSystem extends EventEmitter {
     async shutdown() {
         this.logger.info("[System] Shutting down server system...");
         this.runtimeConfig?.close();
+        this.modelCatalogStore?.close();
         this.apiKeyStore?.close();
         await this.requestHandler?.cacheManager?.close();
 

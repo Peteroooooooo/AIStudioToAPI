@@ -44,13 +44,23 @@ class FormatConverter {
         thinkingConfig = null,
         forceThinking = false,
         gemini38FlashThinkingLevel = null,
+        managedPolicy = undefined,
         includeThoughtsWhenReasoning = false,
     }) {
         const config = thinkingConfig ? { ...thinkingConfig } : {};
         const model = String(modelName || "")
             .replace(/^models\//i, "")
             .toLowerCase();
-        const forcedLevel = model === "gemini-3.8-flash" ? gemini38FlashThinkingLevel : null;
+        const hasManagedPolicy = managedPolicy !== undefined;
+        const capability = managedPolicy?.capability;
+        if (capability?.kind === "none") return null;
+        const forcedLevel = hasManagedPolicy
+            ? managedPolicy?.mode === "force"
+                ? managedPolicy.level
+                : null
+            : model === "gemini-3.8-flash"
+              ? gemini38FlashThinkingLevel
+              : null;
         const explicitLevel = config.thinkingLevel ?? config.thinking_level ?? null;
         const effortLevels = {
             high: "HIGH",
@@ -62,7 +72,13 @@ class FormatConverter {
             xhigh: "HIGH",
         };
         let effortLevel = null;
-        if (!forcedLevel && reasoningEffort !== null && reasoningEffort !== undefined && reasoningEffort !== "") {
+        if (
+            !forcedLevel &&
+            capability?.kind !== "budget" &&
+            reasoningEffort !== null &&
+            reasoningEffort !== undefined &&
+            reasoningEffort !== ""
+        ) {
             const effort = String(reasoningEffort).toLowerCase();
             if (!Object.hasOwn(effortLevels, effort)) {
                 const error = new Error(`Unsupported reasoning effort: ${reasoningEffort}`);
@@ -72,18 +88,26 @@ class FormatConverter {
             effortLevel = effortLevels[effort];
         }
 
-        const thinkingLevel =
+        const requestedThinkingLevel =
             forcedLevel ||
             modelThinkingLevel ||
             effortLevel ||
             (typeof explicitLevel === "string" ? explicitLevel.toUpperCase() : explicitLevel) ||
-            (model === "gemini-3.8-flash" ? "HIGH" : null);
-        if (model === "gemini-3.8-flash" && thinkingLevel && !["LOW", "MEDIUM", "HIGH"].includes(thinkingLevel)) {
-            const error = new Error(`gemini-3.8-flash does not support thinking level ${thinkingLevel}`);
+            (!hasManagedPolicy && model === "gemini-3.8-flash" ? "HIGH" : null);
+        const thinkingLevel = capability?.kind === "budget" ? null : requestedThinkingLevel;
+        const allowedLevels =
+            capability?.kind === "level"
+                ? capability.levels
+                : !hasManagedPolicy && model === "gemini-3.8-flash"
+                  ? ["LOW", "MEDIUM", "HIGH"]
+                  : null;
+        if (thinkingLevel && allowedLevels && !allowedLevels.includes(thinkingLevel)) {
+            const error = new Error(`${model} does not support thinking level ${thinkingLevel}`);
             error.code = "INVALID_THINKING_LEVEL";
             throw error;
         }
         delete config.thinking_level;
+        if (capability?.kind === "budget") delete config.thinkingLevel;
         if (forcedLevel) {
             delete config.thinkingBudget;
             delete config.thinking_budget;
@@ -1049,6 +1073,7 @@ class FormatConverter {
             forceThinking: this.serverSystem.config.forceThinking,
             gemini38FlashThinkingLevel: this.serverSystem.config.gemini38FlashThinkingLevel,
             includeThoughtsWhenReasoning: reasoningEffort !== null && reasoningEffort !== undefined,
+            managedPolicy: this.serverSystem.modelCatalogStore?.getEffectiveThinkingPolicy(cleanModelName),
             modelName: cleanModelName,
             modelThinkingLevel,
             reasoningEffort,
@@ -2647,6 +2672,7 @@ class FormatConverter {
         thinkingConfig = FormatConverter.resolveThinkingConfig({
             forceThinking: this.serverSystem.config.forceThinking,
             gemini38FlashThinkingLevel: this.serverSystem.config.gemini38FlashThinkingLevel,
+            managedPolicy: this.serverSystem.modelCatalogStore?.getEffectiveThinkingPolicy(cleanModelName),
             modelName: cleanModelName,
             modelThinkingLevel,
             thinkingConfig,
@@ -3505,6 +3531,7 @@ class FormatConverter {
             forceThinking: this.serverSystem.config.forceThinking,
             gemini38FlashThinkingLevel: this.serverSystem.config.gemini38FlashThinkingLevel,
             includeThoughtsWhenReasoning: Boolean(reasoning),
+            managedPolicy: this.serverSystem.modelCatalogStore?.getEffectiveThinkingPolicy(cleanModelName),
             modelName: cleanModelName,
             modelThinkingLevel,
             reasoningEffort: reasoning?.effort,

@@ -4422,6 +4422,7 @@ class RequestHandler {
             const thinkingConfig = FormatConverter.resolveThinkingConfig({
                 forceThinking: this.config.forceThinking,
                 gemini38FlashThinkingLevel: this.config.gemini38FlashThinkingLevel,
+                managedPolicy: this.serverSystem.modelCatalogStore?.getEffectiveThinkingPolicy(nativeModelName),
                 modelName: nativeModelName,
                 modelThinkingLevel,
                 thinkingConfig: bodyObj.generationConfig?.thinkingConfig,
