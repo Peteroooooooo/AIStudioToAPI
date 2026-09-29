@@ -28,6 +28,7 @@ const EXPIRED_RECHECK_INTERVAL_MS = 15 * 60 * 1000;
 const EXPIRED_RECHECK_MAX_BACKOFF_MS = 6 * 60 * 60 * 1000;
 const EXPIRED_RECHECK_WS_TIMEOUT_MS = 60000;
 const AUTH_IDENTITY_URL = "https://aistudio.google.com/apps";
+const NATIVE_MODELS_RPC_PATH = "MakerSuiteService/ListModels";
 const FIREFOX_DOH_DISABLED_PREFS = {
     "network.trr.mode": 5,
     "network.trr.uri": "",
@@ -210,6 +211,39 @@ class BrowserManager {
 
     setSystemBusyProvider(provider) {
         this._isSystemBusyProvider = typeof provider === "function" ? provider : null;
+    }
+
+    async fetchNativeModelCatalog() {
+        const preferred = this.contexts.get(this.currentAuthIndex);
+        const source =
+            preferred?.context && !preferred.page?.isClosed()
+                ? preferred
+                : [...this.contexts.values()].find(entry => entry.context && !entry.page?.isClosed());
+        if (!source) throw new Error("No active AI Studio browser context is available for model sync.");
+
+        const page = await source.context.newPage();
+        try {
+            const [response] = await Promise.all([
+                page.waitForResponse(
+                    candidate =>
+                        candidate.request().method() === "POST" && candidate.url().includes(NATIVE_MODELS_RPC_PATH),
+                    { timeout: 45000 }
+                ),
+                page.goto(AUTH_IDENTITY_URL, { timeout: 45000, waitUntil: "domcontentloaded" }),
+            ]);
+            if (!response.ok()) throw new Error(`AI Studio model list returned HTTP ${response.status()}.`);
+            const body = await response.text();
+            if (body.length > 10000000) throw new Error("AI Studio model list is too large.");
+            return JSON.parse(body);
+        } catch (error) {
+            const reason = String(error.message || error)
+                .split("\n", 1)[0]
+                .slice(0, 180);
+            this.logger.warn(`[Models] AI Studio model discovery failed: ${reason}`);
+            throw error;
+        } finally {
+            await page.close().catch(() => {});
+        }
     }
 
     _isSystemBusy() {

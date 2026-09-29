@@ -46,6 +46,19 @@
                 </button>
                 <button
                     class="menu-item"
+                    :class="{ active: activeTab === 'models' }"
+                    :aria-current="activeTab === 'models' ? 'page' : undefined"
+                    @click="switchTab('models')"
+                >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                        <rect x="3" y="4" width="18" height="5" rx="1.5" />
+                        <rect x="3" y="15" width="18" height="5" rx="1.5" />
+                        <path d="M8 9v6m8-6v6" />
+                    </svg>
+                    <span>{{ t("modelCatalogNavigation") }}</span>
+                </button>
+                <button
+                    class="menu-item"
                     :class="{ active: activeTab === 'stats' }"
                     :aria-current="activeTab === 'stats' ? 'page' : undefined"
                     @click="switchTab('stats')"
@@ -150,6 +163,7 @@
                 @batch-download="handleAccountBatchDownload"
                 @refresh="updateContent"
             />
+            <ModelsView v-if="activeTab === 'models'" :t="t" />
             <!-- SETTINGS VIEW -->
             <div v-if="activeTab === 'settings'" class="view-container settings-view">
                 <header class="page-header settings-page-header">
@@ -297,21 +311,9 @@
                                 </dl>
                             </div>
                             <div class="runtime-option-fields">
-                                <div
-                                    v-for="field in group.fields"
-                                    :key="field.key"
-                                    class="runtime-option-field"
-                                    :class="{ 'is-thinking-level': field.type === 'thinkingLevel' }"
-                                >
+                                <div v-for="field in group.fields" :key="field.key" class="runtime-option-field">
                                     <label :for="`runtime-${field.key}`">{{ t(field.titleKey) }}</label>
                                     <code>{{ field.key }}</code>
-                                    <p
-                                        v-if="field.type === 'thinkingLevel'"
-                                        :id="`runtime-${field.key}-description`"
-                                        class="runtime-thinking-description"
-                                    >
-                                        {{ t("runtimeGemini38FlashThinkingLevelDescription") }}
-                                    </p>
                                     <div class="runtime-option-control">
                                         <el-switch
                                             v-if="field.type === 'boolean'"
@@ -337,28 +339,6 @@
                                             <el-option :label="t('normal')" value="INFO" />
                                             <el-option :label="t('debug')" value="DEBUG" />
                                         </el-select>
-                                        <div v-else-if="field.type === 'thinkingLevel'" class="runtime-thinking-slider">
-                                            <input
-                                                :id="`runtime-${field.key}`"
-                                                v-model.number="runtimeThinkingLevelIndex"
-                                                type="range"
-                                                min="0"
-                                                max="2"
-                                                step="1"
-                                                :disabled="!!runtimeConfig.busy"
-                                                :aria-describedby="`runtime-${field.key}-description`"
-                                                :aria-valuetext="formatRuntimeOption(field, runtimeDraft[field.key])"
-                                            />
-                                            <div class="runtime-thinking-marks" aria-hidden="true">
-                                                <span
-                                                    v-for="level in runtimeThinkingLevelValues"
-                                                    :key="level"
-                                                    :class="{ 'is-active': runtimeDraft[field.key] === level }"
-                                                >
-                                                    {{ t(`runtimeThinkingLevel${level}`) }}
-                                                </span>
-                                            </div>
-                                        </div>
                                         <el-select
                                             v-else
                                             :id="`runtime-${field.key}`"
@@ -553,6 +533,7 @@ import AccountsView from "../components/AccountsView.vue";
 import ApiKeysSettings from "../components/ApiKeysSettings.vue";
 import DashboardView from "../components/DashboardView.vue";
 import LogsView from "../components/LogsView.vue";
+import ModelsView from "../components/ModelsView.vue";
 import UsageAnalytics from "../components/UsageAnalytics.vue";
 import JSZip from "jszip";
 import escapeHtml from "../utils/escapeHtml";
@@ -564,7 +545,7 @@ const route = useRoute();
 const forkReleasesUrl = "https://github.com/Peteroooooooo/AIStudioToAPI/releases";
 const fileInput = ref(null);
 const usageStatsImportInput = ref(null);
-const viewNames = new Set(["home", "accounts", "stats", "settings", "logs"]);
+const viewNames = new Set(["home", "accounts", "models", "stats", "settings", "logs"]);
 const viewFromQuery = value => (typeof value === "string" && viewNames.has(value) ? value : "home");
 const activeTab = ref(viewFromQuery(route.query.view));
 const isDownloadingUsageStats = ref(false);
@@ -793,11 +774,6 @@ const runtimeOptionGroups = [
         fields: [
             { key: "streamingMode", titleKey: "streamingMode", type: "streaming" },
             { key: "forceThinking", titleKey: "forceThinking", type: "boolean" },
-            {
-                key: "gemini38FlashThinkingLevel",
-                titleKey: "runtimeGemini38FlashThinkingLevel",
-                type: "thinkingLevel",
-            },
             { key: "forceWebSearch", titleKey: "forceWebSearch", type: "boolean" },
             { key: "forceUrlContext", titleKey: "forceUrlContext", type: "boolean" },
             { key: "forceCodeExecution", titleKey: "forceCodeExecution", type: "boolean" },
@@ -828,16 +804,6 @@ const cacheStatusMetrics = [
 ];
 const runtimeEditableFields = [...runtimeFields, ...runtimeOptionFields];
 const runtimeDraft = reactive({});
-const runtimeThinkingLevelValues = ["LOW", "MEDIUM", "HIGH"];
-const runtimeThinkingLevelIndex = computed({
-    get: () => {
-        const index = runtimeThinkingLevelValues.indexOf(runtimeDraft.gemini38FlashThinkingLevel);
-        return index < 0 ? 2 : index;
-    },
-    set: index => {
-        runtimeDraft.gemini38FlashThinkingLevel = runtimeThinkingLevelValues[Number(index)];
-    },
-});
 const runtimeConfig = reactive({
     busy: "",
     configPath: "",
@@ -892,7 +858,6 @@ const formatRuntimeOption = (field, value) => {
     if (field.type === "boolean") return value ? t("enabled") : t("disabled");
     if (field.type === "streaming") return t(value);
     if (field.type === "logLevel") return t(value === "DEBUG" ? "debug" : "normal");
-    if (field.type === "thinkingLevel") return t(`runtimeThinkingLevel${value}`);
     if (field.type === "safety") return t(`safetySettingsThreshold.${value}`);
     return String(value);
 };
@@ -2184,6 +2149,7 @@ watchEffect(() => {
         accounts: "consoleAccounts",
         home: "consoleDashboard",
         logs: "consoleLogs",
+        models: "modelCatalogNavigation",
         settings: "consoleSettings",
         stats: "consoleAnalytics",
     };
@@ -2746,62 +2712,6 @@ watchEffect(() => {
         :deep(.el-select) {
             width: 140px;
             max-width: 100%;
-        }
-    }
-
-    &.is-thinking-level {
-        grid-template-columns: minmax(0, 1fr);
-
-        .runtime-option-control {
-            grid-column: 1;
-            grid-row: auto;
-            max-width: 520px;
-            width: 100%;
-        }
-    }
-}
-
-.runtime-thinking-description {
-    color: @text-secondary;
-    font-size: 0.78rem;
-    grid-column: 1;
-    line-height: 1.45;
-    margin: 4px 0 10px;
-}
-
-.runtime-thinking-slider {
-    input[type="range"] {
-        accent-color: @primary-color;
-        cursor: pointer;
-        display: block;
-        margin: 0;
-        width: 100%;
-
-        &:disabled {
-            cursor: not-allowed;
-        }
-
-        &:focus-visible {
-            outline: 2px solid @primary-color;
-            outline-offset: 4px;
-        }
-    }
-}
-
-.runtime-thinking-marks {
-    color: @text-secondary;
-    display: flex;
-    font-size: 0.75rem;
-    justify-content: space-between;
-    margin-top: 6px;
-
-    span {
-        min-width: 48px;
-        text-align: center;
-
-        &.is-active {
-            color: @primary-color;
-            font-weight: 700;
         }
     }
 }
