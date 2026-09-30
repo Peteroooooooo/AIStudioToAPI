@@ -1456,9 +1456,9 @@ const handleLogout = () => {
         .catch(() => {});
 };
 
-const updateAccountHealth = async account => {
+const updateAccountHealth = async (account, requestedAction) => {
     const mode = account.health?.mode || "active";
-    if (mode !== "disabled" && (account.isExpired || mode === "reauth")) {
+    if (!requestedAction && mode !== "disabled" && (account.isExpired || mode === "reauth")) {
         state.isSwitchingAccount = true;
         try {
             const res = await fetch(`/api/accounts/${account.index}/recheck`, { method: "POST" });
@@ -1479,7 +1479,7 @@ const updateAccountHealth = async account => {
         }
         return;
     }
-    const action = mode === "disabled" ? "enable" : mode === "active" ? "disable" : "reset";
+    const action = requestedAction || (mode === "disabled" ? "enable" : mode === "active" ? "disable" : "reset");
     state.isSwitchingAccount = true;
     try {
         const res = await fetch(`/api/accounts/${account.index}/health`, {
