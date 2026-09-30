@@ -244,6 +244,20 @@
                                         {{ t("usageDetails") }}
                                     </button>
                                     <button
+                                        type="button"
+                                        class="accounts-text-button"
+                                        :disabled="isBusy || account.isInvalid"
+                                        @click="
+                                            emit(
+                                                'health',
+                                                account,
+                                                account.health?.mode === 'disabled' ? 'enable' : 'disable'
+                                            )
+                                        "
+                                    >
+                                        {{ t(account.health?.mode === "disabled" ? "healthEnable" : "healthDisable") }}
+                                    </button>
+                                    <button
                                         v-if="canRetryWithoutReauth(account)"
                                         type="button"
                                         class="accounts-text-button"
@@ -335,6 +349,14 @@
                     <div class="accounts-card-actions">
                         <button type="button" class="accounts-text-button" @click="openDetails(account)">
                             {{ t("usageDetails") }}
+                        </button>
+                        <button
+                            type="button"
+                            class="accounts-text-button"
+                            :disabled="isBusy || account.isInvalid"
+                            @click="emit('health', account, account.health?.mode === 'disabled' ? 'enable' : 'disable')"
+                        >
+                            {{ t(account.health?.mode === "disabled" ? "healthEnable" : "healthDisable") }}
                         </button>
                         <button
                             v-if="canRetryWithoutReauth(account)"
@@ -442,6 +464,21 @@
                         {{ t("accountsReauthenticate") }}
                     </button>
                     <button
+                        type="button"
+                        class="accounts-button"
+                        :disabled="isBusy || selectedAccount.isInvalid"
+                        @click="
+                            emit(
+                                'health',
+                                selectedAccount,
+                                selectedAccount.health?.mode === 'disabled' ? 'enable' : 'disable'
+                            )
+                        "
+                    >
+                        {{ t(selectedAccount.health?.mode === "disabled" ? "healthEnable" : "healthDisable") }}
+                    </button>
+                    <button
+                        v-if="canRetryWithoutReauth(selectedAccount) || selectedAccount.health?.mode === 'cooldown'"
                         type="button"
                         class="accounts-button"
                         :disabled="isBusy || selectedAccount.isInvalid"
