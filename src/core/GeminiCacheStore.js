@@ -62,11 +62,12 @@ class GeminiCacheStore {
         return googleRequest.contents;
     }
 
-    _prefixHashes(accountKey, model, googleRequest, maxPrefixLength) {
+    _prefixHashes(accountKey, model, googleRequest, maxPrefixLength, scopeKey = null) {
         const suffix = `],"model":${canonical(model)},"systemInstruction":${canonical(
             googleRequest.systemInstruction ?? null
         )},"toolConfig":${canonical(googleRequest.toolConfig ?? null)},"tools":${canonical(googleRequest.tools ?? null)}}`;
-        const prefix = createHash("sha256").update(`{"accountKey":${canonical(accountKey)},"contents":[`);
+        const scope = scopeKey ? `"scopeKey":${canonical(scopeKey)},` : "";
+        const prefix = createHash("sha256").update(`{${scope}"accountKey":${canonical(accountKey)},"contents":[`);
         const hashes = [];
         for (let index = 0; index <= maxPrefixLength; index++) {
             hashes.push(prefix.copy().update(suffix).digest("hex"));
@@ -76,6 +77,50 @@ class GeminiCacheStore {
             }
         }
         return hashes;
+    }
+
+    contentKey({ model, googleRequest, prefixLength, scopeKey = null }) {
+        this._identity("content-owner", model);
+        const contents = this._contents(googleRequest);
+        if (!Number.isSafeInteger(prefixLength) || prefixLength < 0 || prefixLength > contents.length)
+            throw new RangeError("Cache prefix must end at a complete contents message boundary.");
+        return this._prefixHashes("content-owner", model, googleRequest, prefixLength, scopeKey)[prefixLength];
+    }
+
+    findOwnerMatches({
+        model,
+        googleRequest,
+        scopeKey = null,
+        now = Date.now(),
+        maxPrefixLength,
+        isUsable = () => true,
+    }) {
+        const contents = this._contents(googleRequest);
+        const searchLimit = maxPrefixLength === undefined ? contents.length - 1 : maxPrefixLength;
+        if (!Number.isSafeInteger(searchLimit) || searchLimit < 0 || searchLimit > contents.length)
+            throw new RangeError("maxPrefixLength must identify a complete contents prefix.");
+        if (searchLimit < 1 || this._maxEntries() === 0) return [];
+        const hashes = this._prefixHashes("content-owner", model, googleRequest, searchLimit, scopeKey);
+        const allowed = new Set(
+            [...this.entries.values()]
+                .filter(entry => timestamp(entry.expireTime) > timestamp(now))
+                .sort((left, right) => timestamp(right.lastUsedAt) - timestamp(left.lastUsedAt))
+                .slice(0, this._maxEntries())
+                .map(entry => entry.hash)
+        );
+        return [...this.entries.values()]
+            .filter(
+                entry =>
+                    entry.prefixLength > 0 &&
+                    entry.prefixLength <= searchLimit &&
+                    entry.model === model &&
+                    (entry.scopeKey || null) === (scopeKey || null) &&
+                    entry.contentHash === hashes[entry.prefixLength] &&
+                    allowed.has(entry.hash) &&
+                    isUsable(entry)
+            )
+            .sort((left, right) => right.prefixLength - left.prefixLength)
+            .map(entry => ({ entry: { ...entry }, prefixLength: entry.prefixLength }));
     }
 
     _prune(entries, now = Date.now()) {
@@ -213,7 +258,15 @@ class GeminiCacheStore {
         });
     }
 
-    findLongest({ accountKey, model, googleRequest, now = Date.now(), maxPrefixLength }) {
+    findLongest({
+        accountKey,
+        model,
+        googleRequest,
+        now = Date.now(),
+        maxPrefixLength,
+        scopeKey = null,
+        isUsable = () => true,
+    }) {
         const identity = this._identity(accountKey, model);
         const contents = this._contents(googleRequest);
         const nowMs = timestamp(now);
@@ -236,11 +289,11 @@ class GeminiCacheStore {
         if (valid.length !== this.entries.size) this._scheduleMaintenance();
         const allowed = new Set(valid.map(entry => entry.hash));
 
-        const hashes = this._prefixHashes(identity.accountKey, identity.model, googleRequest, searchLimit);
+        const hashes = this._prefixHashes(identity.accountKey, identity.model, googleRequest, searchLimit, scopeKey);
         for (let prefixLength = searchLimit; prefixLength >= 0; prefixLength--) {
             const hash = hashes[prefixLength];
             const entry = this.entries.get(hash);
-            if (entry && allowed.has(hash)) return { entry: { ...entry }, prefixLength };
+            if (entry && allowed.has(hash) && isUsable(entry)) return { entry: { ...entry }, prefixLength };
         }
         return null;
     }
@@ -253,8 +306,11 @@ class GeminiCacheStore {
         name,
         expireTime,
         tokenCount = null,
+        scopeKey = null,
         retireAncestors = false,
         canRetireAncestor = () => true,
+        conversationKey = null,
+        ownerVersion = null,
     }) {
         const identity = this._identity(accountKey, model);
         const contents = this._contents(googleRequest);
@@ -271,13 +327,15 @@ class GeminiCacheStore {
         if (tokenCount !== null && (!Number.isSafeInteger(tokenCount) || tokenCount < 0)) {
             throw new RangeError("Cache tokenCount must be a nonnegative integer.");
         }
-        const hashes = this._prefixHashes(identity.accountKey, identity.model, googleRequest, prefixLength);
+        const hashes = this._prefixHashes(identity.accountKey, identity.model, googleRequest, prefixLength, scopeKey);
         const hash = hashes[prefixLength];
         return this._enqueue(async () => {
             const now = new Date().toISOString();
             const previous = this.entries.get(hash);
             const entry = {
                 accountKey: identity.accountKey,
+                contentHash: this.contentKey({ googleRequest, model, prefixLength, scopeKey }),
+                conversationKey,
                 createdAt: previous?.createdAt || now,
                 expireTime: new Date(expiryMs).toISOString(),
                 hash,
@@ -285,7 +343,9 @@ class GeminiCacheStore {
                 lastUsedAt: now,
                 model: identity.model,
                 name,
+                ownerVersion,
                 prefixLength,
+                scopeKey,
                 tokenCount,
             };
             const next = new Map(this.entries);
@@ -372,6 +432,16 @@ class GeminiCacheStore {
 
     pendingDeleteEntries() {
         return [...this.pendingDeletes.values()].map(entry => ({ ...entry }));
+    }
+
+    async rememberOrphan({ accountKey, name, expireTime }) {
+        if (!accountKey || !name?.startsWith("cachedContents/") || !Number.isFinite(timestamp(expireTime))) return;
+        return this._enqueue(async () => {
+            const nextPending = new Map(this.pendingDeletes);
+            this._rememberEvicted(nextPending, [{ accountKey, expireTime, name }]);
+            await this._persist(this.entries, nextPending);
+            this.pendingDeletes = nextPending;
+        });
     }
 
     async markDeleted(entry) {

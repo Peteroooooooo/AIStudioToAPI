@@ -347,42 +347,29 @@ test("successful generation schedules countTokens and cachedContents creation, t
 
         assert.deepEqual(
             requests.map(item => item.request.path),
-            [
-                "/v1beta/models/gemini-3.8-flash:countTokens",
-                "/v1beta/cachedContents",
-                "/v1beta/models/gemini-3.8-flash:countTokens",
-                "/v1beta/cachedContents",
-            ]
+            ["/v1beta/models/gemini-3.8-flash:countTokens", "/v1beta/cachedContents"]
         );
-        assert.deepEqual(JSON.parse(requests[0].request.body).generateContentRequest.contents, [
-            { parts: [{ text: "." }], role: "user" },
-        ]);
-        const sharedCacheBody = JSON.parse(requests[1].request.body);
-        assert.equal(Object.hasOwn(sharedCacheBody, "contents"), false);
-        assert.deepEqual(sharedCacheBody.systemInstruction, body.systemInstruction);
-        assert.deepEqual(sharedCacheBody.tools, body.tools);
-        assert.deepEqual(JSON.parse(requests[2].request.body).generateContentRequest.contents, body.contents);
-        assert.deepEqual(JSON.parse(requests[3].request.body).contents, body.contents);
+        assert.deepEqual(JSON.parse(requests[0].request.body).generateContentRequest.contents, body.contents);
+        const cacheBody = JSON.parse(requests[1].request.body);
+        assert.deepEqual(cacheBody.contents, body.contents);
+        assert.deepEqual(cacheBody.systemInstruction, body.systemInstruction);
+        assert.deepEqual(cacheBody.tools, body.tools);
         assert.equal(JSON.parse(requests[1].request.body).ttl, "3600s");
         assert.equal(requests[0].authIndex, 0);
         assert.equal(requests[1].authIndex, 0);
-        assert.equal(requests[2].authIndex, 0);
-        assert.equal(requests[3].authIndex, 0);
-        assert.equal(manager.stats().created, 2);
-        assert.equal(manager.stats().entryCount, 2);
+        assert.equal(manager.stats().created, 1);
+        assert.equal(manager.stats().entryCount, 1);
         await manager.close();
 
         const restarted = new GeminiCacheManager(handler, dataDir);
         try {
             const freshSession = googleRequest(["B1"]);
-            const shared = JSON.parse(restarted.prepare(proxyRequest(freshSession), 0).body);
-            assert.equal(shared.cachedContent, "cachedContents/test-2");
-            assert.deepEqual(shared.contents, freshSession.contents);
-            assert.equal(Object.hasOwn(shared, "systemInstruction"), false);
+            const fresh = proxyRequest(freshSession);
+            assert.equal(restarted.prepare(fresh, 0), fresh);
 
             const next = googleRequest([...body.contents.map(message => message.parts[0].text), "R2", "A3"]);
             const result = JSON.parse(restarted.prepare(proxyRequest(next), 0).body);
-            assert.equal(result.cachedContent, "cachedContents/test-4");
+            assert.equal(result.cachedContent, "cachedContents/test-2");
             assert.deepEqual(result.contents, next.contents.slice(3));
         } finally {
             await restarted.close();
@@ -519,7 +506,7 @@ test("1024-token minimum and 1024-token growth replace only the previous history
                 .filter(item => item.request.method === "DELETE")
                 .map(item => item.request.path)
                 .join(),
-            "/v1beta/cachedContents/test-3"
+            "/v1beta/cachedContents/test-2"
         );
         assert.equal(manager.stats().entryCount, 1);
         assert.deepEqual(manager.store.pendingDeleteEntries(), []);
@@ -684,7 +671,7 @@ test("a queued renewal cannot restore an ancestor retired by a newer checkpoint"
         while (manager.queuedTasks > 0) await manager.background;
         assert.equal(manager.stats().entryCount, 1);
         assert.equal(manager.stats().renewals, 0);
-        assert.equal(requests.filter(item => item.request.method === "PATCH").length, 1);
+        assert.equal(requests.filter(item => item.request.method === "PATCH").length, 0);
     } finally {
         await manager.close();
         fs.rmSync(dataDir, { force: true, recursive: true });
@@ -789,6 +776,277 @@ test("a disconnected owner account keeps the pending deletion until it reconnect
         while (manager.queuedTasks > 0) await manager.background;
         assert.equal(requests.filter(item => item.request.method === "DELETE").length, 1);
         assert.deepEqual(manager.store.pendingDeleteEntries(), []);
+    } finally {
+        await manager.close();
+        fs.rmSync(dataDir, { force: true, recursive: true });
+    }
+});
+
+test("retiring and near-expiry longest caches fall back to a shorter usable prefix", async () => {
+    const dataDir = tempDirectory();
+    const { manager } = fixture(dataDir);
+    try {
+        const body = googleRequest(["A1", "R1", "A2", "R2", "A3"]);
+        await seed(manager, body, 0, 1, "cachedContents/usable-short");
+        const retiring = await seed(manager, body, 0, 3, "cachedContents/retiring-long");
+        manager.retiringCacheUses.add(manager._cacheUseKey(retiring));
+        await manager.store.put({
+            accountKey: manager._accountKey(0),
+            expireTime: new Date(Date.now() + 5_000).toISOString(),
+            googleRequest: body,
+            model: "gemini-3.8-flash",
+            name: "cachedContents/expiring-longest",
+            prefixLength: 4,
+            tokenCount: 200,
+        });
+        const candidates = manager.findOwnerCandidates(proxyRequest(body), [0, 1]);
+        assert.deepEqual(
+            candidates.map(({ authIndex, prefixLength }) => ({ authIndex, prefixLength })),
+            [{ authIndex: 0, prefixLength: 1 }]
+        );
+        const prepared = JSON.parse(manager.prepare(proxyRequest(body), 0).body);
+        assert.equal(prepared.cachedContent, "cachedContents/usable-short");
+        assert.deepEqual(prepared.contents, body.contents.slice(1));
+    } finally {
+        await manager.close();
+        fs.rmSync(dataDir, { force: true, recursive: true });
+    }
+});
+
+test("owner discovery is caller scoped and a shared template cannot establish conversation affinity", async () => {
+    const dataDir = tempDirectory();
+    const { handler, manager } = fixture(dataDir);
+    const body = googleRequest(["private first", "answer", "new question"]);
+    try {
+        await manager.store.put({
+            accountKey: manager._accountKey(1),
+            expireTime: new Date(Date.now() + 3_600_000).toISOString(),
+            googleRequest: body,
+            model: "gemini-3.8-flash",
+            name: "cachedContents/caller-one-history",
+            prefixLength: 2,
+            scopeKey: "caller-one",
+            tokenCount: 200,
+        });
+        await seed(manager, body, 0, 0, "cachedContents/legacy-template");
+        const scoped = { ...proxyRequest(body), cache_scope: "caller-one" };
+        assert.deepEqual(
+            manager.findOwnerCandidates(scoped, [0, 1]).map(item => item.authIndex),
+            [1]
+        );
+        assert.equal(JSON.parse(manager.prepare(scoped, 1).body).cachedContent, "cachedContents/caller-one-history");
+        const otherCaller = { ...proxyRequest(body), cache_scope: "caller-two" };
+        assert.deepEqual(manager.findOwnerCandidates(otherCaller, [0, 1]), []);
+        assert.equal(manager.prepare(otherCaller, 1), otherCaller);
+        const unrelated = proxyRequest(googleRequest(["unrelated", "answer", "question"]));
+        assert.deepEqual(manager.findOwnerCandidates(unrelated, [0, 1]), []);
+        await manager.close();
+        const restarted = new GeminiCacheManager(handler, dataDir);
+        try {
+            assert.deepEqual(
+                restarted.findOwnerCandidates(scoped, [0, 1]).map(item => item.authIndex),
+                [1]
+            );
+            assert.deepEqual(restarted.findOwnerCandidates(otherCaller, [0, 1]), []);
+        } finally {
+            await restarted.close();
+        }
+    } finally {
+        await manager.close();
+        fs.rmSync(dataDir, { force: true, recursive: true });
+    }
+});
+
+test("pending history creation identifies its owner and prevents a second healthy account from copying it", async () => {
+    const dataDir = tempDirectory();
+    const { manager, requests } = fixture(dataDir);
+    let release;
+    manager.background = new Promise(resolve => {
+        release = resolve;
+    });
+    try {
+        const body = googleRequest(["first", "answer"]);
+        const first = manager._requestInfo({ ...proxyRequest(body), cache_scope: "caller" }, 0);
+        manager._scheduleCreate(first);
+        const continued = { ...proxyRequest(googleRequest(["first", "answer", "next"])), cache_scope: "caller" };
+        assert.deepEqual(
+            manager.findOwnerCandidates(continued, [0, 1]).map(({ authIndex, pending }) => ({ authIndex, pending })),
+            [{ authIndex: 0, pending: true }]
+        );
+        manager._scheduleCreate(manager._requestInfo({ ...proxyRequest(body), cache_scope: "caller" }, 1));
+        assert.equal(manager.pendingCreates.size, 1);
+        release();
+        await manager.background;
+        assert.equal(requests.filter(item => item.request.path === "/v1beta/cachedContents").length, 1);
+        assert.ok(requests.every(item => item.authIndex === 0));
+        assert.equal(manager.pendingOwners.size, 0);
+        // Already-created identical content is not duplicated on another account.
+        manager._scheduleCreate(manager._requestInfo({ ...proxyRequest(body), cache_scope: "caller" }, 1));
+        await manager.background;
+        assert.equal(requests.filter(item => item.request.path === "/v1beta/cachedContents").length, 1);
+    } finally {
+        release?.();
+        await manager.close();
+        fs.rmSync(dataDir, { force: true, recursive: true });
+    }
+});
+
+test("migration cancels old queued creation and allows only the new owner to build", async () => {
+    const dataDir = tempDirectory();
+    const { handler, manager, requests } = fixture(dataDir);
+    let owner = 0;
+    handler.accountScheduler = {
+        isAccountAvailable: () => true,
+        isCurrentOwner: (lease, authIndex) => lease?.authIndex === owner && authIndex === owner,
+        waitForMaintenance: async () => true,
+    };
+    let release;
+    manager.background = new Promise(resolve => {
+        release = resolve;
+    });
+    try {
+        const body = googleRequest(["first", "answer"]);
+        const first = { ...proxyRequest(body), account_lease: { authIndex: 0 }, cache_scope: "caller" };
+        manager._scheduleCreate(manager._requestInfo(first, 0));
+        owner = 1;
+        const migrated = { ...proxyRequest(body), account_lease: { authIndex: 1 }, cache_scope: "caller" };
+        manager._scheduleCreate(manager._requestInfo(migrated, 1));
+        const continued = { ...proxyRequest(googleRequest(["first", "answer", "next"])), cache_scope: "caller" };
+        assert.deepEqual(
+            manager.findOwnerCandidates(continued, [0, 1]).map(item => item.authIndex),
+            [1]
+        );
+        release();
+        await manager.background;
+        assert.equal(requests.filter(item => item.request.path === "/v1beta/cachedContents").length, 1);
+        assert.ok(requests.every(item => item.authIndex === 1));
+        assert.equal(manager.pendingOwners.size, 0);
+    } finally {
+        release?.();
+        await manager.close();
+        fs.rmSync(dataDir, { force: true, recursive: true });
+    }
+});
+
+test("the migrated owner may rebuild after A recovers without returning the conversation to A", async () => {
+    const dataDir = tempDirectory();
+    const { handler, manager, requests } = fixture(dataDir);
+    handler.accountScheduler = {
+        isAccountAvailable: () => true,
+        isCurrentOwner: (lease, index) => lease?.key === "conversation" && lease?.version === 2 && index === 1,
+        waitForMaintenance: async () => true,
+    };
+    try {
+        const body = googleRequest(["first", "answer"]);
+        await manager.store.put({
+            accountKey: manager._accountKey(0),
+            conversationKey: "conversation",
+            expireTime: new Date(Date.now() + 3_600_000).toISOString(),
+            googleRequest: body,
+            model: "gemini-3.8-flash",
+            name: "cachedContents/recovered-a",
+            ownerVersion: 1,
+            prefixLength: 2,
+            scopeKey: "caller",
+            tokenCount: 200,
+        });
+        const request = {
+            ...proxyRequest(body),
+            account_lease: { authIndex: 1, key: "conversation", version: 2 },
+            cache_scope: "caller",
+        };
+        manager._scheduleCreate(manager._requestInfo(request, 1));
+        await manager.background;
+        assert.equal(requests.filter(item => item.request.path === "/v1beta/cachedContents").length, 1);
+        assert.ok(requests.every(item => item.authIndex === 1));
+        const next = { ...proxyRequest(googleRequest(["first", "answer", "next"])), cache_scope: "caller" };
+        assert.ok(JSON.parse(manager.prepare(next, 1).body).cachedContent);
+    } finally {
+        await manager.close();
+        fs.rmSync(dataDir, { force: true, recursive: true });
+    }
+});
+
+test("a late cache creation response after migration is queued for deletion, never restored as usable", async () => {
+    const dataDir = tempDirectory();
+    const { handler, manager } = fixture(dataDir);
+    let current = true;
+    handler.accountScheduler = {
+        isAccountAvailable: () => true,
+        isCurrentOwner: () => current,
+        waitForMaintenance: async () => true,
+    };
+    manager._resourceRequest = async (_index, request) => {
+        if (request.path.endsWith(":countTokens")) return { totalTokens: 1000 };
+        current = false;
+        return { expireTime: new Date(Date.now() + 3_600_000).toISOString(), name: "cachedContents/late-old-owner" };
+    };
+    try {
+        const body = googleRequest(["first", "answer"]);
+        const info = manager._requestInfo({ ...proxyRequest(body), account_lease: { authIndex: 0 } }, 0);
+        manager._deleteEvicted = () => {};
+        await manager._create(info, 2);
+        assert.equal(manager.stats().entryCount, 0);
+        assert.deepEqual(
+            manager.store.pendingDeleteEntries().map(item => item.name),
+            ["cachedContents/late-old-owner"]
+        );
+    } finally {
+        await manager.close();
+        fs.rmSync(dataDir, { force: true, recursive: true });
+    }
+});
+
+test("short media URIs use countTokens rather than the JSON byte length", async () => {
+    const dataDir = tempDirectory();
+    const { manager, requests } = fixture(
+        dataDir,
+        { cacheCheckpointTokens: 1024, cacheMinTokens: 1024 },
+        { countTokens: () => 4096 }
+    );
+    try {
+        const body = {
+            contents: [{ parts: [{ fileData: { fileUri: "files/a", mimeType: "video/mp4" } }], role: "user" }],
+        };
+        assert.ok(Buffer.byteLength(JSON.stringify(body)) < 1024);
+        await manager._create(manager._requestInfo(proxyRequest(body), 0), 1);
+        assert.deepEqual(
+            requests.map(item => item.request.path),
+            ["/v1beta/models/gemini-3.8-flash:countTokens", "/v1beta/cachedContents"]
+        );
+        assert.equal(manager.stats().entryCount, 1);
+    } finally {
+        await manager.close();
+        fs.rmSync(dataDir, { force: true, recursive: true });
+    }
+});
+
+test("maintenance yields to generation and unsupported creation backs off without preventing generation", async () => {
+    const dataDir = tempDirectory();
+    const { handler, manager, requests } = fixture(dataDir);
+    let maintenanceAllowed = false;
+    handler.accountScheduler = {
+        isAccountAvailable: () => true,
+        isCurrentOwner: () => true,
+        waitForMaintenance: async () => maintenanceAllowed,
+    };
+    try {
+        const body = googleRequest(["first", "answer"]);
+        const info = manager._requestInfo(proxyRequest(body), 0);
+        manager._scheduleCreate(info);
+        await manager.background;
+        assert.equal(requests.length, 0);
+        maintenanceAllowed = true;
+        manager._resourceRequest = async () => {
+            throw Object.assign(new Error("unsupported"), { status: 400 });
+        };
+        manager._scheduleCreate(info);
+        await manager.background;
+        assert.ok(manager.maintenanceRetryAfter.get(manager._maintenanceKey(info)) > Date.now() + 500_000);
+        manager._scheduleCreate(info);
+        assert.equal(manager.queuedTasks, 0);
+        const generation = proxyRequest(body);
+        assert.equal(manager.prepare(generation, 0), generation);
     } finally {
         await manager.close();
         fs.rmSync(dataDir, { force: true, recursive: true });

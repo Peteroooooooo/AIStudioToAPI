@@ -110,7 +110,6 @@ class ConfigLoader {
             apiKeySource: "Not set",
             browserExecutablePath: null,
             checkUpdate: true,
-            enableAuthUpdate: true,
             enableUsageStats: true,
             failureThreshold: 2,
             fakeStreamTimeoutMs: 300000,
@@ -129,6 +128,7 @@ class ConfigLoader {
             maxRetries: 3,
             proxyBypass: importLegacyEnv ? getProxyBypassFromEnv() : getProxyBypass(),
             proxyUrl: null,
+            rateLimitCooldownSeconds: 18000,
             rateLimitMaxAttempts: 5,
             rateLimitWindowMinutes: 15,
             retryDelay: 2000,
@@ -166,6 +166,13 @@ class ConfigLoader {
         if (legacyEnv.RETRY_DELAY) {
             const parsed = parseInt(legacyEnv.RETRY_DELAY, 10);
             config.retryDelay = Number.isFinite(parsed) ? Math.max(50, parsed) : config.retryDelay;
+        }
+        if (legacyEnv.RATE_LIMIT_COOLDOWN_SECONDS) {
+            const parsed = Number(legacyEnv.RATE_LIMIT_COOLDOWN_SECONDS);
+            if (!Number.isInteger(parsed) || parsed < 1 || parsed > 604800) {
+                throw new Error("RATE_LIMIT_COOLDOWN_SECONDS must be an integer from 1 to 604800.");
+            }
+            config.rateLimitCooldownSeconds = parsed;
         }
         if (legacyEnv.STREAM_TIMEOUT_MS) {
             const parsed = parseInt(legacyEnv.STREAM_TIMEOUT_MS, 10);
@@ -219,8 +226,6 @@ class ConfigLoader {
                 );
             }
         }
-        if (legacyEnv.ENABLE_AUTH_UPDATE)
-            config.enableAuthUpdate = legacyEnv.ENABLE_AUTH_UPDATE.toLowerCase() !== "false";
         if (legacyEnv.ENABLE_USAGE_STATS)
             config.enableUsageStats = legacyEnv.ENABLE_USAGE_STATS.toLowerCase() !== "false";
 
@@ -348,7 +353,7 @@ class ConfigLoader {
         this.logger.info(`  Force URL Context: ${config.forceUrlContext}`);
         this.logger.info(`  Check Update: ${config.checkUpdate}`);
         this.logger.info(`  Default Safety Threshold: ${config.safetySettingsThreshold}`);
-        this.logger.info(`  Auto Update Auth: ${config.enableAuthUpdate}`);
+        this.logger.info("  Auto Save Auth: Enabled");
         this.logger.info(`  Usage Stats: ${config.enableUsageStats}`);
         this.logger.info(`  Max Contexts: ${config.maxContexts === 0 ? "Unlimited" : config.maxContexts}`);
         this.logger.info(
@@ -367,6 +372,7 @@ class ConfigLoader {
             }`
         );
         this.logger.info(`  Max Retries per Request: ${config.maxRetries} times`);
+        this.logger.info(`  HTTP 429 Cooldown: ${config.rateLimitCooldownSeconds}s`);
         this.logger.info(`  Retry Delay: ${config.retryDelay}ms`);
         this.logger.info(`  API Key Source: ${config.apiKeySource}`);
 

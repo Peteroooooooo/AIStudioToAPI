@@ -57,6 +57,9 @@ class BrowserManager {
         this.abortedContexts = new Set(); // Indices that should be aborted during background init
         this._backgroundPreloadTask = null; // Current background preload task promise (only one at a time)
         this._backgroundPreloadAbort = false; // Flag to signal background task to abort
+        this._accountReadyTasks = new Map();
+        this._poolReadyTask = null;
+        this._rebalanceTask = null;
 
         // Legacy single context references (for backward compatibility)
         this.context = null;
@@ -74,6 +77,8 @@ class BrowserManager {
         this.connectionRegistry = null;
         this._onAuthQueuesDrained = null;
         this._isSystemBusyProvider = null;
+        this._accountLoadProvider = null;
+        this._accountChangeNotifier = null;
         this.pendingContextClosures = new Map();
         this._closingPendingContexts = new Map();
         this._authUpdateSuspended = new Set();
@@ -211,6 +216,121 @@ class BrowserManager {
 
     setSystemBusyProvider(provider) {
         this._isSystemBusyProvider = typeof provider === "function" ? provider : null;
+    }
+
+    setAccountLoadProvider(provider) {
+        this._accountLoadProvider = typeof provider === "function" ? provider : null;
+    }
+
+    setAccountChangeNotifier(notifier) {
+        this._accountChangeNotifier = typeof notifier === "function" ? notifier : null;
+    }
+
+    notifyAccountIdle(authIndex) {
+        this._closePendingContextIfIdle(authIndex).catch(error => {
+            this.logger.warn(`[ContextPool] Deferred close for #${authIndex} failed: ${error.message}`);
+        });
+    }
+
+    isAccountReady(authIndex) {
+        const entry = this.contexts.get(authIndex);
+        return Boolean(
+            entry?.page &&
+            !entry.page.isClosed() &&
+            this.authSource.health.isAvailable(authIndex) &&
+            !this.authSource.isExpired(authIndex) &&
+            !this.authSource.pendingRefreshIndices?.has(authIndex) &&
+            !this.pendingContextClosures.has(authIndex) &&
+            !this.initializingContexts.has(authIndex) &&
+            this.connectionRegistry?.isAccountConnected(authIndex)
+        );
+    }
+
+    getReadyAccountIndices() {
+        const eligible = this.authSource.getRotationIndices();
+        const ready = eligible.filter(index => this.isAccountReady(index));
+        return this.config.maxContexts > 0 ? ready.slice(0, this.config.maxContexts) : ready;
+    }
+
+    _getServingPoolOccupancy() {
+        const eligible = new Set(this.authSource.getRotationIndices());
+        return [...new Set([...this.contexts.keys(), ...this.initializingContexts])].filter(
+            index => eligible.has(index) && !this.pendingContextClosures.has(index)
+        ).length;
+    }
+
+    async ensureAccountReady(authIndex) {
+        if (this.isAccountReady(authIndex)) return true;
+        if (!this.authSource.getRotationIndices().includes(authIndex)) return false;
+        if (this._accountReadyTasks.has(authIndex)) return this._accountReadyTasks.get(authIndex);
+        const task = this._ensureAccountReady(authIndex);
+        this._accountReadyTasks.set(authIndex, task);
+        try {
+            return await task;
+        } finally {
+            if (this._accountReadyTasks.get(authIndex) === task) this._accountReadyTasks.delete(authIndex);
+        }
+    }
+
+    async _ensureAccountReady(authIndex) {
+        if (this.initializingContexts.has(authIndex)) await this._waitForContextInit(authIndex);
+        if (this.isAccountReady(authIndex)) return true;
+        if (this.authSource.pendingRefreshIndices?.has(authIndex)) return false;
+        if (this.contexts.has(authIndex)) {
+            if (this._hasActiveQueueForAuth(authIndex)) return false;
+            if (
+                this.connectionRegistry?.isInGracePeriod(authIndex) ||
+                this.connectionRegistry?.isReconnectingInProgress(authIndex)
+            )
+                return false;
+            if (!this.contexts.get(authIndex).page?.isClosed()) {
+                if (await this.attemptLightweightReconnect(authIndex)) return this.isAccountReady(authIndex);
+                return false;
+            }
+            await this.closeContext(authIndex);
+        }
+        if (this.config.maxContexts > 0 && this._getServingPoolOccupancy() >= this.config.maxContexts) return false;
+        this.initializingContexts.add(authIndex);
+        try {
+            await this._ensureBrowser();
+            await this._initializeContext(authIndex, true);
+            if (this._currentAuthIndex < 0) {
+                const entry = this.contexts.get(authIndex);
+                if (entry) this._activateContext(entry.context, entry.page, authIndex);
+            }
+        } finally {
+            this.initializingContexts.delete(authIndex);
+        }
+        return this.isAccountReady(authIndex);
+    }
+
+    async ensureAccountPoolReady() {
+        // Existing ready accounts are never held behind another account's launch.
+        if (this.getReadyAccountIndices().length > 0) {
+            this.rebalanceContextPool().catch(error => this.logger.warn(`[ContextPool] ${error.message}`));
+            return this.getReadyAccountIndices();
+        }
+        if (this._poolReadyTask) return this._poolReadyTask;
+        const task = (async () => {
+            await this.rebalanceContextPool();
+            const poolCap = this.config.maxContexts || Infinity;
+            for (const index of this.authSource.getRotationIndices()) {
+                if (this._getServingPoolOccupancy() >= poolCap && !this.contexts.has(index)) break;
+                try {
+                    if (await this.ensureAccountReady(index)) break;
+                } catch (error) {
+                    this.logger.warn(`[ContextPool] Account #${index} not ready: ${error.message}`);
+                }
+            }
+            this.rebalanceContextPool().catch(error => this.logger.warn(`[ContextPool] ${error.message}`));
+            return this.getReadyAccountIndices();
+        })();
+        this._poolReadyTask = task;
+        try {
+            return await task;
+        } finally {
+            if (this._poolReadyTask === task) this._poolReadyTask = null;
+        }
     }
 
     async fetchNativeModelCatalog() {
@@ -539,11 +659,6 @@ class BrowserManager {
         const contextData = this.contexts.get(authIndex);
         if (!contextData || !contextData.context) return;
 
-        // Check availability of auto-update feature from config
-        if (!this.config.enableAuthUpdate) {
-            return;
-        }
-
         try {
             const configDir = path.join(process.cwd(), "configs", "auth");
             const authFilePath = path.join(configDir, `auth-${authIndex}.json`);
@@ -645,11 +760,10 @@ class BrowserManager {
      * Interface: Notify user activity
      * Used to force wake up the Launch detection when a request comes in
      */
-    notifyUserActivity() {
-        if (this.noButtonCount > 0) {
-            this.logger.info("[Browser] ⚡ User activity detected, forcing Launch detection wakeup...");
-            this.noButtonCount = 0;
-        }
+    notifyUserActivity(authIndex = this._currentAuthIndex) {
+        const entry = this.contexts.get(authIndex);
+        if (entry) entry.noButtonCount = 0;
+        this.noButtonCount = 0;
     }
 
     /**
@@ -909,8 +1023,8 @@ class BrowserManager {
         this.page = pg;
         this._currentAuthIndex = authIndex;
         this.noButtonCount = 0;
-        this._startHealthMonitor();
-        this._startBackgroundWakeup();
+        this._startHealthMonitor(authIndex);
+        this._startBackgroundWakeup(authIndex);
         this._sendActiveTrigger("[Browser]", pg);
     }
 
@@ -1077,12 +1191,15 @@ class BrowserManager {
     }
 
     async _confirmLoginRequired(page, logPrefix) {
+        const owner = [...(this.contexts?.entries() || [])].find(([, entry]) => entry.page === page)?.[0];
+        if (owner !== undefined && this._hasActiveQueueForAuth(owner)) return false;
         await page.waitForTimeout(LOGIN_CONFIRM_WAIT_MS);
         let identity = await this._readPageIdentity(page, logPrefix);
         if (!this._isLoginPage(identity.currentUrl, identity.pageTitle)) return false;
 
         // A single redirect can be part of a normal sign-in handshake. Retry the app once
         // before persisting an Expired flag; a network failure is not proof of expired auth.
+        if (owner !== undefined && this._hasActiveQueueForAuth(owner)) return false;
         await page.goto(this.targetUrl, { timeout: 45000, waitUntil: "domcontentloaded" });
         await page.waitForTimeout(LOGIN_CONFIRM_WAIT_MS);
         identity = await this._readPageIdentity(page, logPrefix);
@@ -1388,6 +1505,7 @@ class BrowserManager {
         // must never save its stale state over the new credentials.
         this._authUpdateSuspended.add(authIndex);
         this.authSource.setPendingRefresh(authIndex, true);
+        this._accountChangeNotifier?.(authIndex);
         if (this._hasActiveQueueForAuth(authIndex)) {
             this.pendingContextClosures.set(authIndex, "reauth");
             return { deferred: true };
@@ -1422,8 +1540,7 @@ class BrowserManager {
      * Periodically cleans up popups and keeps the session alive.
      * In multi-context mode, stores the interval in the context data.
      */
-    _startHealthMonitor() {
-        const authIndex = this._currentAuthIndex;
+    _startHealthMonitor(authIndex = this._currentAuthIndex) {
         if (authIndex < 0) {
             this.logger.warn("[Browser] Cannot start health monitor: no active auth index");
             return;
@@ -1436,10 +1553,7 @@ class BrowserManager {
             return;
         }
 
-        // Clear existing interval if any
-        if (contextData.healthMonitorInterval) {
-            clearInterval(contextData.healthMonitorInterval);
-        }
+        if (contextData.healthMonitorInterval) return;
 
         this.logger.info(`[Context#${authIndex}] 🛡️ Background health monitor service (Scavenger) started...`);
 
@@ -1448,10 +1562,9 @@ class BrowserManager {
         // Run every 4 seconds
         contextData.healthMonitorInterval = setInterval(async () => {
             try {
-                // Check if this is still the current active account
-                // This prevents background contexts from running healthMonitor unnecessarily
-                if (this._currentAuthIndex !== authIndex) {
-                    // Silently skip - this context is not active
+                if (this.contexts.get(authIndex) !== contextData) {
+                    clearInterval(contextData.healthMonitorInterval);
+                    contextData.healthMonitorInterval = null;
                     return;
                 }
 
@@ -1465,6 +1578,10 @@ class BrowserManager {
                     }
                     return;
                 }
+
+                // Buttons such as Reload/Continue can navigate the app. Leave pages
+                // serving generation or cache maintenance untouched until they drain.
+                if (this._hasActiveQueueForAuth(authIndex)) return;
 
                 tickCount++;
 
@@ -1509,6 +1626,7 @@ class BrowserManager {
                     }
 
                     // 4. Popup & Overlay Cleanup
+                    if (this._hasActiveQueueForAuth(authIndex)) return;
                     await page.evaluate(() => {
                         const blockers = [
                             "div.cdk-overlay-backdrop",
@@ -1614,14 +1732,11 @@ class BrowserManager {
      * This service is bound to this.page (instance-level), not individual contexts.
      * Only one instance should run at a time, tracking the current active page.
      */
-    async _startBackgroundWakeup() {
-        // Prevent multiple instances from running simultaneously
-        if (this.backgroundWakeupRunning) {
-            this.logger.info("[Browser] BackgroundWakeup already running, skipping duplicate start.");
-            return;
-        }
-
-        this.logger.debug("[Browser] Starting BackgroundWakeup initialization...");
+    async _startBackgroundWakeup(authIndex = this._currentAuthIndex) {
+        const contextData = this.contexts.get(authIndex);
+        if (!contextData || contextData.wakeupRunning) return;
+        contextData.wakeupRunning = true;
+        contextData.noButtonCount = 0;
         this.backgroundWakeupRunning = true;
 
         // Initial buffer - wait before starting the main loop to let page stabilize
@@ -1629,25 +1744,30 @@ class BrowserManager {
 
         // Verify page is still valid after the initial delay
         try {
-            if (!this.page || this.page.isClosed()) {
-                this.backgroundWakeupRunning = false;
+            if (this.contexts.get(authIndex) !== contextData || !contextData.page || contextData.page.isClosed()) {
+                contextData.wakeupRunning = false;
+                this.backgroundWakeupRunning = [...this.contexts.values()].some(entry => entry.wakeupRunning);
                 this.logger.info(
                     "[Browser] BackgroundWakeup stopped: page became null or closed during startup delay."
                 );
                 return;
             }
         } catch (error) {
-            this.backgroundWakeupRunning = false;
+            contextData.wakeupRunning = false;
+            this.backgroundWakeupRunning = [...this.contexts.values()].some(entry => entry.wakeupRunning);
             this.logger.warn(`[Browser] BackgroundWakeup stopped: error checking page status: ${error.message}`);
             return;
         }
 
         this.logger.info("[Browser] 🛡️ Background Wakeup Service (Rocket Handler) started...");
 
-        // Main loop: directly use this.page, automatically follows context switches
-        while (this.page && !this.page.isClosed()) {
+        while (this.contexts.get(authIndex) === contextData && contextData.page && !contextData.page.isClosed()) {
             try {
-                const currentPage = this.page; // Capture for this iteration
+                const currentPage = contextData.page;
+                if (this._hasActiveQueueForAuth(authIndex)) {
+                    await new Promise(r => setTimeout(r, 1000));
+                    continue;
+                }
 
                 // 1. Force page wake-up
                 await currentPage.bringToFront().catch(() => {});
@@ -1727,7 +1847,7 @@ class BrowserManager {
                 });
 
                 // 3. Execute Click if found
-                if (targetInfo.found) {
+                if (targetInfo.found && !this._hasActiveQueueForAuth(authIndex)) {
                     this.logger.info(`[Browser] 🎯 Found Rocket/Launch button [${targetInfo.tagName}], engaging...`);
 
                     // Physical Click
@@ -1752,7 +1872,7 @@ class BrowserManager {
                         });
                     });
 
-                    if (isStillThere) {
+                    if (isStillThere && !this._hasActiveQueueForAuth(authIndex)) {
                         this.logger.warn(`[Browser] ⚠️ Physical click ineffective, attempting JS force click...`);
                         await currentPage.evaluate(() => {
                             const candidates = Array.from(
@@ -1772,7 +1892,7 @@ class BrowserManager {
                         this.logger.info(`[Browser] ✅ Click successful, button disappeared.`);
                         // Long sleep on success, but check for context switches every second
                         for (let i = 0; i < 60; i++) {
-                            if (this.noButtonCount === 0) {
+                            if (contextData.noButtonCount === 0 || this.contexts.get(authIndex) !== contextData) {
                                 this.logger.info(`[Browser] ⚡ Woken up early due to user activity or context switch.`);
                                 break; // Wake up early if user activity detected
                             }
@@ -1780,12 +1900,12 @@ class BrowserManager {
                         }
                     }
                 } else {
-                    this.noButtonCount++;
+                    contextData.noButtonCount++;
                     // Smart Sleep
-                    if (this.noButtonCount > 20) {
+                    if (contextData.noButtonCount > 20) {
                         // Long sleep, but check for user activity
                         for (let i = 0; i < 30; i++) {
-                            if (this.noButtonCount === 0) break; // Woken up by request
+                            if (contextData.noButtonCount === 0 || this.contexts.get(authIndex) !== contextData) break;
                             await new Promise(r => setTimeout(r, 1000));
                         }
                     } else {
@@ -1799,12 +1919,13 @@ class BrowserManager {
         }
 
         // Reset flag when loop exits
-        this.backgroundWakeupRunning = false;
+        contextData.wakeupRunning = false;
+        this.backgroundWakeupRunning = [...this.contexts.values()].some(entry => entry.wakeupRunning);
 
         // Log the reason for stopping
-        if (!this.page) {
+        if (!contextData.page) {
             this.logger.info("[Browser] Background Wakeup Service stopped: this.page is null.");
-        } else if (this.page.isClosed()) {
+        } else if (contextData.page.isClosed()) {
             this.logger.info("[Browser] Background Wakeup Service stopped: this.page was closed.");
         } else {
             this.logger.info("[Browser] Background Wakeup Service stopped: unknown reason.");
@@ -2066,8 +2187,9 @@ class BrowserManager {
      * @param {number} maxPoolSize - Stop when this.contexts.size reaches this limit (0 = no limit)
      */
     async _preloadBackgroundContexts(indices, maxPoolSize = 0) {
-        // If there's an existing background task, abort it and wait for it to finish
-        await this.abortBackgroundPreload();
+        // Dispatching through another healthy account must not keep cancelling a
+        // slow pool member's initialization.
+        if (this._backgroundPreloadTask) return;
 
         // Reset abort flag and create new background task
         this._backgroundPreloadAbort = false;
@@ -2089,10 +2211,10 @@ class BrowserManager {
     }
 
     _hasActiveQueueForAuth(authIndex) {
-        if (this.connectionRegistry?.hasMessageQueueForAuth) {
-            return this.connectionRegistry.hasMessageQueueForAuth(authIndex);
-        }
-        return false;
+        return Boolean(
+            this.connectionRegistry?.hasMessageQueueForAuth?.(authIndex) ||
+            this._accountLoadProvider?.(authIndex)?.inFlight > 0
+        );
     }
 
     _cancelPendingContextClosure(authIndex, reason = "closure_cancelled") {
@@ -2154,7 +2276,11 @@ class BrowserManager {
         if (!this.pendingContextClosures.has(authIndex)) {
             return false;
         }
-        if (authIndex === this._currentAuthIndex && this.pendingContextClosures.get(authIndex) !== "reauth") {
+        if (
+            authIndex === this._currentAuthIndex &&
+            this.pendingContextClosures.get(authIndex) !== "reauth" &&
+            this.authSource.getRotationIndices().includes(authIndex)
+        ) {
             this.logger.debug(
                 `[ContextPool] Skipping pending close for context #${authIndex} because it is active again as current.`
             );
@@ -2271,7 +2397,7 @@ class BrowserManager {
             }
 
             // Check pool size limit
-            if (maxPoolSize > 0 && this.contexts.size >= maxPoolSize) {
+            if (maxPoolSize > 0 && this._getServingPoolOccupancy() >= maxPoolSize) {
                 this.logger.info(`[ContextPool] Pool size limit reached, stopping preload`);
                 break;
             }
@@ -2490,29 +2616,37 @@ class BrowserManager {
      * Removes excess contexts and starts missing ones in background
      */
     async rebalanceContextPool() {
+        if (this._rebalanceTask) return this._rebalanceTask;
+        const task = this._rebalanceContextPool();
+        this._rebalanceTask = task;
+        try {
+            return await task;
+        } finally {
+            if (this._rebalanceTask === task) this._rebalanceTask = null;
+        }
+    }
+
+    async _rebalanceContextPool() {
         const maxContexts = this.config.maxContexts;
         // maxContexts === 0 means unlimited pool size
         const isUnlimited = maxContexts === 0;
 
-        // Build full rotation ordered from current account
+        // Keep healthy resident accounts stable. currentAuthIndex is a compatibility
+        // pointer, not the pool's dispatch policy.
         const rotation = this.authSource.getRotationIndices();
         const currentCanonical =
             this._currentAuthIndex >= 0 ? this.authSource.getCanonicalIndex(this._currentAuthIndex) : null;
-        const startPos = currentCanonical !== null ? Math.max(rotation.indexOf(currentCanonical), 0) : 0;
-        const ordered = [];
-        for (let i = 0; i < rotation.length; i++) {
-            ordered.push(rotation[(startPos + i) % rotation.length]);
-        }
+        const ordered = [
+            ...rotation.filter(index => this.contexts.has(index)),
+            ...rotation.filter(index => !this.contexts.has(index)),
+        ];
 
         // Targets = first maxContexts from ordered (or all available if unlimited)
         // In unlimited mode, include all valid accounts (rotation + duplicates), excluding expired
         let targets;
         if (isUnlimited) {
             // Filter out expired accounts from availableIndices
-            const nonExpiredAvailable = this.authSource.availableIndices.filter(
-                idx => !this.authSource.isExpired(idx) && this.authSource.health.isAvailable(idx)
-            );
-            targets = new Set(nonExpiredAvailable);
+            targets = new Set(rotation);
         } else {
             targets = new Set(ordered.slice(0, maxContexts));
         }
@@ -2532,8 +2666,8 @@ class BrowserManager {
             currentCanonicalIndex !== this._currentAuthIndex;
 
         for (const idx of this.contexts.keys()) {
-            // Skip current account
-            if (idx === this._currentAuthIndex) continue;
+            // The compatibility pointer must not retain an unhealthy account.
+            if (idx === this._currentAuthIndex && targets.has(idx)) continue;
 
             // If current is a duplicate AND we're in limited mode, remove the canonical version (we're using the old one)
             if (!isUnlimited && isDuplicateAccount && idx === currentCanonicalIndex) {
@@ -2577,9 +2711,17 @@ class BrowserManager {
         }
 
         // Preload candidates if ready and initializing contexts still leave room in the pool
-        const poolOccupancy = this.contexts.size + this.initializingContexts.size;
+        const poolOccupancy = this._getServingPoolOccupancy();
         if (!this._expiredRecheckContext && candidates.length > 0 && (isUnlimited || poolOccupancy < maxContexts)) {
             this._preloadBackgroundContexts(candidates, isUnlimited ? 0 : maxContexts);
+        }
+
+        for (const index of targets) {
+            if (this.contexts.has(index) && !this.isAccountReady(index)) {
+                this.ensureAccountReady(index).catch(error => {
+                    this.logger.warn(`[ContextPool] Account #${index} recovery failed: ${error.message}`);
+                });
+            }
         }
     }
 
@@ -2765,6 +2907,8 @@ class BrowserManager {
                     healthMonitorInterval: null,
                     page,
                 });
+                this._startHealthMonitor(authIndex);
+                this._startBackgroundWakeup(authIndex);
             } else {
                 this._throwIfContextInitAborted(authIndex, isBackgroundTask);
             }
@@ -2886,15 +3030,6 @@ class BrowserManager {
                     }
 
                     // Page is alive and auth is valid, proceed with fast switch
-                    // Stop background tasks for old context
-                    if (this._currentAuthIndex >= 0 && this.contexts.has(this._currentAuthIndex)) {
-                        const oldContextData = this.contexts.get(this._currentAuthIndex);
-                        if (oldContextData.healthMonitorInterval) {
-                            clearInterval(oldContextData.healthMonitorInterval);
-                            oldContextData.healthMonitorInterval = null;
-                        }
-                    }
-
                     // Switch to new context
                     this._activateContext(contextData.context, contextData.page, authIndex);
                     await this._flushPendingContextClosures();
@@ -2939,15 +3074,6 @@ class BrowserManager {
         this.initializingContexts.add(authIndex);
 
         try {
-            // Stop background tasks for old context
-            if (this._currentAuthIndex >= 0 && this.contexts.has(this._currentAuthIndex)) {
-                const oldContextData = this.contexts.get(this._currentAuthIndex);
-                if (oldContextData.healthMonitorInterval) {
-                    clearInterval(oldContextData.healthMonitorInterval);
-                    oldContextData.healthMonitorInterval = null;
-                }
-            }
-
             // Initialize new context (isBackgroundTask=false for foreground initialization)
             const { context, page } = await this._initializeContext(authIndex, false);
 
@@ -3023,6 +3149,11 @@ class BrowserManager {
             return false;
         }
 
+        if (this._hasActiveQueueForAuth(targetAuthIndex)) {
+            this.logger.info(`[Reconnect] Deferring account #${targetAuthIndex} reload until its requests drain.`);
+            return false;
+        }
+
         const page = contextData.page;
 
         // Verify browser and page are still valid
@@ -3045,15 +3176,10 @@ class BrowserManager {
         this.logger.info(`🔄 [Reconnect] Starting lightweight reconnect for account #${targetAuthIndex}...`);
         this.logger.info("==================================================");
 
-        // Stop existing background tasks only if this is the current account
-        const isCurrentAccount = targetAuthIndex === this._currentAuthIndex;
-        if (isCurrentAccount) {
-            const ctxData = this.contexts.get(targetAuthIndex);
-            if (ctxData && ctxData.healthMonitorInterval) {
-                clearInterval(ctxData.healthMonitorInterval);
-                ctxData.healthMonitorInterval = null;
-                this.logger.info("[Reconnect] Stopped background health monitor.");
-            }
+        // Only this account's services pause during its navigation.
+        if (contextData.healthMonitorInterval) {
+            clearInterval(contextData.healthMonitorInterval);
+            contextData.healthMonitorInterval = null;
         }
 
         try {
@@ -3097,13 +3223,9 @@ class BrowserManager {
             this.logger.info(`✅ [Reconnect] Lightweight reconnect successful for account #${targetAuthIndex}!`);
             this.logger.info("==================================================");
 
-            // Restart background tasks only if this is the current account
-            if (isCurrentAccount) {
-                // Reset BackgroundWakeup state after reconnect
-                this.noButtonCount = 0;
-                this._startHealthMonitor();
-                this._startBackgroundWakeup(); // Internal check prevents duplicate instances
-            }
+            this.notifyUserActivity(targetAuthIndex);
+            this._startHealthMonitor(targetAuthIndex);
+            this._startBackgroundWakeup(targetAuthIndex);
 
             return true;
         } catch (error) {

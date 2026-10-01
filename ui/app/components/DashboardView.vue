@@ -29,8 +29,8 @@
                 <strong>{{ browserLabel }}</strong>
             </div>
             <div class="dashboard-status-detail">
-                <span>{{ t("consoleCurrentAccount") }}</span>
-                <strong>{{ currentAccountLabel }}</strong>
+                <span>{{ t("consoleServingAccounts") }}</span>
+                <strong>{{ servingAccounts }}</strong>
             </div>
             <div class="dashboard-status-detail">
                 <span>{{ t("consoleVersion") }}</span>
@@ -52,7 +52,7 @@
             <article class="dashboard-metric">
                 <span>{{ t("consoleContextPool") }}</span>
                 <strong
-                    >{{ status.activeContextsCount || 0 }} <em>/ {{ contextLimit }}</em></strong
+                    >{{ servingAccounts }} <em>/ {{ contextLimit }}</em></strong
                 >
                 <small>{{ t("consoleWarmedContexts") }}</small>
             </article>
@@ -79,23 +79,20 @@
                         <span class="context-avatar">{{ account.index }}</span>
                         <div class="context-identity">
                             <strong>{{ accountLabel(account) }}</strong>
-                            <small v-if="account.index === status.currentAuthIndex">{{
-                                t("consoleCurrentAccount")
-                            }}</small>
-                            <small v-else>{{ healthLabel(account) }}</small>
+                            <small>{{ healthLabel(account) }}</small>
                         </div>
-                        <span class="context-badge" :class="account.hasContext ? 'is-ready' : 'is-idle'">
-                            {{ account.hasContext ? t("consoleWarmed") : t("consoleNotWarmed") }}
+                        <span class="context-badge" :class="canServe(account) ? 'is-ready' : 'is-idle'">
+                            {{ canServe(account) ? t("consoleWarmed") : t("consoleNotWarmed") }}
                         </span>
                     </div>
                 </div>
                 <p v-else class="dashboard-empty">{{ t("consoleNoAccounts") }}</p>
                 <div class="dashboard-panel-foot">
                     <span
-                        >{{ t("consoleRotationCount") }} <strong>{{ status.usageCount ?? "–" }}</strong></span
+                        >{{ t("consoleInFlight") }} <strong>{{ status.accountPool?.inFlight ?? "–" }}</strong></span
                     >
                     <span
-                        >{{ t("consoleFailureCount") }} <strong>{{ status.failureCount ?? "–" }}</strong></span
+                        >{{ t("consoleQueued") }} <strong>{{ status.accountPool?.waiting ?? "–" }}</strong></span
                     >
                     <button type="button" @click="emit('navigate', 'settings')">{{ t("consoleGoSettings") }}</button>
                 </div>
@@ -151,6 +148,16 @@ const refreshing = ref(false);
 let pollTimer = null;
 
 const accounts = computed(() => props.status.accountDetails || []);
+const canServe = account =>
+    account.serving ??
+    (account.isRotation &&
+        !account.isInvalid &&
+        !account.isExpired &&
+        !account.isDuplicate &&
+        account.health?.mode === "active" &&
+        account.hasContext &&
+        (account.isConnected ?? true));
+const servingAccounts = computed(() => accounts.value.filter(canServe).length);
 const readyAccounts = computed(
     () =>
         accounts.value.filter(
@@ -182,13 +189,10 @@ const serviceLabel = computed(() =>
           : props.t("consoleRunning")
 );
 const browserLabel = computed(() =>
-    props.status.browserConnected ? props.t("consoleConnected") : props.t("consoleDisconnected")
+    props.status.browserConnected || servingAccounts.value > 0
+        ? props.t("consoleConnected")
+        : props.t("consoleDisconnected")
 );
-const currentAccountLabel = computed(() => {
-    const current = accounts.value.find(account => account.index === props.status.currentAuthIndex);
-    return current ? accountLabel(current) : props.t("consoleNoCurrentAccount");
-});
-
 const formatCount = value =>
     Number.isFinite(value) ? new Intl.NumberFormat(document.documentElement.lang || "en").format(value) : "–";
 const formatTime = value => {
@@ -199,6 +203,7 @@ const shortId = value => (typeof value === "string" && value.length > 13 ? `${va
 const attemptedAccounts = failure => {
     const indices = (failure.attempts || []).map(attempt => attempt.authIndex).filter(index => Number.isInteger(index));
     if (indices.length) return [...new Set(indices)].map(index => `#${index}`).join(" → ");
+    if (Array.isArray(failure.attempts) && !failure.attempts.length) return props.t("consoleNoUpstreamAttempt");
     return Number.isInteger(failure.finalAuthIndex) ? `#${failure.finalAuthIndex}` : "–";
 };
 const accountLabel = account => {
@@ -212,6 +217,9 @@ const healthLabel = account => {
     if (account.isInvalid) return props.t("consoleInvalidAccount");
     if (account.isExpired) return props.t("consoleExpiredAccount");
     if (account.isDuplicate) return props.t("consoleDuplicateAccount");
+    if (account.health?.probeRequired) {
+        return props.t(account.health.probeInFlight ? "consoleProbing" : "consoleProbeRequired");
+    }
     switch (account.health?.mode) {
         case "cooldown":
             return props.t("consoleCooldown");
@@ -265,7 +273,9 @@ onBeforeUnmount(() => {
     color: var(--text-primary);
     display: grid;
     gap: 18px;
+    grid-template-columns: minmax(0, 1fr);
     min-width: 0;
+    width: 100%;
 }
 .dashboard-heading,
 .dashboard-panel-header,
@@ -276,7 +286,14 @@ onBeforeUnmount(() => {
     justify-content: space-between;
 }
 .dashboard-heading {
+    flex-wrap: wrap;
     gap: 16px;
+}
+.dashboard-heading > div {
+    min-width: 0;
+}
+.dashboard-heading > div:first-child {
+    flex: 1 1 320px;
 }
 .dashboard-heading h1 {
     font-size: clamp(1.45rem, 2vw, 1.85rem);
@@ -297,12 +314,13 @@ onBeforeUnmount(() => {
 .dashboard-heading-actions {
     align-items: center;
     display: flex;
+    flex-wrap: wrap;
     gap: 12px;
 }
 .dashboard-updated {
     color: var(--text-secondary);
     font-size: 0.8rem;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
 }
 .dashboard-refresh,
 .dashboard-text-action,
@@ -326,22 +344,26 @@ onBeforeUnmount(() => {
     opacity: 0.6;
 }
 .dashboard-status-band {
+    align-items: start;
     background: var(--bg-card);
     border: 1px solid var(--border-light);
     border-radius: 16px;
+    display: grid;
     gap: 12px;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     padding: 18px 22px;
 }
 .dashboard-status-main {
     align-items: center;
     display: flex;
     gap: 12px;
-    min-width: 165px;
+    min-width: 0;
 }
 .dashboard-status-main div,
 .dashboard-status-detail {
     display: grid;
     gap: 3px;
+    min-width: 0;
 }
 .dashboard-status-label,
 .dashboard-status-detail span {
@@ -357,6 +379,7 @@ onBeforeUnmount(() => {
 }
 .dashboard-status-dot {
     border-radius: 50%;
+    flex-shrink: 0;
     height: 10px;
     width: 10px;
 }
@@ -422,8 +445,13 @@ onBeforeUnmount(() => {
     padding: 19px;
 }
 .dashboard-panel-header {
+    flex-wrap: wrap;
     gap: 12px;
     margin-bottom: 12px;
+}
+.dashboard-panel-header > div {
+    flex: 1 1 220px;
+    min-width: 0;
 }
 .dashboard-panel-header h2 {
     font-size: 1rem;
@@ -559,7 +587,7 @@ onBeforeUnmount(() => {
 .dashboard-error {
     color: var(--color-error);
 }
-@media (max-width: 1100px) {
+@container console-content (max-width: 900px) {
     .dashboard-status-band {
         align-items: stretch;
         display: grid;
@@ -569,10 +597,13 @@ onBeforeUnmount(() => {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 }
-@media (max-width: 760px) {
+@container console-content (max-width: 760px) {
     .dashboard-heading {
         align-items: flex-start;
         flex-direction: column;
+    }
+    .dashboard-heading > div:first-child {
+        flex-basis: auto;
     }
     .dashboard-columns {
         grid-template-columns: 1fr;
@@ -582,7 +613,7 @@ onBeforeUnmount(() => {
         width: 100%;
     }
 }
-@media (max-width: 480px) {
+@container console-content (max-width: 440px) {
     .console-dashboard {
         gap: 12px;
     }
@@ -602,8 +633,11 @@ onBeforeUnmount(() => {
     .dashboard-panel-header {
         align-items: flex-start;
     }
-    .dashboard-panel-header p {
-        max-width: 21ch;
+}
+@container console-content (max-width: 340px) {
+    .dashboard-status-band,
+    .dashboard-metrics {
+        grid-template-columns: minmax(0, 1fr);
     }
 }
 </style>

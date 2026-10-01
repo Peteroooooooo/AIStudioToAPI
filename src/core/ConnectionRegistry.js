@@ -125,6 +125,8 @@ class ConnectionRegistry extends EventEmitter {
 
     _removeConnection(websocket) {
         const disconnectedAuthIndex = websocket._authIndex;
+        // A replaced socket can close after its successor has registered.
+        if (this.connectionsByAuth.get(disconnectedAuthIndex) !== websocket) return;
 
         // Remove from connectionsByAuth if it has an authIndex
         if (disconnectedAuthIndex !== undefined && disconnectedAuthIndex >= 0) {
@@ -312,6 +314,7 @@ class ConnectionRegistry extends EventEmitter {
                         this.emit("backendOutcome", {
                             authCredentialEpoch: entry.authCredentialEpoch,
                             authIndex: entry.authIndex,
+                            healthEpoch: entry.healthEpoch,
                             requestAttemptId: entry.requestAttemptId,
                             requestId,
                             status: Number.isFinite(status) ? status : 500,
@@ -322,6 +325,7 @@ class ConnectionRegistry extends EventEmitter {
                     this.emit("backendOutcome", {
                         authCredentialEpoch: entry.authCredentialEpoch,
                         authIndex: entry.authIndex,
+                        healthEpoch: entry.healthEpoch,
                         requestAttemptId: entry.requestAttemptId,
                         requestId,
                         success: true,
@@ -352,16 +356,20 @@ class ConnectionRegistry extends EventEmitter {
         }
     }
 
-    isReconnectingInProgress() {
-        // Only check if current account is reconnecting, to avoid non-current account reconnection affecting current account's request handling
-        const currentAuthIndex = this.getCurrentAuthIndex ? this.getCurrentAuthIndex() : -1;
-        return currentAuthIndex >= 0 && (this.reconnectingAccounts.get(currentAuthIndex) || false);
+    isReconnectingInProgress(authIndex = this.getCurrentAuthIndex ? this.getCurrentAuthIndex() : -1) {
+        return authIndex >= 0 && (this.reconnectingAccounts.get(authIndex) || false);
     }
 
-    isInGracePeriod() {
-        // Only check if current account is in grace period, to avoid non-current account disconnection affecting current account's request handling
-        const currentAuthIndex = this.getCurrentAuthIndex ? this.getCurrentAuthIndex() : -1;
-        return currentAuthIndex >= 0 && this.reconnectGraceTimers.has(currentAuthIndex);
+    isInGracePeriod(authIndex = this.getCurrentAuthIndex ? this.getCurrentAuthIndex() : -1) {
+        return authIndex >= 0 && this.reconnectGraceTimers.has(authIndex);
+    }
+
+    isAccountConnected(authIndex) {
+        return Boolean(
+            this.connectionsByAuth.get(authIndex)?.readyState === 1 &&
+            !this.isInGracePeriod(authIndex) &&
+            !this.isReconnectingInProgress(authIndex)
+        );
     }
 
     getConnectionByAuth(authIndex, log = true) {
@@ -510,6 +518,7 @@ class ConnectionRegistry extends EventEmitter {
             authCredentialEpoch: this.getAuthCredentialEpoch?.(authIndex) ?? 0,
             authIndex,
             createdAt: Date.now(),
+            healthEpoch: this.browserManager?.authSource?.health?.getEpoch?.(authIndex),
             queue,
             requestAttemptId,
         });

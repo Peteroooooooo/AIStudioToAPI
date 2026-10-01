@@ -326,6 +326,9 @@ class AuthSwitcher {
     }
 
     shouldSwitchByUsage() {
+        // Multiple resident accounts are dispatched independently by the pool.
+        // A use threshold must not migrate their healthy sessions.
+        if (this.authSource.getRotationIndices().length > 1) return false;
         return this.config.switchOnUses > 0 && this.usageCount >= this.config.switchOnUses;
     }
 

@@ -14,6 +14,7 @@ const crypto = require("node:crypto");
 const path = require("node:path");
 const FormatConverter = require("./FormatConverter");
 const GeminiCacheManager = require("./GeminiCacheManager");
+const AccountScheduler = require("./AccountScheduler");
 const { isUserAbortedError } = require("../utils/CustomErrors");
 const { QueueClosedError, QueueTimeoutError } = require("../utils/MessageQueue");
 
@@ -39,6 +40,9 @@ class RequestHandler {
         this.authSwitcher = new AuthSwitcher(logger, config, authSource, browserManager);
         this.formatConverter = new FormatConverter(logger, serverSystem);
         this.cacheManager = new GeminiCacheManager(this, path.join(process.cwd(), "data"));
+        if (typeof browserManager.ensureAccountPoolReady === "function") {
+            this.accountScheduler = new AccountScheduler(this, { dataDir: path.join(process.cwd(), "data") });
+        }
 
         this.needsSwitchingAfterRequest = false;
     }
@@ -84,6 +88,15 @@ class RequestHandler {
     }
 
     _recordGenerationAccountUse(authIndex, label, requestId) {
+        if (this.accountScheduler) {
+            this.cacheManager.recordAccountUse(authIndex, this.currentAuthIndex);
+            this._updateTrackedRequest(requestId, {
+                initialAccountName: this._getAccountNameForIndex(authIndex),
+                initialAuthIndex: authIndex,
+            });
+            this.logger.info(`[Request] ${label} on serving account #${authIndex}, request ID: ${requestId}`);
+            return;
+        }
         const selectedCount = this.cacheManager.recordAccountUse(authIndex, this.currentAuthIndex);
         if (authIndex !== this.currentAuthIndex) {
             this._updateTrackedRequest(requestId, {
@@ -111,8 +124,24 @@ class RequestHandler {
     }
 
     async _recordCurrentAccountFailure(error, requestId) {
+        if (this.accountScheduler?.hasRequest(requestId)) {
+            // Registry backend outcomes record the attempt's health and credential
+            // epochs before delivery. Replaying that failure here could quarantine
+            // an account after its credentials or health state have recovered.
+            this.accountScheduler.notifyAccountChange?.();
+            return;
+        }
         if (!this._isRequestOnCurrentAccount(requestId)) return;
         await this.authSwitcher.handleRequestFailureAndSwitch(error, null);
+    }
+
+    _getRequestAuthIndex(requestId) {
+        return this.accountScheduler?.getLease(requestId)?.authIndex ?? this.currentAuthIndex;
+    }
+
+    _getRequestAttemptLimit(proxyRequest) {
+        if (proxyRequest.is_upload) return 1;
+        return Math.max(1, Number(proxyRequest.request_attempt_limit ?? this.config.maxRetries) || 1);
     }
 
     _getClientIp(req) {
@@ -206,8 +235,8 @@ class RequestHandler {
         usageStatsService.startRequest(requestId, {
             apiKeyId: this._getCallerApiKeyId(req),
             clientIp: this._getClientIp(req),
-            initialAccountName: this._getAccountNameForIndex(this.currentAuthIndex),
-            initialAuthIndex: this.currentAuthIndex,
+            initialAccountName: null,
+            initialAuthIndex: null,
             method: req.method,
             path: req.path,
             ...meta,
@@ -221,6 +250,8 @@ class RequestHandler {
     }
 
     _finalizeTrackedRequest(requestId, res, overrides = {}) {
+        clearTimeout(res.__accountDeadlineTimer);
+        this.accountScheduler?.release(requestId);
         const usageStatsService = this._getUsageStatsService();
         if (!usageStatsService) return;
 
@@ -666,6 +697,32 @@ class RequestHandler {
     }
 
     async _ensureBrowserBackedRequestReady(res, options = {}) {
+        if (this.accountScheduler) {
+            try {
+                await this.browserManager.ensureAccountPoolReady();
+                const recovering = this.authSource
+                    .getRotationIndices()
+                    .some(
+                        index =>
+                            this.connectionRegistry.isInGracePeriod?.(index) ||
+                            this.connectionRegistry.isReconnectingInProgress?.(index)
+                    );
+                if (!this.browserManager.getReadyAccountIndices().length && !recovering) {
+                    this._sendErrorResponse(
+                        res,
+                        503,
+                        "No serving account is available; retry after cooldown or reauthentication."
+                    );
+                    return false;
+                }
+                this.browserManager.notifyUserActivity();
+                return true;
+            } catch (error) {
+                this.logger.warn(`[Accounts] Pool readiness failed: ${error.message}`);
+                this._sendErrorResponse(res, 503, "No serving account could be initialized.");
+                return false;
+            }
+        }
         const { logPrefix = "Request", waitErrorType = null, waitOptions } = options;
 
         if (
@@ -738,6 +795,11 @@ class RequestHandler {
     }
 
     _shouldSwitchImmediately(errorDetails) {
+        if (this.accountScheduler?.hasRequest(errorDetails?.request_id || errorDetails?.requestId)) {
+            const authIndex =
+                errorDetails.authIndex ?? this._getRequestAuthIndex(errorDetails.request_id || errorDetails.requestId);
+            return Number(errorDetails.status) === 429 || !this.accountScheduler.isAccountAvailable(authIndex);
+        }
         const status = Number(errorDetails?.status);
         const sourceAuthIndex = Number.isInteger(errorDetails?.authIndex)
             ? errorDetails.authIndex
@@ -786,6 +848,18 @@ class RequestHandler {
     }
 
     async _prepareImmediateStatusRetry(errorDetails, requestId, tracker, sourceAuthIndex) {
+        if (this.accountScheduler?.hasRequest(requestId)) {
+            const authIndex = sourceAuthIndex ?? this._getRequestAuthIndex(requestId);
+            await this._recordCurrentAccountFailure({ ...errorDetails, authIndex }, requestId);
+            const unavailable =
+                Number(errorDetails.status) === 429 || !this.accountScheduler.isAccountAvailable(authIndex);
+            const lease = await this.accountScheduler.retry(requestId, {
+                exclude: unavailable ? [...tracker.attemptedAuthIndices] : [],
+                unavailable,
+            });
+            tracker.attemptedAuthIndices.add(lease.authIndex);
+            return true;
+        }
         const currentAuthIndex = this.currentAuthIndex;
         const hasSourceAuth = Number.isInteger(sourceAuthIndex) && sourceAuthIndex >= 0;
         const hasCurrentAuth = Number.isInteger(currentAuthIndex) && currentAuthIndex >= 0;
@@ -1020,7 +1094,8 @@ class RequestHandler {
             proxyRequest.is_generative = isGenerativeRequest;
             this._initializeProxyRequestAttempt(proxyRequest);
             this.cacheManager.attachResponse(res, proxyRequest);
-            const selectedAuthIndex = this.cacheManager.chooseConnectedAccount(proxyRequest, this.currentAuthIndex);
+            const selectedAuthIndex = await this._selectServingAccount(proxyRequest, req, res);
+            if (selectedAuthIndex === null) return;
             if (isGenerativeRequest) {
                 this._recordGenerationAccountUse(selectedAuthIndex, "Google generation request", requestId);
             }
@@ -1113,6 +1188,8 @@ class RequestHandler {
                 tracking_model: cleanModelName,
             };
             this._initializeProxyRequestAttempt(proxyRequest);
+            const selectedAuthIndex = await this._selectServingAccount(proxyRequest, req, res);
+            if (selectedAuthIndex === null) return;
             this._updateTrackedRequest(requestId, {
                 isStreaming: false,
                 model: proxyRequest.tracking_model,
@@ -1124,7 +1201,7 @@ class RequestHandler {
             try {
                 const messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
-                    this.currentAuthIndex,
+                    selectedAuthIndex,
                     proxyRequest.request_attempt_id
                 );
                 this._setupClientDisconnectHandler(res, requestId);
@@ -1164,6 +1241,7 @@ class RequestHandler {
                 body_b64: uploadBodyBuffer ? uploadBodyBuffer.toString("base64") : undefined,
                 headers: req.headers,
                 is_generative: false, // Uploads are never generative
+                is_upload: true,
                 method: req.method,
                 path: req.path.replace(/^\/proxy/, ""),
                 query_params: req.query || {},
@@ -1171,6 +1249,8 @@ class RequestHandler {
                 streaming_mode: "fake", // Uploads always return a single JSON response
             };
             this._initializeProxyRequestAttempt(proxyRequest);
+            const selectedAuthIndex = await this._selectServingAccount(proxyRequest, req, res);
+            if (selectedAuthIndex === null) return;
             this._updateTrackedRequest(requestId, {
                 path: proxyRequest.path,
             });
@@ -1179,7 +1259,7 @@ class RequestHandler {
                 // Create message queue inside try-catch to handle invalid authIndex
                 const messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
-                    this.currentAuthIndex,
+                    selectedAuthIndex,
                     proxyRequest.request_attempt_id
                 );
                 this._setupClientDisconnectHandler(res, requestId);
@@ -1285,7 +1365,8 @@ class RequestHandler {
             this._initializeProxyRequestAttempt(proxyRequest);
             res.__proxyResponseStreamMode = isOpenAIStream ? (useRealStream ? "real" : "fake") : null;
             this.cacheManager.attachResponse(res, proxyRequest);
-            const selectedAuthIndex = this.cacheManager.chooseConnectedAccount(proxyRequest, this.currentAuthIndex);
+            const selectedAuthIndex = await this._selectServingAccount(proxyRequest, req, res);
+            if (selectedAuthIndex === null) return;
             this._recordGenerationAccountUse(selectedAuthIndex, "OpenAI generation request", requestId);
             this._updateTrackedRequest(requestId, {
                 isStreaming: isOpenAIStream,
@@ -1310,11 +1391,21 @@ class RequestHandler {
                     let initialMessage;
                     let skipFinalFailureSwitch = false;
                     const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
-                    const maxRetries = this.config.maxRetries;
+                    const maxRetries = this._getRequestAttemptLimit(proxyRequest);
                     let retryAttempt = 1;
 
                     // eslint-disable-next-line no-constant-condition
                     while (true) {
+                        if (this.accountScheduler?.hasRequest(proxyRequest.request_id)) {
+                            const result = await this._executeScheduledRequestWithRetries(proxyRequest, currentQueue, {
+                                timeout: this.timeouts.STREAM_CHUNK,
+                            });
+                            currentQueue = result.queue;
+                            currentQueueAuthIndex = result.authIndex;
+                            initialMessage = result.success ? result.message : { ...result.error, event_type: "error" };
+                            skipFinalFailureSwitch = true;
+                            break;
+                        }
                         this._getUsageStatsService()?.recordAttempt(
                             proxyRequest.request_id,
                             currentQueueAuthIndex,
@@ -1336,6 +1427,7 @@ class RequestHandler {
                                 currentQueueAuthIndex,
                                 proxyRequest.request_attempt_id
                             );
+                            retryAttempt++;
                             continue;
                         }
 
@@ -1701,7 +1793,8 @@ class RequestHandler {
             this._initializeProxyRequestAttempt(proxyRequest);
             res.__proxyResponseStreamMode = isOpenAIStream ? (useRealStream ? "real" : "fake") : null;
             this.cacheManager.attachResponse(res, proxyRequest);
-            const selectedAuthIndex = this.cacheManager.chooseConnectedAccount(proxyRequest, this.currentAuthIndex);
+            const selectedAuthIndex = await this._selectServingAccount(proxyRequest, req, res);
+            if (selectedAuthIndex === null) return;
             this._recordGenerationAccountUse(selectedAuthIndex, "OpenAI Response generation request", requestId);
             this._updateTrackedRequest(requestId, {
                 isStreaming: isOpenAIStream,
@@ -1726,11 +1819,21 @@ class RequestHandler {
                     let initialMessage;
                     let skipFinalFailureSwitch = false;
                     const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
-                    const maxRetries = this.config.maxRetries;
+                    const maxRetries = this._getRequestAttemptLimit(proxyRequest);
                     let retryAttempt = 1;
 
                     // eslint-disable-next-line no-constant-condition
                     while (true) {
+                        if (this.accountScheduler?.hasRequest(proxyRequest.request_id)) {
+                            const result = await this._executeScheduledRequestWithRetries(proxyRequest, currentQueue, {
+                                timeout: this.timeouts.STREAM_CHUNK,
+                            });
+                            currentQueue = result.queue;
+                            currentQueueAuthIndex = result.authIndex;
+                            initialMessage = result.success ? result.message : { ...result.error, event_type: "error" };
+                            skipFinalFailureSwitch = true;
+                            break;
+                        }
                         this._getUsageStatsService()?.recordAttempt(
                             proxyRequest.request_id,
                             currentQueueAuthIndex,
@@ -1752,6 +1855,7 @@ class RequestHandler {
                                 currentQueueAuthIndex,
                                 proxyRequest.request_attempt_id
                             );
+                            retryAttempt++;
                             continue;
                         }
 
@@ -2091,7 +2195,8 @@ class RequestHandler {
             this._initializeProxyRequestAttempt(proxyRequest);
             res.__proxyResponseStreamMode = isClaudeStream ? (useRealStream ? "real" : "fake") : null;
             this.cacheManager.attachResponse(res, proxyRequest);
-            const selectedAuthIndex = this.cacheManager.chooseConnectedAccount(proxyRequest, this.currentAuthIndex);
+            const selectedAuthIndex = await this._selectServingAccount(proxyRequest, req, res);
+            if (selectedAuthIndex === null) return;
             this._recordGenerationAccountUse(selectedAuthIndex, "Claude generation request", requestId);
             this._updateTrackedRequest(requestId, {
                 isStreaming: isClaudeStream,
@@ -2116,11 +2221,21 @@ class RequestHandler {
                     let initialMessage;
                     let skipFinalFailureSwitch = false;
                     const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
-                    const maxRetries = this.config.maxRetries;
+                    const maxRetries = this._getRequestAttemptLimit(proxyRequest);
                     let retryAttempt = 1;
 
                     // eslint-disable-next-line no-constant-condition
                     while (true) {
+                        if (this.accountScheduler?.hasRequest(proxyRequest.request_id)) {
+                            const result = await this._executeScheduledRequestWithRetries(proxyRequest, currentQueue, {
+                                timeout: this.timeouts.STREAM_CHUNK,
+                            });
+                            currentQueue = result.queue;
+                            currentQueueAuthIndex = result.authIndex;
+                            initialMessage = result.success ? result.message : { ...result.error, event_type: "error" };
+                            skipFinalFailureSwitch = true;
+                            break;
+                        }
                         this._getUsageStatsService()?.recordAttempt(
                             proxyRequest.request_id,
                             currentQueueAuthIndex,
@@ -2142,6 +2257,7 @@ class RequestHandler {
                                 currentQueueAuthIndex,
                                 proxyRequest.request_attempt_id
                             );
+                            retryAttempt++;
                             continue;
                         }
 
@@ -2447,6 +2563,8 @@ class RequestHandler {
                 request_id: requestId,
             };
             this._initializeProxyRequestAttempt(proxyRequest);
+            const selectedAuthIndex = await this._selectServingAccount(proxyRequest, req, res);
+            if (selectedAuthIndex === null) return;
             this._updateTrackedRequest(requestId, {
                 model,
                 path: proxyRequest.path,
@@ -2457,28 +2575,22 @@ class RequestHandler {
                 // Create message queue inside try-catch to handle invalid authIndex
                 const messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
-                    this.currentAuthIndex,
+                    selectedAuthIndex,
                     proxyRequest.request_attempt_id
                 );
-                const messageQueueAuthIndex =
-                    this.connectionRegistry.getAuthIndexForRequest(requestId) ?? this.currentAuthIndex;
                 this._setupClientDisconnectHandler(res, requestId);
 
-                this._getUsageStatsService()?.recordAttempt(
-                    requestId,
-                    messageQueueAuthIndex,
-                    this._getAccountNameForIndex(messageQueueAuthIndex)
-                );
-                this._forwardRequest(proxyRequest, messageQueueAuthIndex);
-                const response = await messageQueue.dequeue();
+                const result = await this._executeRequestWithRetries(proxyRequest, messageQueue);
+                const response = result.success ? result.message : { ...result.error, event_type: "error" };
+                const activeQueue = result.queue || messageQueue;
 
                 if (response.event_type === "error") {
                     this.logger.error(
                         `❌ [Request] Received error from browser, will trigger switching logic. Status code: ${response.status}, message: ${response.message}`
                     );
                     this._sendErrorResponse(res, response.status || 500, response.message, "api_error");
-                    if (!this._isConnectionResetError(response)) {
-                        await this.authSwitcher.handleRequestFailureAndSwitch(response, null);
+                    if (!response.skipAccountSwitch && !this._isConnectionResetError(response)) {
+                        await this._recordCurrentAccountFailure(response, requestId);
                     }
                     return;
                 }
@@ -2489,7 +2601,7 @@ class RequestHandler {
                     if (response.data) fullBody += response.data;
                     // eslint-disable-next-line no-constant-condition
                     while (true) {
-                        const message = await messageQueue.dequeue();
+                        const message = await activeQueue.dequeue(this.timeouts.FAKE_STREAM);
                         if (message.type === "STREAM_END") {
                             break;
                         }
@@ -2507,7 +2619,7 @@ class RequestHandler {
                 const totalTokens = geminiResponse.totalTokens || 0;
 
                 // Reset failure count on success
-                if (this.authSwitcher.failureCount > 0) {
+                if (this._isRequestOnCurrentAccount(requestId) && this.authSwitcher.failureCount > 0) {
                     this.logger.debug(
                         `✅ [Auth] Count tokens request successful - failure count reset from ${this.authSwitcher.failureCount} to 0`
                     );
@@ -2589,6 +2701,8 @@ class RequestHandler {
                 request_id: requestId,
             };
             this._initializeProxyRequestAttempt(proxyRequest);
+            const selectedAuthIndex = await this._selectServingAccount(proxyRequest, req, res);
+            if (selectedAuthIndex === null) return;
             this._updateTrackedRequest(requestId, {
                 model,
                 path: proxyRequest.path,
@@ -2598,20 +2712,14 @@ class RequestHandler {
             try {
                 const messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
-                    this.currentAuthIndex,
+                    selectedAuthIndex,
                     proxyRequest.request_attempt_id
                 );
-                const messageQueueAuthIndex =
-                    this.connectionRegistry.getAuthIndexForRequest(requestId) ?? this.currentAuthIndex;
                 this._setupClientDisconnectHandler(res, requestId);
 
-                this._getUsageStatsService()?.recordAttempt(
-                    requestId,
-                    messageQueueAuthIndex,
-                    this._getAccountNameForIndex(messageQueueAuthIndex)
-                );
-                this._forwardRequest(proxyRequest, messageQueueAuthIndex);
-                const response = await messageQueue.dequeue();
+                const result = await this._executeRequestWithRetries(proxyRequest, messageQueue);
+                const response = result.success ? result.message : { ...result.error, event_type: "error" };
+                const activeQueue = result.queue || messageQueue;
 
                 if (response.event_type === "error") {
                     this.logger.error(
@@ -2621,8 +2729,8 @@ class RequestHandler {
                     this._sendErrorResponse(res, response.status || 500, response.message);
 
                     // Avoid switching account if the error is just a connection reset
-                    if (!this._isConnectionResetError(response)) {
-                        await this.authSwitcher.handleRequestFailureAndSwitch(response, null);
+                    if (!response.skipAccountSwitch && !this._isConnectionResetError(response)) {
+                        await this._recordCurrentAccountFailure(response, requestId);
                     } else {
                         this.logger.info(
                             "[Request] Failure due to connection reset (input_tokens), skipping account switch."
@@ -2637,7 +2745,7 @@ class RequestHandler {
                     if (response.data) fullBody += response.data;
                     // eslint-disable-next-line no-constant-condition
                     while (true) {
-                        const message = await messageQueue.dequeue();
+                        const message = await activeQueue.dequeue(this.timeouts.FAKE_STREAM);
                         if (message.type === "STREAM_END") {
                             break;
                         }
@@ -2666,7 +2774,7 @@ class RequestHandler {
                 const totalTokens = geminiResponse.totalTokens || 0;
 
                 // Reset failure count on success
-                if (this.authSwitcher.failureCount > 0) {
+                if (this._isRequestOnCurrentAccount(requestId) && this.authSwitcher.failureCount > 0) {
                     this.logger.debug(
                         `✅ [Auth] input_tokens request successful - failure count reset from ${this.authSwitcher.failureCount} to 0`
                     );
@@ -3095,11 +3203,21 @@ class RequestHandler {
         let headerMessage;
         let skipFinalFailureSwitch = false;
         const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
-        const maxRetries = this.config.maxRetries;
+        const maxRetries = this._getRequestAttemptLimit(proxyRequest);
         let retryAttempt = 1;
 
         // eslint-disable-next-line no-constant-condition
         while (true) {
+            if (this.accountScheduler?.hasRequest(proxyRequest.request_id)) {
+                const result = await this._executeScheduledRequestWithRetries(proxyRequest, currentQueue, {
+                    timeout: this.timeouts.STREAM_CHUNK,
+                });
+                currentQueue = result.queue;
+                currentQueueAuthIndex = result.authIndex;
+                headerMessage = result.success ? result.message : { ...result.error, event_type: "error" };
+                skipFinalFailureSwitch = true;
+                break;
+            }
             // Record attempt before forwarding, so failed attempts are also counted
             this._getUsageStatsService()?.recordAttempt(
                 proxyRequest.request_id,
@@ -3117,6 +3235,7 @@ class RequestHandler {
                     currentQueueAuthIndex,
                     proxyRequest.request_attempt_id
                 );
+                retryAttempt++;
                 continue;
             }
 
@@ -3343,6 +3462,7 @@ class RequestHandler {
 
             const fullBodyBuffer = Buffer.concat(chunks);
             let responseBodyBuffer = fullBodyBuffer;
+            this._recordResponseResources(proxyRequest, headerMessage, fullBodyBuffer);
 
             try {
                 const fullResponse = JSON.parse(responseBodyBuffer.toString());
@@ -3417,15 +3537,173 @@ class RequestHandler {
     async _retryWithoutRejectedCache(message, proxyRequest, queue, authIndex) {
         if (message?.event_type !== "error" || !this.cacheManager.canFallback(proxyRequest, message)) return false;
         await this.cacheManager.invalidateAndBypass(proxyRequest);
+        if ((proxyRequest.request_attempt_number || 1) >= this._getRequestAttemptLimit(proxyRequest)) return false;
         this._cancelCurrentAttemptBeforeRetry(proxyRequest, authIndex);
         queue.close("cache_fallback");
+        if (this.accountScheduler?.hasRequest(proxyRequest.request_id))
+            await this.accountScheduler.retry(proxyRequest.request_id);
         this._advanceProxyRequestAttempt(proxyRequest);
         return true;
     }
 
+    _scheduledDeadline(requestId) {
+        return this.accountScheduler.getDeadline?.(requestId) ?? Infinity;
+    }
+
+    async _waitScheduledRetryDelay(proxyRequest, delay) {
+        const requestId = proxyRequest.request_id;
+        const remaining = this._scheduledDeadline(requestId) - Date.now();
+        if (remaining <= 0) throw Object.assign(new Error("Request deadline exceeded."), { status: 504 });
+        const signal = this.accountScheduler.getSignal?.(requestId);
+        if (signal?.aborted || !this.accountScheduler.hasRequest(requestId))
+            throw Object.assign(new Error("The user aborted a request"), { isUserAborted: true });
+        if (delay <= 0) return;
+        await new Promise((resolve, reject) => {
+            const onAbort = () => {
+                clearTimeout(timer);
+                signal?.removeEventListener("abort", onAbort);
+                reject(Object.assign(new Error("The user aborted a request"), { isUserAborted: true }));
+            };
+            const timer = setTimeout(
+                () => {
+                    signal?.removeEventListener("abort", onAbort);
+                    resolve();
+                },
+                Math.min(delay, remaining)
+            );
+            signal?.addEventListener("abort", onAbort, { once: true });
+        });
+        if (Date.now() >= this._scheduledDeadline(requestId))
+            throw Object.assign(new Error("Request deadline exceeded."), { status: 504 });
+    }
+
+    async _recoverScheduledRequestAccount(proxyRequest, authIndex) {
+        const requestId = proxyRequest.request_id;
+        this.connectionRegistry.removeMessageQueue?.(requestId, "account_transport_recovery");
+        this.cacheManager._releaseAttempt?.(proxyRequest);
+        this.accountScheduler.pauseForRecovery?.(requestId);
+        const started = Date.now();
+        while (Date.now() - started < WS_RECONNECT_WAIT_MS) {
+            if (!this.accountScheduler.hasRequest(requestId)) return false;
+            if (this.connectionRegistry.getConnectionByAuth(authIndex, false)?.readyState === 1) return true;
+            if (
+                !this.connectionRegistry.isInGracePeriod?.(authIndex) &&
+                !this.connectionRegistry.isReconnectingInProgress?.(authIndex)
+            )
+                break;
+            await this._waitScheduledRetryDelay(proxyRequest, 100);
+        }
+        if (!this.accountScheduler.hasRequest(requestId)) return false;
+        return Boolean(await this.browserManager.ensureAccountReady?.(authIndex));
+    }
+
+    async _executeScheduledRequestWithRetries(
+        proxyRequest,
+        messageQueue,
+        { timeout = this.timeouts.FAKE_STREAM } = {}
+    ) {
+        const requestId = proxyRequest.request_id;
+        const maxAttempts = this._getRequestAttemptLimit(proxyRequest);
+        let currentQueue = messageQueue;
+        let authIndex = this._getRequestAuthIndex(requestId);
+        const attempted = new Set([authIndex]);
+        let lastError = null;
+        while ((proxyRequest.request_attempt_number || 1) <= maxAttempts) {
+            try {
+                if (!this.accountScheduler.hasRequest(requestId))
+                    throw Object.assign(new Error("The user aborted a request"), { isUserAborted: true });
+                authIndex = this._getRequestAuthIndex(requestId);
+                const remaining = this._scheduledDeadline(requestId) - Date.now();
+                if (remaining <= 0) throw Object.assign(new Error("Request deadline exceeded."), { status: 504 });
+                this._getUsageStatsService()?.recordAttempt(
+                    requestId,
+                    authIndex,
+                    this._getAccountNameForIndex(authIndex)
+                );
+                this._forwardRequest(proxyRequest, authIndex);
+                const message = await currentQueue.dequeue(Math.min(timeout, remaining));
+                if (message.event_type === "timeout")
+                    throw Object.assign(new Error("Request timed out waiting for browser response."), { status: 504 });
+                if (message.event_type !== "error") return { authIndex, message, queue: currentQueue, success: true };
+                throw Object.assign(new Error(message.message || "Google request failed."), message);
+            } catch (error) {
+                lastError = {
+                    authIndex,
+                    message: error.message || "Request failed.",
+                    skipAccountSwitch: true,
+                    status:
+                        Number(error.status) ||
+                        (error instanceof QueueTimeoutError || error.code === "QUEUE_TIMEOUT" ? 504 : 503),
+                };
+                if (
+                    isUserAbortedError(error) ||
+                    error.reason === "client_disconnect" ||
+                    !this.accountScheduler.hasRequest(requestId)
+                ) {
+                    lastError.isUserAborted = true;
+                    break;
+                }
+                const cacheRejected = this.cacheManager.canFallback(proxyRequest, lastError);
+                try {
+                    if (cacheRejected) {
+                        if (
+                            !(await this._retryWithoutRejectedCache(
+                                { ...lastError, event_type: "error" },
+                                proxyRequest,
+                                currentQueue,
+                                authIndex
+                            ))
+                        )
+                            break;
+                    } else {
+                        const transportFailure =
+                            this._isConnectionResetError(error) ||
+                            this.connectionRegistry.getConnectionByAuth(authIndex, false)?.readyState !== 1;
+                        if (!transportFailure) await this._recordCurrentAccountFailure(lastError, requestId);
+                        this._cancelCurrentAttemptBeforeRetry(proxyRequest, authIndex);
+                        if (
+                            (proxyRequest.request_attempt_number || 1) >= maxAttempts ||
+                            [400, 403, 404, 422].includes(lastError.status) ||
+                            (lastError.status === 401 && this.accountScheduler.isAccountAvailable(authIndex))
+                        )
+                            break;
+                        currentQueue.close("scheduled_retry");
+                        let unavailable =
+                            lastError.status === 429 || !this.accountScheduler.isAccountAvailable(authIndex);
+                        if (transportFailure)
+                            unavailable = !(await this._recoverScheduledRequestAccount(proxyRequest, authIndex));
+                        if (!unavailable)
+                            await this._waitScheduledRetryDelay(proxyRequest, this.config.retryDelay || 0);
+                        const lease = await this.accountScheduler.retry(requestId, {
+                            exclude: unavailable ? [...attempted] : [],
+                            unavailable,
+                        });
+                        attempted.add(lease.authIndex);
+                        this._advanceProxyRequestAttempt(proxyRequest);
+                    }
+                    authIndex = this._getRequestAuthIndex(requestId);
+                    currentQueue = this.connectionRegistry.createMessageQueue(
+                        requestId,
+                        authIndex,
+                        proxyRequest.request_attempt_id
+                    );
+                } catch (retryError) {
+                    if (isUserAbortedError(retryError)) lastError.isUserAborted = true;
+                    if (Number(retryError.status) === 504)
+                        lastError = { ...lastError, message: retryError.message, status: 504 };
+                    this.logger.warn(`[Request] Could not prepare account retry: ${retryError.message}`);
+                    break;
+                }
+            }
+        }
+        return { authIndex, error: lastError, queue: currentQueue, success: false };
+    }
+
     async _executeRequestWithRetries(proxyRequest, messageQueue) {
+        if (this.accountScheduler?.hasRequest(proxyRequest.request_id))
+            return this._executeScheduledRequestWithRetries(proxyRequest, messageQueue);
         // Keep one request's attempt budget stable while settings are edited.
-        const maxRetries = this.config.maxRetries;
+        const maxRetries = this._getRequestAttemptLimit(proxyRequest);
         const retryDelay = this.config.retryDelay;
         let lastError = null;
         let currentQueue = messageQueue;
@@ -3568,6 +3846,7 @@ class RequestHandler {
                         currentQueueAuthIndex,
                         proxyRequest.request_attempt_id
                     );
+                    retryAttempt++;
                     continue;
                 }
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
@@ -3932,6 +4211,31 @@ class RequestHandler {
         }
     }
 
+    _recordResponseResources(proxyRequest, headerMessage, bodyBuffer) {
+        const authIndex = this.accountScheduler?.getLease(proxyRequest.request_id)?.authIndex;
+        if (!Number.isInteger(authIndex) || Number(headerMessage.status || 200) >= 400) return;
+        const record = name => this.accountScheduler.recordResource(proxyRequest.cache_scope, name, authIndex);
+        for (const [name, value] of Object.entries(headerMessage.headers || {})) {
+            if (name.toLowerCase() !== "x-goog-upload-url" || typeof value !== "string") continue;
+            try {
+                const uploadId = new URL(value).searchParams.get("upload_id");
+                if (uploadId) record(`upload-session:${uploadId}`);
+                record(value);
+            } catch {
+                /* An invalid upload URL cannot be used for ownership. */
+            }
+        }
+        try {
+            const body = JSON.parse(bodyBuffer.toString());
+            for (const resource of [body, body.file]) {
+                if (/^(?:files|cachedContents)\//.test(resource?.name || "")) record(resource.name);
+                if (typeof resource?.uri === "string") record(resource.uri);
+            }
+        } catch {
+            /* Non-JSON responses do not contain resource names. */
+        }
+    }
+
     _setResponseHeaders(res, headerMessage, req) {
         res.status(headerMessage.status || 200);
         const headers = headerMessage.headers || {};
@@ -3983,6 +4287,15 @@ class RequestHandler {
         // Normalize error message to handle non-Error objects and missing/non-string messages
         const errorMsg = String(error?.message ?? error);
         const requestIdSuffix = requestId ? `, request ID: ${requestId}` : "";
+        if (isUserAbortedError(error) && !res.headersSent) {
+            this._markTrackedClientAbort(res, errorMsg);
+            if (!res.writableEnded) res.end();
+            return;
+        }
+        if (Number.isInteger(error.statusCode) && !res.headersSent) {
+            this._sendErrorResponse(res, error.statusCode, errorMsg);
+            return;
+        }
 
         // Check if this is a client disconnect - if so, just log and return
         if (this._isConnectionResetError(error)) {
@@ -4021,7 +4334,11 @@ class RequestHandler {
                         let errorMessage = `Processing failed: ${errorMsg}`;
 
                         // Use precise error type checking instead of string matching
-                        if (error instanceof QueueTimeoutError || error.code === "QUEUE_TIMEOUT") {
+                        if (
+                            error instanceof QueueTimeoutError ||
+                            error.code === "QUEUE_TIMEOUT" ||
+                            error.statusCode === 504
+                        ) {
                             errorCode = 504;
                             errorType = "timeout_error";
                             errorMessage = `Stream timeout: ${errorMsg}`;
@@ -4241,7 +4558,57 @@ class RequestHandler {
         }
     }
 
+    async _selectServingAccount(proxyRequest, req, res) {
+        if (!this.accountScheduler)
+            return this.cacheManager.chooseConnectedAccount(proxyRequest, this.currentAuthIndex);
+        res.__accountAbortController ||= new AbortController();
+        this._setupClientDisconnectHandler(res, proxyRequest.request_id);
+        const deadline = Date.now() + this.timeouts.FAKE_STREAM;
+        res.__accountDeadlineTimer = setTimeout(
+            () => {
+                if (res.writableEnded) return;
+                this._handleRequestError(
+                    Object.assign(new Error("Request deadline exceeded."), { statusCode: 504 }),
+                    res,
+                    proxyRequest.request_id
+                );
+                const index = this.accountScheduler.getLease(proxyRequest.request_id)?.authIndex;
+                if (Number.isInteger(index))
+                    this._cancelBrowserRequest(proxyRequest.request_id, index, proxyRequest.request_attempt_id);
+                this.connectionRegistry.removeMessageQueue(proxyRequest.request_id, "request_deadline");
+                res.__accountAbortController.abort();
+            },
+            Math.max(1, deadline - Date.now())
+        );
+        res.__accountDeadlineTimer.unref?.();
+        if (res.destroyed || res.__usageTrackingClientAborted) res.__accountAbortController.abort();
+        const caller = this._getCallerApiKeyId(req) || "anonymous";
+        const scope = crypto
+            .createHmac("sha256", this.config.sessionSecret || "local-account-scope")
+            .update(caller)
+            .digest("hex");
+        let lease;
+        try {
+            lease = await this.accountScheduler.acquire(proxyRequest, {
+                deadline,
+                scope,
+                sessionId: typeof req.headers?.["x-session-id"] === "string" ? req.headers["x-session-id"] : null,
+                signal: res.__accountAbortController.signal,
+            });
+        } catch (error) {
+            this._handleRequestError(error, res, proxyRequest.request_id);
+            return null;
+        }
+        this._updateTrackedRequest(proxyRequest.request_id, {
+            initialAccountName: this._getAccountNameForIndex(lease.authIndex),
+            initialAuthIndex: lease.authIndex,
+        });
+        return lease.authIndex;
+    }
+
     _setupClientDisconnectHandler(res, requestId) {
+        if (res.__proxyDisconnectRegistered) return;
+        res.__proxyDisconnectRegistered = true;
         res.on("close", () => {
             if (!res.writableEnded) {
                 this._markTrackedClientAbort(res);
@@ -4256,6 +4623,8 @@ class RequestHandler {
                 this._cancelBrowserRequest(requestId, targetAuthIndex, requestAttemptId);
                 // Close and remove the message queue to unblock any waiting dequeue() calls
                 this.connectionRegistry.removeMessageQueue(requestId, "client_disconnect");
+                res.__accountAbortController?.abort();
+                this.accountScheduler?.cancel(requestId);
             }
         });
     }
@@ -4544,6 +4913,7 @@ class RequestHandler {
     }
 
     _initializeProxyRequestAttempt(proxyRequest) {
+        proxyRequest.request_attempt_limit ??= Math.max(1, Number(this.config.maxRetries) || 1);
         if (!proxyRequest.request_attempt_number) {
             proxyRequest.request_attempt_number = 1;
         }
@@ -4578,6 +4948,13 @@ class RequestHandler {
                 JSON.stringify({
                     event_type: "proxy_request",
                     ...wireRequest,
+                    account_lease: undefined,
+                    cache_scope: undefined,
+                    headers: Object.fromEntries(
+                        Object.entries(wireRequest.headers || {}).filter(
+                            ([name]) => name.toLowerCase() !== "x-session-id"
+                        )
+                    ),
                 })
             );
         } else {
