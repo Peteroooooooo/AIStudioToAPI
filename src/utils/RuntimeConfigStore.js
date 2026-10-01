@@ -15,7 +15,11 @@ const SAFETY_THRESHOLDS = new Set([
     "BLOCK_NONE",
     "OFF",
 ]);
-const RUNTIME_DEFAULTS = Object.freeze({ ...CACHE_DEFAULTS, gemini38FlashThinkingLevel: "HIGH" });
+const RUNTIME_DEFAULTS = Object.freeze({
+    ...CACHE_DEFAULTS,
+    gemini38FlashThinkingLevel: "HIGH",
+    rateLimitCooldownSeconds: 18000,
+});
 
 const NUMERIC_LIMITS = Object.freeze({
     cacheCheckpointTokens: [1024, 100000],
@@ -27,6 +31,7 @@ const NUMERIC_LIMITS = Object.freeze({
     fakeStreamTimeoutMs: [1, 300000],
     maxContexts: [0, 32],
     maxRetries: [1, 10],
+    rateLimitCooldownSeconds: [1, 604800],
     retryDelay: [50, 60000],
     streamTimeoutMs: [1, 300000],
     switchOnUses: [0, 10000],
@@ -34,7 +39,6 @@ const NUMERIC_LIMITS = Object.freeze({
 const BOOLEAN_FIELDS = new Set([
     "cacheEnabled",
     "checkUpdate",
-    "enableAuthUpdate",
     "forceCodeExecution",
     "forceThinking",
     "forceUrlContext",
@@ -135,6 +139,9 @@ class RuntimeConfigStore {
             throw new RuntimeConfigValidationError("Unsupported config file format.");
         }
         validateStartup(saved.startup);
+        // Credential snapshots are always saved; retire the old optional switch.
+        delete saved.settings?.enableAuthUpdate;
+        delete saved.resetDefaults?.enableAuthUpdate;
         // Add newly managed fields without changing values already saved by the user.
         const previousLogLevel = saved.startup?.logLevel ?? this.config.logLevel;
         const managedDefaults = Object.fromEntries(Object.keys(RUNTIME_DEFAULTS).map(key => [key, this.defaults[key]]));
@@ -174,7 +181,14 @@ class RuntimeConfigStore {
             const missingManagedFields = [...Object.keys(RUNTIME_DEFAULTS), "logLevel"].some(
                 key => !Object.hasOwn(previousFile.settings, key) || !Object.hasOwn(previousFile.resetDefaults, key)
             );
-            if (JSON.stringify(completedStartup) !== JSON.stringify(previousStartup) || missingManagedFields) {
+            const retiredAuthSetting = [previousFile.settings, previousFile.resetDefaults].some(settings =>
+                Object.hasOwn(settings || {}, "enableAuthUpdate")
+            );
+            if (
+                JSON.stringify(completedStartup) !== JSON.stringify(previousStartup) ||
+                missingManagedFields ||
+                retiredAuthSetting
+            ) {
                 // Expand files created by an older release once. Values already
                 // present in the file always win over the startup seed.
                 this.fileExtras.startup = completedStartup;
@@ -213,6 +227,7 @@ class RuntimeConfigStore {
                 if (fs.existsSync(temporaryPath)) fs.rmSync(temporaryPath);
             }
             this.lastAppliedContent = content;
+            this._apply(this.settings);
             this.logger.info("[Config] Created data/config.json from startup settings.");
         }
     }

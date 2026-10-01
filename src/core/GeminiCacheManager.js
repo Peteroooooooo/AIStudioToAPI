@@ -18,7 +18,9 @@ class GeminiCacheManager {
         this.cachedAttemptIds = new Map();
         this.bypassOnce = new WeakSet();
         this.pendingCreates = new Set();
+        this.pendingOwners = new Map();
         this.pendingRenewals = new Set();
+        this.maintenanceRetryAfter = new Map();
         this.activeCacheUses = new Map();
         this.deferredAncestors = new Map();
         this.retiringCacheUses = new Set();
@@ -79,7 +81,129 @@ class GeminiCacheManager {
         ) {
             return null;
         }
-        return { accountKey, authIndex, googleRequest, model };
+        return {
+            accountKey,
+            authIndex,
+            googleRequest,
+            model,
+            ownerLease: proxyRequest.account_lease || null,
+            scopeKey: proxyRequest.cache_scope || null,
+        };
+    }
+
+    _usableEntry(entry) {
+        return (
+            !this.retiringCacheUses.has(this._cacheUseKey(entry)) && Date.parse(entry.expireTime) - Date.now() >= 10_000
+        );
+    }
+
+    _findUsable(info, options = {}) {
+        return this.store.findLongest({ ...info, ...options, isUsable: entry => this._usableEntry(entry) });
+    }
+
+    _canMaintain(info) {
+        if (!this.config.cacheEnabled || !this.handler.authSource?.health?.isAvailable(info.authIndex)) return false;
+        if ((this.maintenanceRetryAfter.get(this._maintenanceKey(info)) || 0) > Date.now()) return false;
+        const connection = this.handler.connectionRegistry.getConnectionByAuth(info.authIndex, false);
+        if (!connection || connection.readyState !== 1) return false;
+        const scheduler = this.handler.accountScheduler;
+        if (scheduler?.isAccountAvailable && !scheduler.isAccountAvailable(info.authIndex)) return false;
+        return !scheduler?.isCurrentOwner || scheduler.isCurrentOwner(info.ownerLease, info.authIndex);
+    }
+
+    _maintenanceKey(info) {
+        return `${info.accountKey}:${info.scopeKey || "legacy"}:${info.model}`;
+    }
+
+    _backOffMaintenance(info, error) {
+        const delay = [400, 403, 404, 422, 501].includes(Number(error?.status)) ? 600_000 : 60_000;
+        this.maintenanceRetryAfter.set(this._maintenanceKey(info), Date.now() + delay);
+    }
+
+    async _waitForMaintenance(info) {
+        if (!this._canMaintain(info)) return false;
+        const scheduler = this.handler.accountScheduler;
+        if (scheduler?.waitForMaintenance && !(await scheduler.waitForMaintenance(info.authIndex, info.ownerLease)))
+            return false;
+        return this._canMaintain(info);
+    }
+
+    _hasMedia(value) {
+        if (!value || typeof value !== "object") return false;
+        return Object.entries(value).some(
+            ([key, child]) =>
+                ["fileData", "inlineData", "fileUri", "file_data", "inline_data", "file_uri"].includes(key) ||
+                this._hasMedia(child)
+        );
+    }
+
+    _hasOtherContentOwner(info, prefixLength) {
+        return (
+            this.store.findOwnerMatches({
+                ...info,
+                isUsable: entry => {
+                    if (
+                        entry.accountKey === info.accountKey ||
+                        entry.prefixLength !== prefixLength ||
+                        !this._usableEntry(entry)
+                    )
+                        return false;
+                    // A recovered former account must not prevent the migrated owner
+                    // from rebuilding its own resource for the same conversation.
+                    if (
+                        info.ownerLease &&
+                        entry.conversationKey === info.ownerLease.key &&
+                        entry.ownerVersion !== info.ownerLease.version
+                    )
+                        return false;
+                    const indices = this.handler.authSource?.availableIndices || [];
+                    return indices.some(
+                        authIndex =>
+                            this._accountKey(authIndex) === entry.accountKey &&
+                            this.handler.authSource?.health?.isAvailable(authIndex) &&
+                            (!this.handler.accountScheduler?.isAccountAvailable ||
+                                this.handler.accountScheduler.isAccountAvailable(authIndex)) &&
+                            this.handler.connectionRegistry.getConnectionByAuth(authIndex, false)?.readyState === 1
+                    );
+                },
+                maxPrefixLength: prefixLength,
+            }).length > 0
+        );
+    }
+
+    findOwnerCandidates(proxyRequest, candidateIndices, { scope } = {}) {
+        this._deleteEvicted();
+        const indices = candidateIndices || this.handler.authSource?.getRotationIndices?.() || [];
+        const info = indices.map(index => this._requestInfo(proxyRequest, index)).find(Boolean);
+        if (!info) return [];
+        if (scope !== undefined) info.scopeKey = scope;
+        const ownerIndices = new Map();
+        for (const authIndex of indices) {
+            if (!this.handler.authSource?.health?.isAvailable(authIndex)) continue;
+            const connection = this.handler.connectionRegistry.getConnectionByAuth(authIndex, false);
+            if (connection?.readyState === 1) ownerIndices.set(this._accountKey(authIndex), authIndex);
+        }
+        const matches = this.store
+            .findOwnerMatches({
+                ...info,
+                isUsable: entry => ownerIndices.has(entry.accountKey) && this._usableEntry(entry),
+            })
+            .map(match => ({ ...match, authIndex: ownerIndices.get(match.entry.accountKey), pending: false }));
+        // Only history prefixes establish affinity. A shared system/tools template
+        // must not pull every unrelated conversation onto the same account.
+        for (const pending of this.pendingOwners.values()) {
+            if (pending.prefixLength < 1 || pending.prefixLength >= info.googleRequest.contents.length) continue;
+            if (!ownerIndices.has(pending.accountKey) || !this._canMaintain(pending.info)) continue;
+            if (pending.contentKey !== this.store.contentKey({ ...info, prefixLength: pending.prefixLength })) continue;
+            matches.push({
+                authIndex: ownerIndices.get(pending.accountKey),
+                pending: true,
+                prefixLength: pending.prefixLength,
+            });
+        }
+        return matches.sort(
+            (left, right) => right.prefixLength - left.prefixLength || Number(left.pending) - Number(right.pending)
+        );
     }
 
     _syncCurrentAccount(currentAuthIndex) {
@@ -93,7 +217,7 @@ class GeminiCacheManager {
         this._syncCurrentAccount(currentAuthIndex);
         const currentInfo = this._requestInfo(proxyRequest, currentAuthIndex);
         if (!currentInfo) return currentAuthIndex;
-        const currentMatch = this.store.findLongest(currentInfo);
+        const currentMatch = this._findUsable(currentInfo);
         let bestIndex = currentAuthIndex;
         let bestPrefix =
             currentMatch && Date.parse(currentMatch.entry.expireTime) - Date.now() >= 10000
@@ -108,7 +232,7 @@ class GeminiCacheManager {
                 continue;
             const info = this._requestInfo(proxyRequest, index);
             if (!info) continue;
-            const match = this.store.findLongest(info);
+            const match = this._findUsable(info);
             if (!match || Date.parse(match.entry.expireTime) - Date.now() < 10000) continue;
             if (match.prefixLength > bestPrefix) {
                 bestIndex = index;
@@ -134,11 +258,8 @@ class GeminiCacheManager {
             return proxyRequest;
         }
         const bypass = this.bypassOnce.delete(proxyRequest);
-        const match = bypass ? null : this.store.findLongest(info);
-        const usable =
-            match &&
-            !this.retiringCacheUses.has(this._cacheUseKey(match.entry)) &&
-            Date.parse(match.entry.expireTime) - Date.now() >= 10000;
+        const match = bypass ? null : this._findUsable(info);
+        const usable = Boolean(match);
         const attempt = {
             ...info,
             activeHit: Boolean(usable),
@@ -306,54 +427,62 @@ class GeminiCacheManager {
     }
 
     _scheduleCreate(info) {
-        if (!this.config.cacheEnabled) return;
-        if (info.googleRequest.systemInstruction || info.googleRequest.tools || info.googleRequest.toolConfig) {
-            this._scheduleCreatePrefix(info, 0);
-        }
+        if (!this._canMaintain(info)) return;
         this._scheduleCreatePrefix(info, info.googleRequest.contents.length);
     }
 
     _scheduleCreatePrefix(info, prefixLength) {
-        const { accountKey, googleRequest, model } = info;
-        const existing = this.store.findLongest({ accountKey, googleRequest, maxPrefixLength: prefixLength, model });
+        if (!this._canMaintain(info)) return;
+        if (this._hasOtherContentOwner(info, prefixLength)) return;
+        const existing = this._findUsable(info, { maxPrefixLength: prefixLength });
         if (existing?.prefixLength === prefixLength) return;
-        const taskKey = crypto
-            .createHash("sha256")
-            .update(JSON.stringify([accountKey, model, this._cacheFields(googleRequest, prefixLength)]))
-            .digest("hex");
+        const contentKey = this.store.contentKey({ ...info, prefixLength });
+        const taskKey = `${info.accountKey}:${contentKey}`;
         if (this.pendingCreates.has(taskKey)) return;
+        const previousOwner = this.pendingOwners.get(contentKey);
+        if (previousOwner && this._canMaintain(previousOwner.info)) return;
+        const pendingOwner = { accountKey: info.accountKey, contentKey, info, prefixLength };
         this.pendingCreates.add(taskKey);
+        this.pendingOwners.set(contentKey, pendingOwner);
         if (
             !this._schedule(async () => {
                 try {
                     await this._create(info, prefixLength);
+                } catch (error) {
+                    this._backOffMaintenance(info, error);
+                    throw error;
                 } finally {
                     this.pendingCreates.delete(taskKey);
+                    if (this.pendingOwners.get(contentKey) === pendingOwner) this.pendingOwners.delete(contentKey);
                 }
             })
         ) {
             this.pendingCreates.delete(taskKey);
+            if (this.pendingOwners.get(contentKey) === pendingOwner) this.pendingOwners.delete(contentKey);
         }
     }
 
     async _create(info, prefixLength) {
-        if (!this.config.cacheEnabled || !this.handler.connectionRegistry.getConnectionByAuth(info.authIndex, false))
-            return;
+        if (!this._canMaintain(info)) return;
+        if (this._hasOtherContentOwner(info, prefixLength)) return;
         const fields = this._cacheFields(info.googleRequest, prefixLength);
         const fullFields = this._cacheFields(info.googleRequest, info.googleRequest.contents.length);
-        // Token count cannot exceed the UTF-8 byte count of this request body.
-        if (Buffer.byteLength(JSON.stringify(fullFields)) < this.config.cacheMinTokens) return;
-        const existing = this.store.findLongest({ ...info, maxPrefixLength: prefixLength });
+        // A media URI can represent many tokens despite its tiny JSON body.
+        // Only pure text/structured inputs use this inexpensive upper bound.
+        if (!this._hasMedia(fullFields) && Buffer.byteLength(JSON.stringify(fullFields)) < this.config.cacheMinTokens)
+            return;
+        const existing = this._findUsable(info, { maxPrefixLength: prefixLength });
         if (existing?.prefixLength === prefixLength) return;
         if (
             prefixLength > 0 &&
             existing?.prefixLength === 0 &&
+            !this._hasMedia(fields) &&
             Buffer.byteLength(JSON.stringify(fields)) -
                 Buffer.byteLength(JSON.stringify(this._cacheFields(info.googleRequest, 0))) <
                 this.config.cacheCheckpointTokens
-        ) {
+        )
             return;
-        }
+        if (!(await this._waitForMaintenance(info))) return;
 
         // countTokens requires at least one content message, while cachedContents
         // can store system instructions and tools on their own.
@@ -365,6 +494,7 @@ class GeminiCacheManager {
             path: `/v1beta/models/${info.model}:countTokens`,
         });
         const tokenCount = Number(countResponse.totalTokens) - (prefixLength === 0 ? 1 : 0);
+        if (!this._canMaintain(info)) return;
         if (!Number.isSafeInteger(tokenCount) || tokenCount < this.config.cacheMinTokens) return;
         if (
             existing?.entry?.tokenCount != null &&
@@ -374,6 +504,7 @@ class GeminiCacheManager {
         }
 
         try {
+            if (!(await this._waitForMaintenance(info))) return;
             const cacheFields = { ...fields };
             if (prefixLength === 0) delete cacheFields.contents;
             const created = await this._resourceRequest(info.authIndex, {
@@ -382,6 +513,11 @@ class GeminiCacheManager {
                 path: "/v1beta/cachedContents",
             });
             if (!created.name || !created.expireTime) throw new Error("Gemini did not return a cache name and expiry.");
+            if (!this._canMaintain(info)) {
+                await this.store.rememberOrphan({ accountKey: info.accountKey, ...created });
+                this._deleteEvicted();
+                return;
+            }
             const retiringKeys = new Set();
             const previousDeferred = new Map();
             let stored = false;
@@ -415,12 +551,15 @@ class GeminiCacheManager {
                         });
                         return false;
                     },
+                    conversationKey: info.ownerLease?.key || null,
                     expireTime: created.expireTime,
                     googleRequest: info.googleRequest,
                     model: info.model,
                     name: created.name,
+                    ownerVersion: info.ownerLease?.version ?? null,
                     prefixLength,
                     retireAncestors: prefixLength > 0,
+                    scopeKey: info.scopeKey,
                     tokenCount,
                 });
                 stored = true;
@@ -446,13 +585,14 @@ class GeminiCacheManager {
 
     _maybeRenew(info) {
         const entry = info.hit;
-        if (!entry || this.config.cacheRenewWindowSeconds <= 0) return;
+        if (!entry || !this._canMaintain(info) || this.config.cacheRenewWindowSeconds <= 0) return;
         if (Date.parse(entry.expireTime) - Date.now() > this.config.cacheRenewWindowSeconds * 1000) return;
         if (this.pendingRenewals.has(entry.name)) return;
         this.pendingRenewals.add(entry.name);
         if (
             !this._schedule(async () => {
                 try {
+                    if (!(await this._waitForMaintenance(info)) || !this.store.hasCurrent(entry)) return;
                     const updated = await this._resourceRequest(info.authIndex, {
                         body: { ttl: `${this.config.cacheTtlSeconds}s` },
                         method: "PATCH",
@@ -460,20 +600,25 @@ class GeminiCacheManager {
                         queryParams: { updateMask: "ttl" },
                     });
                     if (updated.expireTime) {
+                        if (!this._canMaintain(info)) return;
                         const current = this.store.findLongest({ ...info, maxPrefixLength: entry.prefixLength });
                         if (current?.prefixLength !== entry.prefixLength || current.entry.name !== entry.name) return;
                         await this.store.put({
                             accountKey: info.accountKey,
+                            conversationKey: info.ownerLease?.key || null,
                             expireTime: updated.expireTime,
                             googleRequest: info.googleRequest,
                             model: info.model,
                             name: entry.name,
+                            ownerVersion: info.ownerLease?.version ?? null,
                             prefixLength: entry.prefixLength,
+                            scopeKey: info.scopeKey,
                             tokenCount: entry.tokenCount,
                         });
                         this.metrics.renewals++;
                     }
                 } catch (error) {
+                    this._backOffMaintenance(info, error);
                     this.logger.warn(`[Cache] Could not renew Gemini resource: ${error.message}`);
                 } finally {
                     this.pendingRenewals.delete(entry.name);

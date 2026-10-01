@@ -146,16 +146,12 @@
                 v-if="activeTab === 'accounts'"
                 ref="accountsViewRef"
                 :accounts="state.accountDetails"
-                :current-auth-index="state.currentAuthIndex"
                 :is-busy="isBusy"
-                :usage-count="state.usageCount"
-                :failure-count="state.failureCount"
                 :t="t"
                 @add="addUser"
                 @reauth="reauthenticateAccount"
                 @upload="triggerFileUpload"
                 @deduplicate="deduplicateAuth"
-                @switch="switchAccountByIndex"
                 @health="updateAccountHealth"
                 @delete="deleteAccountByIndex"
                 @download="downloadAccountByIndex"
@@ -249,7 +245,6 @@
                                     <div class="runtime-field-heading">
                                         <label :for="`runtime-${field.key}`">{{ t(field.titleKey) }}</label>
                                     </div>
-                                    <code class="runtime-field-key">{{ field.key }}</code>
                                     <p class="runtime-field-description">{{ t(field.descriptionKey) }}</p>
                                     <div class="runtime-field-input-row">
                                         <input
@@ -313,7 +308,6 @@
                             <div class="runtime-option-fields">
                                 <div v-for="field in group.fields" :key="field.key" class="runtime-option-field">
                                     <label :for="`runtime-${field.key}`">{{ t(field.titleKey) }}</label>
-                                    <code>{{ field.key }}</code>
                                     <div class="runtime-option-control">
                                         <el-switch
                                             v-if="field.type === 'boolean'"
@@ -609,6 +603,7 @@ const { theme, setTheme } = useTheme();
 
 const state = reactive({
     accountDetails: [],
+    accountPool: null,
     activeContextsCount: 0,
     apiKeySource: "",
     browserConnected: false,
@@ -617,7 +612,6 @@ const state = reactive({
     currentAuthIndex: -1,
     currentLang: I18n.getLang(),
     debugModeEnabled: false,
-    enableAuthUpdateEnabled: true,
     failureCount: 0,
     forceCodeExecutionEnabled: false,
     forceThinkingEnabled: false,
@@ -653,6 +647,14 @@ const runtimeConfigGroups = [
                 min: 0,
                 titleKey: "runtimeMaxContexts",
             },
+            {
+                descriptionKey: "runtimeRateLimitCooldownDescription",
+                key: "rateLimitCooldownSeconds",
+                max: 604800,
+                min: 1,
+                titleKey: "runtimeRateLimitCooldown",
+                unitKey: "runtimeSeconds",
+            },
         ],
         key: "capacity",
         titleKey: "runtimeCapacityTitle",
@@ -666,20 +668,6 @@ const runtimeConfigGroups = [
                 max: 10,
                 min: 1,
                 titleKey: "runtimeMaxRetries",
-            },
-            {
-                descriptionKey: "runtimeFailureThresholdDescription",
-                key: "failureThreshold",
-                max: 10000,
-                min: 0,
-                titleKey: "runtimeFailureThreshold",
-            },
-            {
-                descriptionKey: "runtimeSwitchOnUsesDescription",
-                key: "switchOnUses",
-                max: 10000,
-                min: 0,
-                titleKey: "runtimeSwitchOnUses",
             },
             {
                 descriptionKey: "runtimeRetryDelayDescription",
@@ -785,7 +773,6 @@ const runtimeOptionGroups = [
         descriptionKey: "consoleOperationsDescription",
         fields: [
             { key: "checkUpdate", titleKey: "checkUpdate", type: "boolean" },
-            { key: "enableAuthUpdate", titleKey: "enableAuthUpdate", type: "boolean" },
             { key: "logLevel", titleKey: "logLevel", type: "logLevel" },
             { key: "safetySettingsThreshold", titleKey: "safetySettingsThreshold", type: "safety" },
         ],
@@ -1498,58 +1485,6 @@ const updateAccountHealth = async (account, requestedAction) => {
     }
 };
 
-// Switch account by index
-const switchAccountByIndex = targetIndex => {
-    if (state.currentAuthIndex === targetIndex) {
-        ElMessage.warning(t("alreadyCurrentAccount"));
-        return;
-    }
-
-    const targetAccount = state.accountDetails.find(acc => acc.index === targetIndex);
-    const accountSuffix = targetAccount ? ` (${getAccountDisplayName(targetAccount)})` : "";
-
-    ElMessageBox.confirm(`${t("confirmSwitch")} #${targetIndex}${accountSuffix}?`, {
-        cancelButtonText: t("cancel"),
-        confirmButtonText: t("ok"),
-        lockScroll: false,
-        type: "warning",
-    })
-        .then(async () => {
-            const notification = ElNotification({
-                duration: 0,
-                message: t("switchingAccountNotice"),
-                title: t("warningTitle"),
-                type: "warning",
-            });
-            state.isSwitchingAccount = true;
-            try {
-                const res = await fetch("/api/accounts/current", {
-                    body: JSON.stringify({ targetIndex }),
-                    headers: { "Content-Type": "application/json" },
-                    method: "PUT",
-                });
-                const data = await res.json();
-                const message = t(data.message, data);
-                if (res.ok) {
-                    ElMessage.success(message);
-                } else {
-                    ElMessage.error(message);
-                }
-            } catch (err) {
-                ElMessage.error(t("settingFailed", { message: err.message || err }));
-            } finally {
-                state.isSwitchingAccount = false;
-                notification.close();
-                updateContent();
-            }
-        })
-        .catch(e => {
-            if (e !== "cancel") {
-                console.error(e);
-            }
-        });
-};
-
 const updateStatus = data => {
     state.serviceConnected = true;
 
@@ -1563,7 +1498,6 @@ const updateStatus = data => {
     state.isUpdating = true;
     state.checkUpdateEnabled = isEnabled(data.status.checkUpdate);
     state.streamingModeReal = data.status.streamingMode === "real";
-    state.enableAuthUpdateEnabled = isEnabled(data.status.enableAuthUpdate);
     state.forceThinkingEnabled = isEnabled(data.status.forceThinking);
     state.forceCodeExecutionEnabled = isEnabled(data.status.forceCodeExecution);
     state.forceWebSearchEnabled = isEnabled(data.status.forceWebSearch);
@@ -1574,6 +1508,7 @@ const updateStatus = data => {
     state.activeContextsCount = data.status.activeContextsCount || 0;
     state.cacheStats = data.status.cacheStats || null;
     state.maxContexts = data.status.maxContexts ?? 1;
+    state.accountPool = data.status.accountPool || null;
     state.maxRetries = data.status.maxRetries ?? 3;
     state.safetySettingsThreshold = data.status.safetySettingsThreshold || "OFF";
 
@@ -2163,6 +2098,8 @@ watchEffect(() => {
 .main-layout {
     display: flex;
     min-height: 100vh;
+    min-width: 0;
+    width: 100%;
     background-color: @background-light;
 }
 
@@ -2300,6 +2237,8 @@ watchEffect(() => {
 }
 
 .content-area {
+    container-name: console-content;
+    container-type: inline-size;
     flex: 1;
     margin-left: 230px;
     padding: 28px clamp(20px, 3vw, 44px) 48px;
@@ -2346,15 +2285,20 @@ watchEffect(() => {
 }
 
 /* Settings View Specifics */
+.settings-view {
+    margin-inline: auto;
+    max-width: 960px;
+    width: 100%;
+}
+
 .runtime-config-card {
     margin-bottom: 24px;
 }
 
 .runtime-config-header {
     display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 24px;
+    flex-direction: column;
+    gap: 14px;
     margin-bottom: 20px;
 
     h2 {
@@ -2385,7 +2329,7 @@ watchEffect(() => {
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
-    justify-content: flex-end;
+    justify-content: flex-start;
 }
 
 .runtime-action-button {
@@ -2561,22 +2505,26 @@ watchEffect(() => {
 .runtime-config-fields {
     display: grid;
     gap: 12px;
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .runtime-config-field {
     background: @background-light;
     border: 1px solid @border-light;
     border-radius: 12px;
+    display: grid;
+    gap: 8px 12px;
+    grid-template-columns: minmax(0, 1fr) 156px;
     min-width: 0;
-    padding: 15px;
+    padding: 14px;
 }
 
 .runtime-field-heading {
-    align-items: flex-start;
+    align-items: center;
     display: flex;
     gap: 8px;
     justify-content: space-between;
+    min-width: 0;
 
     label {
         color: @text-primary;
@@ -2590,21 +2538,17 @@ watchEffect(() => {
     color: @text-secondary;
     font-size: 0.78rem;
     line-height: 1.45;
-    margin: 8px 0 12px;
-    min-height: 2.25em;
-}
-
-.runtime-field-key {
-    color: @text-secondary;
-    display: inline-block;
-    font-size: 0.7rem;
-    margin-top: 4px;
+    grid-column: 1 / -1;
+    margin: 0;
 }
 
 .runtime-field-input-row {
     align-items: center;
     display: flex;
     gap: 8px;
+    grid-column: 2;
+    grid-row: 1;
+    min-width: 0;
 
     input {
         background: @background-white;
@@ -2613,7 +2557,8 @@ watchEffect(() => {
         color: @text-primary;
         font: inherit;
         font-size: 0.94rem;
-        max-width: 160px;
+        max-width: 116px;
+        min-width: 0;
         min-height: 38px;
         padding: 7px 10px;
         width: 100%;
@@ -2636,8 +2581,9 @@ watchEffect(() => {
 }
 
 .runtime-field-footnote {
+    grid-column: 1 / -1;
     line-height: 1.45;
-    margin-top: 10px;
+    margin-top: 0;
 
     strong {
         color: @text-primary;
@@ -2678,7 +2624,7 @@ watchEffect(() => {
 .runtime-option-fields {
     display: grid;
     gap: 10px;
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .runtime-option-field {
@@ -2695,18 +2641,20 @@ watchEffect(() => {
         color: @text-primary;
         font-size: 0.88rem;
         font-weight: 650;
+        line-height: 1.4;
+        min-width: 0;
     }
 
-    code,
     small {
         color: @text-secondary;
         font-size: 0.72rem;
-        grid-column: 1;
+        grid-column: 1 / -1;
+        line-height: 1.45;
     }
 
     .runtime-option-control {
         grid-column: 2;
-        grid-row: 1 / span 3;
+        grid-row: 1;
         min-width: 58px;
 
         :deep(.el-select) {
@@ -2839,21 +2787,40 @@ watchEffect(() => {
     }
 }
 
-@media (max-width: 1050px) {
+@container console-content (max-width: 760px) {
+    .runtime-config-fields,
+    .runtime-option-fields,
     .settings-secondary-grid {
-        grid-template-columns: 1fr;
+        grid-template-columns: minmax(0, 1fr);
     }
 }
 
 @media (max-width: 700px) {
-    .runtime-config-header {
-        flex-direction: column;
-        gap: 16px;
-    }
-
     .runtime-config-actions {
         justify-content: flex-start;
         width: 100%;
+    }
+
+    .settings-view .status-card {
+        padding: 18px;
+    }
+
+    .runtime-config-field {
+        grid-template-columns: minmax(0, 1fr) 132px;
+        padding: 12px;
+    }
+
+    .runtime-field-input-row input {
+        max-width: 92px;
+    }
+
+    .runtime-option-field .runtime-option-control :deep(.el-select) {
+        width: 120px;
+    }
+
+    .runtime-save-bar {
+        margin: 18px -18px -18px;
+        padding: 12px 18px;
     }
 }
 

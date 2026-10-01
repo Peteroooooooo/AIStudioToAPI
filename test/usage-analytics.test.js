@@ -7,6 +7,21 @@ const path = require("path");
 const { buildOverview, listRequests, parseUsageQuery } = require("../src/core/UsageAnalytics");
 const UsageStatsService = require("../src/core/UsageStatsService");
 
+test("preflight and queued failures with no backend attempt do not blame a selected account", async t => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "usage-no-attempt-"));
+    const service = new UsageStatsService({ accountNameMap: new Map([[1, "a@example.com"]]) }, { warn() {} }, dataDir);
+    t.after(async () => {
+        await service.appendPromise;
+        fs.rmSync(dataDir, { force: true, recursive: true });
+    });
+    service.startRequest("queued", { initialAccountName: "a@example.com", initialAuthIndex: 1 });
+    const record = service.finishRequest("queued", { finalAuthIndex: 1, outcome: "error", statusCode: 504 });
+    assert.equal(record.attemptCount, 0);
+    assert.equal(record.initialAuthIndex, null);
+    assert.equal(record.finalAuthIndex, null);
+    assert.equal(record.finalAccountName, null);
+});
+
 const nowMs = Date.parse("2026-09-25T12:00:00.000Z");
 const records = [
     {

@@ -18,7 +18,6 @@ function initialConfig() {
         cacheRenewWindowSeconds: 0,
         cacheTtlSeconds: 3600,
         checkUpdate: true,
-        enableAuthUpdate: true,
         failureThreshold: 3,
         fakeStreamTimeoutMs: 300000,
         forceCodeExecution: false,
@@ -59,6 +58,32 @@ async function waitFor(check, timeoutMs = 3000) {
     }
 }
 
+test("retired auth-update switches migrate out of old files without changing other settings", async () => {
+    const { directory, store } = temporaryStore();
+    try {
+        const saved = JSON.parse(fs.readFileSync(store.filePath, "utf8"));
+        saved.settings.enableAuthUpdate = false;
+        saved.resetDefaults.enableAuthUpdate = false;
+        saved.settings.maxContexts = 4;
+        store.close();
+        fs.writeFileSync(store.filePath, JSON.stringify(saved));
+        const restarted = new RuntimeConfigStore(initialConfig(), logger, directory);
+        try {
+            const migrated = JSON.parse(fs.readFileSync(restarted.filePath, "utf8"));
+            assert.equal(migrated.settings.maxContexts, 4);
+            assert.equal(Object.hasOwn(migrated.settings, "enableAuthUpdate"), false);
+            assert.equal(Object.hasOwn(migrated.resetDefaults, "enableAuthUpdate"), false);
+            assert.equal(Object.hasOwn(restarted.getState().effective, "enableAuthUpdate"), false);
+            assert.throws(() => restarted.update({ enableAuthUpdate: false }), /Unknown runtime setting/);
+        } finally {
+            restarted.close();
+        }
+    } finally {
+        store.close();
+        fs.rmSync(directory, { force: true, recursive: true });
+    }
+});
+
 test("file is seeded once, page edits persist, and reset uses the saved initial values", async () => {
     const { config, directory, store } = temporaryStore();
     try {
@@ -66,6 +91,7 @@ test("file is seeded once, page edits persist, and reset uses the saved initial 
         assert.equal(initial.effective.maxContexts, 2);
         assert.equal(initial.defaults.maxContexts, 2);
         assert.equal(initial.revision, 0);
+        assert.equal(initial.effective.rateLimitCooldownSeconds, 18000);
         assert.equal(JSON.stringify(initial).includes("test-console-password"), false);
 
         await store.update({
@@ -74,9 +100,11 @@ test("file is seeded once, page edits persist, and reset uses the saved initial 
             logLevel: "DEBUG",
             maxContexts: 1,
             maxRetries: 4,
+            rateLimitCooldownSeconds: 7200,
         });
         assert.equal(config.maxContexts, 1);
         assert.equal(config.maxRetries, 4);
+        assert.equal(config.rateLimitCooldownSeconds, 7200);
         assert.equal(config.forceThinking, true);
         assert.equal(config.gemini38FlashThinkingLevel, "MEDIUM");
         assert.equal(config.logLevel, "DEBUG");
@@ -91,11 +119,13 @@ test("file is seeded once, page edits persist, and reset uses the saved initial 
         const restarted = new RuntimeConfigStore(changedEnvironment, logger, directory);
         try {
             assert.equal(changedEnvironment.maxContexts, 1);
+            assert.equal(changedEnvironment.rateLimitCooldownSeconds, 7200);
             assert.equal(changedEnvironment.logLevel, "DEBUG");
             assert.equal(changedEnvironment.gemini38FlashThinkingLevel, "MEDIUM");
             assert.equal(restarted.getState().defaults.maxContexts, 2);
             await restarted.reset();
             assert.equal(changedEnvironment.maxContexts, 2);
+            assert.equal(changedEnvironment.rateLimitCooldownSeconds, 18000);
             assert.equal(changedEnvironment.gemini38FlashThinkingLevel, "HIGH");
             assert.deepEqual(restarted.getState().effective, restarted.getState().defaults);
         } finally {
@@ -147,6 +177,9 @@ test("invalid edits leave the effective and saved settings unchanged", async () 
     try {
         const content = fs.readFileSync(store.filePath, "utf8");
         assert.throws(() => store.update({ maxContexts: -1 }), /maxContexts/);
+        for (const seconds of [0, -1, 1.5, 604801, "18000"]) {
+            assert.throws(() => store.update({ rateLimitCooldownSeconds: seconds }), /rateLimitCooldownSeconds/);
+        }
         assert.throws(() => store.update({ apiKeys: ["should-not-save"] }), /Unknown runtime setting/);
         for (const level of ["minimal", "low", "MAX", null, 1]) {
             assert.throws(() => store.update({ gemini38FlashThinkingLevel: level }), /gemini38FlashThinkingLevel/);
@@ -244,6 +277,7 @@ test("older config files gain new runtime settings without losing saved values",
             "cacheRenewWindowSeconds",
             "cacheTtlSeconds",
             "gemini38FlashThinkingLevel",
+            "rateLimitCooldownSeconds",
         ]) {
             delete saved.settings[key];
             delete saved.resetDefaults[key];
@@ -257,12 +291,15 @@ test("older config files gain new runtime settings without losing saved values",
             assert.equal(config.cacheEnabled, true);
             assert.equal(config.cacheTtlSeconds, 3600);
             assert.equal(config.gemini38FlashThinkingLevel, "HIGH");
+            assert.equal(config.rateLimitCooldownSeconds, 18000);
             const migrated = JSON.parse(fs.readFileSync(store.filePath, "utf8"));
             assert.equal(migrated.settings.maxContexts, 7);
             assert.equal(migrated.settings.cacheEnabled, true);
             assert.equal(migrated.resetDefaults.cacheTtlSeconds, 3600);
             assert.equal(migrated.settings.gemini38FlashThinkingLevel, "HIGH");
             assert.equal(migrated.resetDefaults.gemini38FlashThinkingLevel, "HIGH");
+            assert.equal(migrated.settings.rateLimitCooldownSeconds, 18000);
+            assert.equal(migrated.resetDefaults.rateLimitCooldownSeconds, 18000);
         } finally {
             restarted.close();
         }

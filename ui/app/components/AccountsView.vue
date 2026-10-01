@@ -50,14 +50,6 @@
                 <span>{{ t("healthDisabled") }}</span>
                 <strong>{{ statusCounts.disabled }}</strong>
             </div>
-            <div class="accounts-current-counters">
-                <span
-                    >{{ t("accountsCurrentRotation") }} <strong>{{ usageCount ?? "—" }}</strong></span
-                >
-                <span
-                    >{{ t("accountsCurrentFailures") }} <strong>{{ failureCount ?? "—" }}</strong></span
-                >
-            </div>
         </div>
 
         <div class="accounts-toolbar">
@@ -70,7 +62,7 @@
                     <span class="sr-only">{{ t("accountsFilterStatus") }}</span>
                     <select v-model="statusFilter" :aria-label="t('accountsFilterStatus')">
                         <option value="all">{{ t("accountsAllStatuses") }}</option>
-                        <option value="available">{{ t("accountsAvailable") }}</option>
+                        <option value="ready">{{ t("accountsAvailable") }}</option>
                         <option value="cooldown">{{ t("healthCooldown") }}</option>
                         <option value="reauth">{{ t("healthReauth") }}</option>
                         <option value="disabled">{{ t("healthDisabled") }}</option>
@@ -166,11 +158,7 @@
                         </tr>
                     </thead>
                     <tbody>
-                        <tr
-                            v-for="account in filteredAccounts"
-                            :key="account.index"
-                            :class="{ 'is-current': account.index === currentAuthIndex }"
-                        >
+                        <tr v-for="account in filteredAccounts" :key="account.index">
                             <td>
                                 <el-checkbox
                                     :model-value="selected.has(account.index)"
@@ -185,9 +173,6 @@
                                     <strong>{{ displayName(account) }}</strong>
                                 </button>
                                 <div class="accounts-tags">
-                                    <span v-if="account.index === currentAuthIndex" class="accounts-tag is-current">{{
-                                        t("tagCurrent")
-                                    }}</span>
                                     <span v-if="account.isInvalid" class="accounts-tag is-issue">{{
                                         t("jsonFormatError")
                                     }}</span>
@@ -197,7 +182,8 @@
                                     <span v-if="account.isExpired" class="accounts-tag is-issue">{{
                                         t("tagExpired")
                                     }}</span>
-                                    <span v-if="account.hasContext" class="accounts-tag">{{
+                                    <span v-if="account.serving" class="accounts-tag">{{ t("consoleWarmed") }}</span>
+                                    <span v-else-if="account.hasContext" class="accounts-tag">{{
                                         t("accountsContextReady")
                                     }}</span>
                                 </div>
@@ -240,49 +226,16 @@
                             </td>
                             <td>
                                 <div class="accounts-row-actions">
-                                    <button type="button" class="accounts-text-button" @click="openDetails(account)">
-                                        {{ t("usageDetails") }}
-                                    </button>
-                                    <button
-                                        type="button"
-                                        class="accounts-text-button"
-                                        :disabled="isBusy || account.isInvalid"
-                                        @click="
-                                            emit(
-                                                'health',
-                                                account,
-                                                account.health?.mode === 'disabled' ? 'enable' : 'disable'
-                                            )
-                                        "
-                                    >
-                                        {{ t(account.health?.mode === "disabled" ? "healthEnable" : "healthDisable") }}
-                                    </button>
-                                    <button
-                                        v-if="canRetryWithoutReauth(account)"
-                                        type="button"
-                                        class="accounts-text-button"
-                                        :disabled="isBusy"
-                                        @click="emit('health', account)"
-                                    >
-                                        {{ t("accountsRetryWithoutReauth") }}
-                                    </button>
-                                    <button
-                                        v-if="canReauthenticate(account)"
-                                        type="button"
-                                        class="accounts-text-button"
-                                        :disabled="isBusy"
-                                        @click="emit('reauth', account.index)"
-                                    >
-                                        {{ t("accountsReauthenticate") }}
-                                    </button>
-                                    <button
-                                        type="button"
-                                        class="accounts-text-button"
-                                        :disabled="isBusy || account.index === currentAuthIndex || !account.isRotation"
-                                        @click="emit('switch', account.index)"
-                                    >
-                                        {{ t("btnSwitchAccount") }}
-                                    </button>
+                                    <AccountActions
+                                        :account="account"
+                                        :is-busy="isBusy"
+                                        :t="t"
+                                        @details="openDetails"
+                                        @health="(item, action) => emit('health', item, action)"
+                                        @reauth="index => emit('reauth', index)"
+                                        @download="index => emit('download', index)"
+                                        @delete="index => emit('delete', index)"
+                                    />
                                 </div>
                             </td>
                         </tr>
@@ -308,13 +261,11 @@
                         }}</span>
                     </div>
                     <div class="accounts-tags">
-                        <span v-if="account.index === currentAuthIndex" class="accounts-tag is-current">{{
-                            t("tagCurrent")
-                        }}</span>
                         <span v-if="account.isInvalid" class="accounts-tag is-issue">{{ t("jsonFormatError") }}</span>
                         <span v-if="account.isDuplicate" class="accounts-tag is-issue">{{ t("duplicateAuth") }}</span>
                         <span v-if="account.isExpired" class="accounts-tag is-issue">{{ t("tagExpired") }}</span>
-                        <span v-if="account.hasContext" class="accounts-tag">{{ t("accountsContextReady") }}</span>
+                        <span v-if="account.serving" class="accounts-tag">{{ t("consoleWarmed") }}</span>
+                        <span v-else-if="account.hasContext" class="accounts-tag">{{ t("accountsContextReady") }}</span>
                     </div>
                     <p
                         v-if="account.health?.mode === 'cooldown' && account.health?.until"
@@ -347,43 +298,16 @@
                         </div>
                     </dl>
                     <div class="accounts-card-actions">
-                        <button type="button" class="accounts-text-button" @click="openDetails(account)">
-                            {{ t("usageDetails") }}
-                        </button>
-                        <button
-                            type="button"
-                            class="accounts-text-button"
-                            :disabled="isBusy || account.isInvalid"
-                            @click="emit('health', account, account.health?.mode === 'disabled' ? 'enable' : 'disable')"
-                        >
-                            {{ t(account.health?.mode === "disabled" ? "healthEnable" : "healthDisable") }}
-                        </button>
-                        <button
-                            v-if="canRetryWithoutReauth(account)"
-                            type="button"
-                            class="accounts-text-button"
-                            :disabled="isBusy"
-                            @click="emit('health', account)"
-                        >
-                            {{ t("accountsRetryWithoutReauth") }}
-                        </button>
-                        <button
-                            v-if="canReauthenticate(account)"
-                            type="button"
-                            class="accounts-text-button"
-                            :disabled="isBusy"
-                            @click="emit('reauth', account.index)"
-                        >
-                            {{ t("accountsReauthenticate") }}
-                        </button>
-                        <button
-                            type="button"
-                            class="accounts-text-button"
-                            :disabled="isBusy || account.index === currentAuthIndex || !account.isRotation"
-                            @click="emit('switch', account.index)"
-                        >
-                            {{ t("btnSwitchAccount") }}
-                        </button>
+                        <AccountActions
+                            :account="account"
+                            :is-busy="isBusy"
+                            :t="t"
+                            @details="openDetails"
+                            @health="(item, action) => emit('health', item, action)"
+                            @reauth="index => emit('reauth', index)"
+                            @download="index => emit('download', index)"
+                            @delete="index => emit('delete', index)"
+                        />
                     </div>
                 </article>
             </div>
@@ -401,9 +325,6 @@
                     <span class="accounts-health" :class="`is-${healthTone(selectedAccount)}`">{{
                         healthLabel(selectedAccount)
                     }}</span>
-                    <span v-if="selectedAccount.index === currentAuthIndex" class="accounts-tag is-current">{{
-                        t("tagCurrent")
-                    }}</span>
                     <span v-if="selectedAccount.isInvalid" class="accounts-tag is-issue">{{
                         t("jsonFormatError")
                     }}</span>
@@ -411,7 +332,10 @@
                         t("duplicateAuth")
                     }}</span>
                     <span v-if="selectedAccount.isExpired" class="accounts-tag is-issue">{{ t("tagExpired") }}</span>
-                    <span v-if="selectedAccount.hasContext" class="accounts-tag">{{ t("accountsContextReady") }}</span>
+                    <span v-if="selectedAccount.serving" class="accounts-tag">{{ t("consoleWarmed") }}</span>
+                    <span v-else-if="selectedAccount.hasContext" class="accounts-tag">{{
+                        t("accountsContextReady")
+                    }}</span>
                 </div>
                 <p
                     v-if="selectedAccount.health?.mode === 'cooldown' && selectedAccount.health?.until"
@@ -463,20 +387,15 @@
                     >
                         {{ t("accountsReauthenticate") }}
                     </button>
-                    <button
-                        type="button"
-                        class="accounts-button"
-                        :disabled="isBusy || selectedAccount.isInvalid"
-                        @click="
-                            emit(
-                                'health',
-                                selectedAccount,
-                                selectedAccount.health?.mode === 'disabled' ? 'enable' : 'disable'
-                            )
-                        "
-                    >
-                        {{ t(selectedAccount.health?.mode === "disabled" ? "healthEnable" : "healthDisable") }}
-                    </button>
+                    <div class="accounts-detail-enabled">
+                        <span>{{ t("accountsEnabled") }}</span>
+                        <el-switch
+                            :model-value="selectedAccount.health?.mode !== 'disabled'"
+                            :disabled="isBusy || selectedAccount.isInvalid"
+                            :aria-label="t('accountsEnabledNamed', { index: selectedAccount.index })"
+                            :before-change="toggleSelectedEnabled"
+                        />
+                    </div>
                     <button
                         v-if="canRetryWithoutReauth(selectedAccount) || selectedAccount.health?.mode === 'cooldown'"
                         type="button"
@@ -486,14 +405,7 @@
                     >
                         {{ healthActionLabel(selectedAccount) }}
                     </button>
-                    <button
-                        type="button"
-                        class="accounts-button"
-                        :disabled="isBusy || selectedAccount.index === currentAuthIndex || !selectedAccount.isRotation"
-                        @click="emit('switch', selectedAccount.index)"
-                    >
-                        {{ t("btnSwitchAccount") }}
-                    </button>
+
                     <button type="button" class="accounts-button" @click="emit('download', selectedAccount.index)">
                         {{ t("download") }}
                     </button>
@@ -545,14 +457,12 @@
 
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import AccountActions from "./AccountActions.vue";
 
 const props = defineProps({
     accounts: { default: () => [], type: Array },
-    currentAuthIndex: { default: -1, type: Number },
-    failureCount: { default: null, type: [String, Number] },
     isBusy: { default: false, type: Boolean },
     t: { required: true, type: Function },
-    usageCount: { default: null, type: [String, Number] },
 });
 const emit = defineEmits([
     "add",
@@ -564,7 +474,6 @@ const emit = defineEmits([
     "health",
     "reauth",
     "refresh",
-    "switch",
     "upload",
 ]);
 const t = (key, options) => props.t(key, options);
@@ -582,6 +491,13 @@ const statsLoading = ref(false);
 const selected = ref(new Set());
 const selectedAccount = ref(null);
 const detailsOpen = ref(false);
+const toggleSelectedEnabled = () => {
+    const account = selectedAccount.value;
+    if (account && !props.isBusy && !account.isInvalid) {
+        emit("health", account, account.health?.mode === "disabled" ? "enable" : "disable");
+    }
+    return false;
+};
 const recentAttempts = ref([]);
 const attemptsLoading = ref(false);
 const attemptsError = ref("");
@@ -610,6 +526,9 @@ const healthLabel = account => {
     if (tone === "cooldown") return t("healthCooldown");
     if (tone === "reauth") return t("healthReauth");
     if (tone === "disabled") return t("healthDisabled");
+    if (account.health?.probeRequired) {
+        return t(account.health.probeInFlight ? "consoleProbing" : "consoleProbeRequired");
+    }
     return tone === "ready" ? t("accountsAvailable") : t("accountsExcluded");
 };
 const canReauthenticate = account => !account.isInvalid && (account.isExpired || account.health?.mode === "reauth");
@@ -1176,6 +1095,12 @@ defineExpose({ clearSelection: () => (selected.value = new Set()), refresh });
 }
 .accounts-row-actions {
     gap: 10px;
+}
+.accounts-detail-enabled {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 0.85rem;
 }
 .accounts-cards {
     display: none;

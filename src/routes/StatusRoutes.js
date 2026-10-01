@@ -72,6 +72,21 @@ class StatusRoutes {
         });
     }
 
+    _getAccountScheduler() {
+        return this.serverSystem.requestHandler?.accountScheduler || this.serverSystem.accountScheduler;
+    }
+
+    _isAccountBusy(index) {
+        return Boolean(
+            this.serverSystem.connectionRegistry?.hasMessageQueueForAuth?.(index) ||
+            this._getAccountScheduler()?.getAccountLoad(index)?.inFlight > 0
+        );
+    }
+
+    _notifyAccountChange(index) {
+        this._getAccountScheduler()?.notifyAccountChange(index);
+    }
+
     /**
      * Setup status and management routes
      */
@@ -119,12 +134,9 @@ class StatusRoutes {
         });
 
         app.get("/health/ready", (req, res) => {
-            const index = this.serverSystem.requestHandler.currentAuthIndex;
-            const ready =
-                index >= 0 &&
-                this.serverSystem.authSource.getRotationIndices().includes(index) &&
-                Boolean(this.serverSystem.connectionRegistry.getConnectionByAuth(index, false));
-            res.status(ready ? 200 : 503).json({ activeAccount: ready ? index : null, ready });
+            const indices = this.serverSystem.browserManager.getReadyAccountIndices();
+            const ready = indices.length > 0;
+            res.status(ready ? 200 : 503).json({ activeAccount: indices[0] ?? null, ready, readyAccounts: indices });
         });
 
         app.get("/", isAuthenticated, (req, res) => {
@@ -188,15 +200,8 @@ class StatusRoutes {
                     );
                     this.logger.warn("[System] Closing context for invalid auth.");
                     try {
-                        // Terminate pending requests for this account before closing
-                        this.serverSystem.connectionRegistry.closeMessageQueuesForAuth(
-                            currentAuthIndex,
-                            "invalid_auth"
-                        );
-                        // Close context (this will trigger WebSocket disconnect)
-                        await browserManager.closeContext(currentAuthIndex);
-                        // Close WebSocket connection explicitly
-                        this.serverSystem.connectionRegistry.closeConnectionByAuth(currentAuthIndex);
+                        this._notifyAccountChange(currentAuthIndex);
+                        await browserManager._closeContextForPoolIfPossible(currentAuthIndex, "invalid_auth");
                     } catch (err) {
                         this.logger.error(`[System] Error while closing context automatically: ${err.message}`);
                     }
@@ -333,18 +338,10 @@ class StatusRoutes {
                       ? health.setDisabled(index, false)
                       : health.reset(index);
             this.logger.info(`[Auth] Dashboard ${action} account #${index}`);
-            if (action === "disable" && this.serverSystem.requestHandler.currentAuthIndex === index) {
-                if (this.serverSystem.authSource.getRotationIndices().length > 0) {
-                    try {
-                        await this.serverSystem.requestHandler._switchToNextAuth();
-                    } catch (error) {
-                        this.logger.error(`[Auth] Could not switch after disabling #${index}: ${error.message}`);
-                        this.serverSystem.requestHandler.authSwitcher.currentAuthIndex = -1;
-                    }
-                } else {
-                    this.serverSystem.requestHandler.authSwitcher.currentAuthIndex = -1;
-                }
-            }
+            this._notifyAccountChange(index);
+            this.serverSystem.browserManager.rebalanceContextPool().catch(error => {
+                this.logger.warn(`[ContextPool] Account ${action} rebalance failed: ${error.message}`);
+            });
             return res.json({ health: result, index });
         });
 
@@ -406,7 +403,7 @@ class StatusRoutes {
             try {
                 if (this._rejectIfSystemBusy(res)) return;
 
-                const { authSource, requestHandler } = this.serverSystem;
+                const { authSource } = this.serverSystem;
 
                 const duplicateGroups = authSource.getDuplicateGroups() || [];
                 if (duplicateGroups.length === 0) {
@@ -420,23 +417,6 @@ class StatusRoutes {
                     "[Auth] Dedup cleanup will keep the auth file with the highest index per email and delete the other duplicates. " +
                         "Assumption: for the same account, auth indices are created in chronological order (higher index = newer)."
                 );
-
-                const currentAuthIndex = requestHandler.currentAuthIndex;
-                if (Number.isInteger(currentAuthIndex) && currentAuthIndex >= 0) {
-                    const canonicalCurrent = authSource.getCanonicalIndex(currentAuthIndex);
-                    if (canonicalCurrent !== null && canonicalCurrent !== currentAuthIndex) {
-                        this.logger.warn(
-                            `[Auth] Current active auth #${currentAuthIndex} is a duplicate. Switching to the latest auth #${canonicalCurrent} before cleanup.`
-                        );
-                        const switchResult = await requestHandler._switchToSpecificAuth(canonicalCurrent);
-                        if (!switchResult.success) {
-                            return res.status(409).json({
-                                message: "accountDedupSwitchFailed",
-                                reason: switchResult.reason,
-                            });
-                        }
-                    }
-                }
 
                 const removedIndices = [];
                 const failed = [];
@@ -460,6 +440,7 @@ class StatusRoutes {
                     for (const index of removed) {
                         try {
                             authSource.removeAuth(index);
+                            this._notifyAccountChange(index);
                             removedIndices.push(index);
                         } catch (error) {
                             failed.push({ error: error.message, index });
@@ -485,8 +466,7 @@ class StatusRoutes {
                 if (removedIndices.length > 0) {
                     for (const idx of removedIndices) {
                         try {
-                            await this.serverSystem.browserManager.closeContext(idx);
-                            this.serverSystem.connectionRegistry.closeConnectionByAuth(idx);
+                            await this.serverSystem.browserManager._closeContextForPoolIfPossible(idx, "deduplicate");
                         } catch (error) {
                             this.logger.warn(
                                 `[Auth] Failed to close context for removed duplicate #${idx}: ${error.message}`
@@ -554,9 +534,11 @@ class StatusRoutes {
 
             // Check if current active account is included in VALID indices
             const includesCurrent = validIndices.includes(currentAuthIndex);
-            if (includesCurrent && !force) {
+            const busyIndices = validIndices.filter(index => this._isAccountBusy(index));
+            if ((includesCurrent || busyIndices.length > 0) && !force) {
                 return res.status(409).json({
-                    includesCurrent: true,
+                    busyIndices,
+                    includesCurrent,
                     message: "warningDeleteCurrentAccount",
                     requiresConfirmation: true,
                 });
@@ -571,6 +553,7 @@ class StatusRoutes {
             for (const targetIndex of validIndices) {
                 try {
                     authSource.removeAuth(targetIndex);
+                    this._notifyAccountChange(targetIndex);
                     successIndices.push(targetIndex);
                     this.logger.warn(`[WebUI] Account #${targetIndex} deleted via batch delete.`);
                 } catch (error) {
@@ -584,43 +567,10 @@ class StatusRoutes {
                 authSource.reloadAuthSources();
             }
 
-            // If current active account was deleted, close context first, then connection
-            if (includesCurrent && successIndices.includes(currentAuthIndex)) {
-                this.logger.warn(
-                    `[WebUI] Current active account #${currentAuthIndex} was deleted. Closing context and connection...`
-                );
-                // Set system busy flag to prevent new requests during cleanup
-                const previousBusy = this.serverSystem.requestHandler.isSystemBusy === true;
-                if (!previousBusy) {
-                    this.serverSystem.requestHandler.isSystemBusy = true;
-                }
-                try {
-                    // 1. Terminate pending requests for the current account
-                    this.serverSystem.connectionRegistry.closeMessageQueuesForAuth(
-                        currentAuthIndex,
-                        "account_deleted_current"
-                    );
-                    // 2. Close context first so page is gone when _removeConnection checks
-                    await this.serverSystem.browserManager.closeContext(currentAuthIndex);
-                    // 3. Then close WebSocket connection
-                    this.serverSystem.connectionRegistry.closeConnectionByAuth(currentAuthIndex);
-                } finally {
-                    // Reset system busy flag after cleanup completes
-                    if (!previousBusy) {
-                        this.serverSystem.requestHandler.isSystemBusy = false;
-                    }
-                }
-            }
-
-            // Close contexts and connections for all successfully deleted accounts (except current, already handled)
             for (const idx of successIndices) {
-                if (idx !== currentAuthIndex) {
-                    this.logger.info(`[WebUI] Closing context and connection for deleted account #${idx}...`);
-                    // Close context first so page is gone when _removeConnection checks
-                    await this.serverSystem.browserManager.closeContext(idx);
-                    // Then close WebSocket connection
-                    this.serverSystem.connectionRegistry.closeConnectionByAuth(idx);
-                }
+                this.serverSystem.connectionRegistry.closeMessageQueuesForAuth(idx, "account_deleted");
+                await this.serverSystem.browserManager.closeContext(idx);
+                this.serverSystem.connectionRegistry.closeConnectionByAuth(idx);
             }
 
             // Rebalance context pool after batch delete
@@ -755,7 +705,7 @@ class StatusRoutes {
             }
 
             // If deleting current account without confirmation, return warning
-            if (targetIndex === currentAuthIndex && !forceDelete) {
+            if ((targetIndex === currentAuthIndex || this._isAccountBusy(targetIndex)) && !forceDelete) {
                 return res.status(409).json({
                     index: targetIndex,
                     message: "warningDeleteCurrentAccount",
@@ -771,6 +721,7 @@ class StatusRoutes {
             try {
                 // Delete auth file
                 authSource.removeAuth(targetIndex);
+                this._notifyAccountChange(targetIndex);
 
                 // Reload auth sources to update internal state immediately
                 authSource.reloadAuthSources();
@@ -778,30 +729,9 @@ class StatusRoutes {
                 // Always close context first, then connection
                 this.logger.info(`[WebUI] Account #${targetIndex} deleted. Closing context and connection...`);
 
-                if (targetIndex === currentAuthIndex) {
-                    // Set system busy flag to prevent new requests during cleanup
-                    const previousBusy = this.serverSystem.requestHandler.isSystemBusy === true;
-                    if (!previousBusy) {
-                        this.serverSystem.requestHandler.isSystemBusy = true;
-                    }
-                    try {
-                        // If deleting the current account, terminate its pending requests first
-                        this.serverSystem.connectionRegistry.closeMessageQueuesForAuth(targetIndex, "account_deleted");
-                        // Close context first so page is gone when _removeConnection checks
-                        await this.serverSystem.browserManager.closeContext(targetIndex);
-                        // Then close WebSocket connection
-                        this.serverSystem.connectionRegistry.closeConnectionByAuth(targetIndex);
-                    } finally {
-                        // Reset system busy flag after cleanup completes
-                        if (!previousBusy) {
-                            this.serverSystem.requestHandler.isSystemBusy = false;
-                        }
-                    }
-                } else {
-                    // Non-current account: no need for system busy flag
-                    await this.serverSystem.browserManager.closeContext(targetIndex);
-                    this.serverSystem.connectionRegistry.closeConnectionByAuth(targetIndex);
-                }
+                this.serverSystem.connectionRegistry.closeMessageQueuesForAuth(targetIndex, "account_deleted");
+                await this.serverSystem.browserManager.closeContext(targetIndex);
+                this.serverSystem.connectionRegistry.closeConnectionByAuth(targetIndex);
 
                 // Rebalance context pool after delete
                 this.serverSystem.browserManager.rebalanceContextPool().catch(err => {
@@ -918,10 +848,6 @@ class StatusRoutes {
 
         app.put("/api/settings/check-update", isAuthenticated, (req, res) =>
             this._toggleRuntimeSetting(res, "checkUpdate")
-        );
-
-        app.put("/api/settings/enable-auth-update", isAuthenticated, (req, res) =>
-            this._toggleRuntimeSetting(res, "enableAuthUpdate")
         );
 
         app.put("/api/settings/safety-settings-threshold", isAuthenticated, (req, res) => {
@@ -1142,7 +1068,25 @@ class StatusRoutes {
             const hasContext = browserManager.contexts.has(index);
 
             const health = authSource.health.getStatus(index);
-            return { canonicalIndex, hasContext, health, index, isDuplicate, isExpired, isInvalid, isRotation, name };
+            const serving = Boolean(browserManager.isAccountReady?.(index) && authSource.health.isAvailable(index));
+            const load = requestHandler.accountScheduler?.getAccountLoad(index) || {
+                conversations: 0,
+                inFlight: 0,
+                waiting: 0,
+            };
+            return {
+                canonicalIndex,
+                hasContext,
+                health,
+                index,
+                isDuplicate,
+                isExpired,
+                isInvalid,
+                isRotation,
+                name,
+                serving,
+                ...load,
+            };
         });
 
         const currentAuthIndex = requestHandler.currentAuthIndex;
@@ -1168,16 +1112,18 @@ class StatusRoutes {
             ),
             status: {
                 accountDetails,
+                accountPool: requestHandler.accountScheduler?.getSnapshot() || null,
                 activeContextsCount: browserManager.contexts.size,
                 apiKeySource: config.apiKeySource,
-                browserConnected: !!this.serverSystem.connectionRegistry.getConnectionByAuth(currentAuthIndex, false),
+                browserConnected: browserManager.getReadyAccountIndices
+                    ? browserManager.getReadyAccountIndices().length > 0
+                    : !!this.serverSystem.connectionRegistry.getConnectionByAuth(currentAuthIndex, false),
                 cacheStats: requestHandler.cacheManager?.stats() || null,
                 checkUpdate: config.checkUpdate,
                 currentAccountName,
                 currentAuthIndex,
                 debugMode: LoggingService.isDebugEnabled(),
                 duplicateIndicesRaw: duplicateIndices,
-                enableAuthUpdate: config.enableAuthUpdate,
                 expiredIndicesRaw: expiredIndices,
                 failureCount,
                 forceCodeExecution: config.forceCodeExecution,

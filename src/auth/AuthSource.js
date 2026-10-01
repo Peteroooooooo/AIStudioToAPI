@@ -16,9 +16,9 @@ const AccountHealth = require("./AccountHealth");
  * Responsible for loading and managing authentication information from the file system
  */
 class AuthSource {
-    constructor(logger) {
+    constructor(logger, config = {}) {
         this.logger = logger;
-        this.health = new AccountHealth(logger);
+        this.health = new AccountHealth(logger, undefined, undefined, config);
         this.authMode = "file";
         this.availableIndices = [];
         // Indices used for rotation/switching (deduplicated by email, keeping the latest index per account)

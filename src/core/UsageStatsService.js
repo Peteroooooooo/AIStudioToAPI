@@ -131,6 +131,10 @@ class UsageStatsService {
             requestAttemptId === undefined
                 ? this.connectionRegistry?.getRequestAttemptIdForRequest(requestId)
                 : requestAttemptId;
+        if (tracker.attempts.length === 0) {
+            tracker.initialAuthIndex = normalizedAuthIndex;
+            tracker.initialAccountName = resolvedAccountName;
+        }
         this._pushAttempt(tracker, normalizedAuthIndex, resolvedAccountName, queueAttemptId);
     }
 
@@ -190,6 +194,11 @@ class UsageStatsService {
         const finishedAtMs = Date.now();
         const lastAttempt = tracker.attempts[tracker.attempts.length - 1] || null;
         const lastParsed = lastAttempt?.accountKey ? this._parseAccountKey(lastAttempt.accountKey) : {};
+        if (!lastAttempt) {
+            tracker.initialAuthIndex = null;
+            tracker.initialAccountName = null;
+            result = { ...result, finalAccountName: null, finalAuthIndex: null };
+        }
         const finalAuthIndex =
             this._normalizeAuthIndex(result.finalAuthIndex) ?? lastParsed.authIndex ?? tracker.initialAuthIndex ?? null;
         const finalAccountName =

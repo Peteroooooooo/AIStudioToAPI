@@ -84,7 +84,7 @@ class ProxyServerSystem extends EventEmitter {
         LoggingService.setLevel(this.config.logLevel);
         configLoader._printConfiguration(this.config);
 
-        this.authSource = new AuthSource(this.logger);
+        this.authSource = new AuthSource(this.logger, this.config);
         this.authCredentialEpochs = new Map();
         this.browserManager = new BrowserManager(this.logger, this.config, this.authSource);
         this.modelCatalogStore.setNativeCatalogFetcher(() => this.browserManager.fetchNativeModelCatalog());
@@ -186,23 +186,35 @@ class ProxyServerSystem extends EventEmitter {
     }
 
     _recordBackendOutcome(outcome) {
-        if (outcome.requestId?.startsWith("cache_resource_")) return;
-        if (this.requestHandler?.cacheManager.consumeCachedAttemptOutcome(outcome)) return;
+        const isCacheMaintenance = outcome.requestId?.startsWith("cache_resource_");
+        // Maintenance shares the account quota, but its other outcomes must not
+        // reset generation health or turn an optional cache error into quarantine.
+        if (isCacheMaintenance && (outcome.success || Number(outcome.status) !== 429)) return;
+        if (!isCacheMaintenance && this.requestHandler?.cacheManager.consumeCachedAttemptOutcome(outcome)) return;
         // Requests started with the previous credential may finish after VNC reauth.
         // Their failures must not quarantine the newly saved credential.
         if (outcome.authCredentialEpoch !== this.getAuthCredentialEpoch(outcome.authIndex)) return;
+        const before = this.authSource.health.getStatus(outcome.authIndex);
         if (outcome.success) {
-            this.authSource.health.recordSuccess(outcome.authIndex);
+            this.authSource.health.recordSuccess(outcome.authIndex, outcome.requestId, outcome.healthEpoch);
         } else {
-            const wasAvailable = this.authSource.health.isAvailable(outcome.authIndex);
-            const status = this.authSource.health.recordFailure(outcome.authIndex, outcome.status, outcome.requestId);
-            if (wasAvailable && status.mode !== "active") {
+            const status = this.authSource.health.recordFailure(
+                outcome.authIndex,
+                outcome.status,
+                outcome.requestId,
+                outcome.healthEpoch
+            );
+            if (before.mode === "active" && status.mode !== "active") {
                 setImmediate(() => {
                     this.browserManager.rebalanceContextPool().catch(error => {
                         this.logger.error(`[Auth] Could not rebalance after account quarantine: ${error.message}`);
                     });
                 });
             }
+        }
+        const after = this.authSource.health.getStatus(outcome.authIndex);
+        if (JSON.stringify(before) !== JSON.stringify(after)) {
+            this.requestHandler?.accountScheduler?.notifyAccountChange?.(outcome.authIndex);
         }
     }
 
