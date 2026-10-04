@@ -31,6 +31,9 @@ class GeminiCacheManager {
         this.queuedTasks = 0;
         this.accountUses = new Map();
         this.lastCurrentAuthIndex = null;
+        this.resourceTimeoutMs = 60_000;
+        this.activeMaintenance = new Map();
+        this.closing = false;
         this.metrics = { created: 0, createFailed: 0, fallbacks: 0, localHits: 0, renewals: 0 };
     }
 
@@ -102,7 +105,8 @@ class GeminiCacheManager {
     }
 
     _canMaintain(info) {
-        if (!this.config.cacheEnabled || !this.handler.authSource?.health?.isAvailable(info.authIndex)) return false;
+        if (this.closing || !this.config.cacheEnabled || !this.handler.authSource?.health?.isAvailable(info.authIndex))
+            return false;
         if ((this.maintenanceRetryAfter.get(this._maintenanceKey(info)) || 0) > Date.now()) return false;
         const connection = this.handler.connectionRegistry.getConnectionByAuth(info.authIndex, false);
         if (!connection || connection.readyState !== 1) return false;
@@ -263,6 +267,7 @@ class GeminiCacheManager {
         const attempt = {
             ...info,
             activeHit: Boolean(usable),
+            bypass,
             hit: usable ? match.entry : null,
             prefixLength: usable ? match.prefixLength : null,
         };
@@ -298,6 +303,17 @@ class GeminiCacheManager {
         this.metrics.localHits++;
         this.logger.info(`[Cache] Using a ${match.prefixLength}-message Gemini prefix on account #${authIndex}.`);
         return { ...proxyRequest, body: JSON.stringify(body) };
+    }
+
+    describeAttempt(proxyRequest) {
+        const attempt = this.attempts.get(proxyRequest);
+        if (!attempt) return null;
+        return {
+            expiresAt: attempt.hit?.expireTime || null,
+            prefixLength: attempt.prefixLength,
+            state: attempt.bypass ? "fallback" : attempt.hit ? "selected" : "miss",
+            upstreamExpiresAt: attempt.hit?.upstreamExpireTime || attempt.hit?.expireTime || null,
+        };
     }
 
     canFallback(proxyRequest, error) {
@@ -415,7 +431,7 @@ class GeminiCacheManager {
     }
 
     _schedule(task) {
-        if (this.queuedTasks >= 16) return false;
+        if (this.closing || this.queuedTasks >= 16) return false;
         this.queuedTasks++;
         this.background = this.background
             .then(() => task())
@@ -614,6 +630,7 @@ class GeminiCacheManager {
                             prefixLength: entry.prefixLength,
                             scopeKey: info.scopeKey,
                             tokenCount: entry.tokenCount,
+                            ttlStartAt: new Date().toISOString(),
                         });
                         this.metrics.renewals++;
                     }
@@ -650,12 +667,17 @@ class GeminiCacheManager {
         if (
             !this._schedule(async () => {
                 try {
+                    let processed = 0;
                     for (const entry of this.store.pendingDeleteEntries()) {
+                        // Yield old-resource cleanup to queued cache creation/renewal.
+                        if (processed >= 4 || (processed > 0 && this.queuedTasks > 1)) break;
                         const key = this._cacheUseKey(entry);
                         if (this.activeCacheUses.has(key)) continue;
                         const authIndex = this._connectedDeleteAccount(entry);
                         if (authIndex === null) continue;
+                        if (this.handler.accountScheduler?.getAccountLoad?.(authIndex)?.inFlight > 0) continue;
                         if ((this.deleteRetryAfter.get(key) || 0) > Date.now()) continue;
+                        processed++;
                         try {
                             await this._resourceRequest(authIndex, { method: "DELETE", path: `/v1beta/${entry.name}` });
                         } catch (error) {
@@ -690,6 +712,12 @@ class GeminiCacheManager {
         const connection = Number.isInteger(authIndex)
             ? this.handler.connectionRegistry.getConnectionByAuth(authIndex, false)
             : null;
+        if (
+            Number.isInteger(authIndex) &&
+            (!this.handler.authSource.health?.isAvailable(authIndex) ||
+                this.handler.authSource.health?.getStatus?.(authIndex)?.probeRequired)
+        )
+            return null;
         if (connection?.readyState !== 1) {
             this.disconnectedDeleteOwners.add(entry.accountKey);
             return null;
@@ -703,6 +731,8 @@ class GeminiCacheManager {
     }
 
     async _resourceRequest(authIndex, { body, method, path, queryParams = {} }) {
+        if (this.closing || this.handler.authSource.health?.isAvailable(authIndex) === false)
+            throw new Error("Account is unavailable for cache maintenance.");
         // Cache maintenance is not a client generation attempt and must not
         // reset or trip the account-health failure counter.
         const requestId = `cache_resource_${this.handler._generateRequestId()}`;
@@ -722,15 +752,35 @@ class GeminiCacheManager {
             authIndex,
             proxyRequest.request_attempt_id
         );
+        const deadline = Date.now() + this.resourceTimeoutMs;
+        let completed = false;
+        const cancel = () => {
+            this.handler._cancelBrowserRequest?.(requestId, authIndex, proxyRequest.request_attempt_id);
+            queue.close?.("cache_resource_cancelled");
+            this.handler.connectionRegistry.removeMessageQueue(requestId, "cache_resource_cancelled");
+        };
+        this.activeMaintenance.set(requestId, { authIndex, cancel });
+        const timer = setTimeout(cancel, this.resourceTimeoutMs);
+        timer.unref?.();
+        const receive = () => {
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) throw Object.assign(new Error("Cache maintenance deadline exceeded."), { status: 504 });
+            if (this.handler.authSource.health?.isAvailable(authIndex) === false)
+                throw new Error("Account disabled during cache maintenance.");
+            return queue.dequeue(remaining);
+        };
         try {
             this.handler._forwardRequest(proxyRequest, authIndex);
-            const first = await queue.dequeue(60000);
+            const first = await receive();
             if (first.event_type === "error" || Number(first.status) >= 400) {
                 const error = new Error(`Gemini cache resource request failed (${first.status || "unknown"}).`);
                 error.status = Number(first.status);
                 throw error;
             }
-            if (first.type === "STREAM_END") return {};
+            if (first.type === "STREAM_END") {
+                completed = true;
+                return {};
+            }
             const chunks = [];
             let bytes = 0;
             if (first.event_type === "chunk" && first.data) {
@@ -740,7 +790,7 @@ class GeminiCacheManager {
             }
             // eslint-disable-next-line no-constant-condition
             while (true) {
-                const message = await queue.dequeue(60000);
+                const message = await receive();
                 if (message.type === "STREAM_END") break;
                 if (message.event_type === "error") {
                     const error = new Error(`Gemini cache resource request failed (${message.status || "unknown"}).`);
@@ -754,6 +804,7 @@ class GeminiCacheManager {
                     chunks.push(chunk);
                 }
             }
+            completed = true;
             if (method === "DELETE" || chunks.length === 0) return {};
             const result = JSON.parse(Buffer.concat(chunks).toString("utf8"));
             if (result.error) {
@@ -763,8 +814,15 @@ class GeminiCacheManager {
             }
             return result;
         } finally {
+            clearTimeout(timer);
+            this.activeMaintenance.delete(requestId);
+            if (!completed) cancel();
             this.handler.connectionRegistry.removeMessageQueue(requestId, "cache_resource_complete");
         }
+    }
+
+    cancelAccountMaintenance(authIndex) {
+        for (const request of this.activeMaintenance.values()) if (request.authIndex === authIndex) request.cancel();
     }
 
     stats() {
@@ -772,6 +830,8 @@ class GeminiCacheManager {
     }
 
     async close() {
+        this.closing = true;
+        for (const request of this.activeMaintenance.values()) request.cancel();
         while (this.queuedTasks > 0) await this.background;
         await this.store.close();
         this._deleteEvicted();

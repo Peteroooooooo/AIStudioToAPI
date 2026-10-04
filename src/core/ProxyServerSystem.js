@@ -186,11 +186,13 @@ class ProxyServerSystem extends EventEmitter {
     }
 
     _recordBackendOutcome(outcome) {
+        // Manual tests commit health only after validating actual generated text.
+        if (this.authSource.health.isManualProbe?.(outcome.authIndex, outcome.requestId)) return;
         const isCacheMaintenance = outcome.requestId?.startsWith("cache_resource_");
         // Maintenance shares the account quota, but its other outcomes must not
         // reset generation health or turn an optional cache error into quarantine.
         if (isCacheMaintenance && (outcome.success || Number(outcome.status) !== 429)) return;
-        if (!isCacheMaintenance && this.requestHandler?.cacheManager.consumeCachedAttemptOutcome(outcome)) return;
+        if (!isCacheMaintenance && this.requestHandler?.cacheManager?.consumeCachedAttemptOutcome(outcome)) return;
         // Requests started with the previous credential may finish after VNC reauth.
         // Their failures must not quarantine the newly saved credential.
         if (outcome.authCredentialEpoch !== this.getAuthCredentialEpoch(outcome.authIndex)) return;
@@ -202,8 +204,20 @@ class ProxyServerSystem extends EventEmitter {
                 outcome.authIndex,
                 outcome.status,
                 outcome.requestId,
-                outcome.healthEpoch
+                outcome.healthEpoch,
+                {
+                    model: this.usageStatsService?.getRequest(outcome.requestId)?.model,
+                    transportFailure: outcome.transportFailure === true,
+                }
             );
+            if (
+                outcome.transportFailure &&
+                outcome.healthEpoch === this.authSource.health.getEpoch(outcome.authIndex)
+            ) {
+                this.browserManager.markAccountTransportFailure?.(outcome.authIndex, outcome.terminationReason);
+            } else if (outcome.transportFailure && before.mode === "active" && status.mode === "disabled") {
+                this.browserManager.markAccountTransportFailure?.(outcome.authIndex, outcome.terminationReason);
+            }
             if (before.mode === "active" && status.mode !== "active") {
                 setImmediate(() => {
                     this.browserManager.rebalanceContextPool().catch(error => {
@@ -696,6 +710,7 @@ class ProxyServerSystem extends EventEmitter {
                 this.connectionRegistry.addConnection(ws, {
                     address: req.socket.remoteAddress,
                     authIndex,
+                    contextGeneration: url.searchParams.get("contextGeneration"),
                 });
             });
         });

@@ -37,6 +37,73 @@ function cacheArguments(googleRequest, overrides = {}) {
     };
 }
 
+test("local TTL caps a longer upstream expiry, hits never extend it and remote cleanup retains upstream expiry", async () => {
+    const { dataDir, store } = temporaryStore({ cacheMaxEntries: 10, cacheTtlSeconds: 3600 });
+    try {
+        const args = cacheArguments(request("system"), { expireTime: new Date(Date.now() + 86_400_000).toISOString() });
+        const entry = await store.put(args);
+        assert.equal(Date.parse(entry.expireTime) - Date.parse(entry.ttlStartAt), 3_600_000);
+        assert.equal(entry.upstreamExpireTime, args.expireTime);
+        await store.recordHit(entry);
+        assert.equal(store.entries.get(entry.hash).expireTime, entry.expireTime);
+        const current = store.entries.get(entry.hash);
+        current.createdAt = current.ttlStartAt = new Date(Date.now() - 7_200_000).toISOString();
+        assert.equal(store.findLongest(args), null);
+        await store.pending;
+        assert.equal(store.entries.size, 0);
+        assert.equal(store.pendingDeleteEntries()[0].expireTime, args.expireTime);
+    } finally {
+        await store.close();
+        fs.rmSync(dataDir, { force: true, recursive: true });
+    }
+});
+
+test("replacement cache gets a fresh creation deadline and explicit renewal gets its own TTL anchor", async () => {
+    const { dataDir, store } = temporaryStore({ cacheMaxEntries: 10, cacheTtlSeconds: 3600 });
+    try {
+        const args = cacheArguments(request("system"), { expireTime: new Date(Date.now() + 86_400_000).toISOString() });
+        const old = await store.put({ ...args, ttlStartAt: new Date(Date.now() - 3_000_000).toISOString() });
+        const replacement = await store.put({ ...args, name: "cachedContents/replacement" });
+        assert.ok(Date.parse(replacement.expireTime) > Date.parse(old.expireTime) + 2_900_000);
+        const renewalAnchor = new Date(Date.now() + 1000).toISOString();
+        const renewed = await store.put({ ...args, name: replacement.name, ttlStartAt: renewalAnchor });
+        assert.equal(renewed.createdAt, replacement.createdAt);
+        assert.equal(Date.parse(renewed.expireTime) - Date.parse(renewed.ttlStartAt), 3_600_000);
+    } finally {
+        await store.close();
+        fs.rmSync(dataDir, { force: true, recursive: true });
+    }
+});
+
+test("legacy index with twenty-four-hour expiry obeys local TTL after restart", async () => {
+    const { dataDir, store } = temporaryStore();
+    try {
+        const entry = await store.put(
+            cacheArguments(request("system"), { expireTime: new Date(Date.now() + 86_400_000).toISOString() })
+        );
+        await store.close();
+        const saved = JSON.parse(fs.readFileSync(store.filePath, "utf8"));
+        saved.entries[0].createdAt = new Date(Date.now() - 7_200_000).toISOString();
+        delete saved.entries[0].ttlStartAt;
+        delete saved.entries[0].upstreamExpireTime;
+        fs.writeFileSync(store.filePath, JSON.stringify(saved));
+        const restored = new GeminiCacheStore({
+            config: { cacheMaxEntries: 10, cacheTtlSeconds: 3600 },
+            dataDir,
+            logger,
+        });
+        try {
+            await restored.pending;
+            assert.equal(restored.stats().entryCount, 0);
+            assert.equal(restored.pendingDeleteEntries()[0].expireTime, entry.expireTime);
+        } finally {
+            await restored.close();
+        }
+    } finally {
+        fs.rmSync(dataDir, { force: true, recursive: true });
+    }
+});
+
 test("matches the longest exact complete-message prefix across sessions and isolates accounts and models", async () => {
     const { dataDir, store } = temporaryStore();
     try {

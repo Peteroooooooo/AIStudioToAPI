@@ -4,7 +4,9 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const { buildOverview, listRequests, parseUsageQuery } = require("../src/core/UsageAnalytics");
+const { buildOverview, listRequests, parseUsageQuery: parseRawUsageQuery } = require("../src/core/UsageAnalytics");
+// These original cases explicitly exercise the retained whole-client-request view.
+const parseUsageQuery = (query, ...args) => parseRawUsageQuery({ view: "requests", ...query }, ...args);
 const UsageStatsService = require("../src/core/UsageStatsService");
 
 test("preflight and queued failures with no backend attempt do not blame a selected account", async t => {
@@ -106,7 +108,7 @@ test("overview summarizes completed requests and attributes them to final accoun
             errorCount: 1,
             retriedRequests: 1,
             successCount: 2,
-            successRate: 50,
+            successRate: 66.7,
             totalRequests: 4,
         }
     );

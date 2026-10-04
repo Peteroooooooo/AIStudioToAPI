@@ -7,7 +7,8 @@
 
 const fs = require("fs");
 const path = require("path");
-const { buildOverview, listRequests } = require("./UsageAnalytics");
+const ConversationLabels = require("./ConversationLabels");
+const { buildOverview, exportRecords, listRequests, projectAttempts } = require("./UsageAnalytics");
 const { normalizeTokenUsage, sumTokenUsage, TokenUsageCapture } = require("./TokenUsage");
 
 class UsageStatsService {
@@ -61,6 +62,16 @@ class UsageStatsService {
         if (this.sequence === undefined) {
             this.sequence = 0;
         }
+        this.conversationLabels = new ConversationLabels(this.enabled ? this.dataDir : null);
+        this.conversationLabels.hydrate(this.records);
+        this._saveConversationLabels();
+    }
+
+    _saveConversationLabels() {
+        if (!this.enabled || !this.conversationLabels.dirty) return;
+        this.appendPromise = this.appendPromise
+            .then(() => this.conversationLabels.flush())
+            .catch(error => this.logger?.warn(`[UsageStats] Could not save conversation labels: ${error.message}`));
     }
 
     startRequest(requestId, meta = {}) {
@@ -98,12 +109,29 @@ class UsageStatsService {
 
         if (patch.apiFormat !== undefined) tracker.apiFormat = patch.apiFormat || tracker.apiFormat;
         if (patch.clientIp !== undefined) tracker.clientIp = patch.clientIp || null;
+        if (typeof patch.conversationId === "string" && /^chat_[1-9]\d*$/.test(patch.conversationId)) {
+            tracker.conversationId = patch.conversationId;
+            Object.assign(tracker, this.conversationLabels.labelFor(patch.conversationId, tracker.startedAt));
+            this._saveConversationLabels();
+            tracker.conversationReused = Boolean(patch.conversationReused);
+            tracker.conversationSource = ["session", "history"].includes(patch.conversationSource)
+                ? patch.conversationSource
+                : "unknown";
+            tracker.conversationMatch = ["session_match", "history_match", "history_unmatched", "first_seen"].includes(
+                patch.conversationMatch
+            )
+                ? patch.conversationMatch
+                : null;
+            tracker.conversationConfigChanged = Boolean(patch.conversationConfigChanged);
+        }
         if (patch.isStreaming !== undefined) tracker.isStreaming = Boolean(patch.isStreaming);
         if (patch.method !== undefined) tracker.method = patch.method || tracker.method;
         if (patch.model !== undefined) tracker.model = patch.model || null;
         if (patch.path !== undefined) tracker.path = patch.path || tracker.path;
         if (patch.requestCategory !== undefined)
             tracker.requestCategory = patch.requestCategory || tracker.requestCategory;
+        if (["queued", "waiting", "leased", "dispatched"].includes(patch.queueState))
+            tracker.queueState = patch.queueState;
         if (patch.streamMode !== undefined) tracker.streamMode = patch.streamMode || null;
 
         if (patch.initialAuthIndex !== undefined) {
@@ -114,7 +142,7 @@ class UsageStatsService {
         }
     }
 
-    recordAttempt(requestId, authIndex, accountName = undefined, requestAttemptId = undefined) {
+    recordAttempt(requestId, authIndex, accountName = undefined, requestAttemptId = undefined, cacheDecision = null) {
         if (!this.enabled) return;
         const tracker = this.activeRequests.get(requestId);
         if (!tracker) return;
@@ -135,7 +163,15 @@ class UsageStatsService {
             tracker.initialAuthIndex = normalizedAuthIndex;
             tracker.initialAccountName = resolvedAccountName;
         }
-        this._pushAttempt(tracker, normalizedAuthIndex, resolvedAccountName, queueAttemptId);
+        const attempt = this._pushAttempt(tracker, normalizedAuthIndex, resolvedAccountName, queueAttemptId);
+        if (attempt && ["selected", "miss", "fallback"].includes(cacheDecision?.state)) {
+            attempt.cacheDecision = {
+                expiresAt: cacheDecision.expiresAt || null,
+                prefixLength: cacheDecision.prefixLength ?? null,
+                state: cacheDecision.state,
+                upstreamExpiresAt: cacheDecision.upstreamExpiresAt || null,
+            };
+        }
     }
 
     recordBackendChunk(requestId, requestAttemptId, data) {
@@ -144,7 +180,7 @@ class UsageStatsService {
         if (!tracker || typeof data !== "string" || !data) return;
         const attemptKey = requestAttemptId || tracker.attempts[tracker.attempts.length - 1]?.requestAttemptId;
         if (!attemptKey) return;
-        this._pushAttempt(tracker, null, null, attemptKey);
+        if (!tracker.attempts.some(attempt => attempt.requestAttemptId === attemptKey)) return;
         let capture = tracker.tokenCaptures.get(attemptKey);
         if (!capture) {
             capture = new TokenUsageCapture();
@@ -153,29 +189,82 @@ class UsageStatsService {
         capture.ingest(data);
     }
 
-    recordBackendAttemptEvent({ requestId, requestAttemptId, authIndex, eventType, statusCode }) {
+    recordBackendAttemptEvent(event) {
+        const { requestId, requestAttemptId, authIndex, eventType, statusCode, errorMessage, message } = event;
         if (!this.enabled) return;
+        if (eventType === "attempt_end") return this.finishAttempt(requestId, event);
         const tracker = this.activeRequests.get(requestId);
         if (!tracker || !requestAttemptId) return;
 
         const normalizedAuthIndex = this._normalizeAuthIndex(authIndex);
-        const attempt = this._pushAttempt(
-            tracker,
-            normalizedAuthIndex,
-            this._resolveAccountName(normalizedAuthIndex),
-            requestAttemptId
-        );
-        const parsedStatus = statusCode === null || statusCode === undefined ? NaN : Number(statusCode);
+        const attempt = tracker.attempts.find(candidate => candidate.requestAttemptId === requestAttemptId);
+        if (!attempt || attempt.authIndex !== normalizedAuthIndex) return;
+        if (attempt.finishedAt) {
+            if (eventType === "error")
+                this.finishAttempt(requestId, {
+                    authIndex,
+                    errorMessage: errorMessage || message,
+                    outcome: "error",
+                    requestAttemptId,
+                });
+            return;
+        }
+        const rawUpstreamStatus =
+            event.upstreamStatusCode ?? (eventType === "response_headers" ? statusCode : undefined);
+        const parsedStatus =
+            rawUpstreamStatus === null || rawUpstreamStatus === undefined ? NaN : Number(rawUpstreamStatus);
         if (Number.isInteger(parsedStatus) && parsedStatus >= 100 && parsedStatus <= 599) {
             attempt.statusCode = parsedStatus;
+            attempt.upstreamStatusCode = parsedStatus;
         }
         if (eventType === "error" || (eventType === "response_headers" && attempt.statusCode >= 400)) {
-            attempt.outcome = "error";
-            attempt.finishedAt = new Date().toISOString();
+            this.finishAttempt(requestId, {
+                authIndex,
+                errorMessage: errorMessage || message,
+                localStatusCode: event.localStatusCode ?? (eventType === "error" ? Number(statusCode) || null : null),
+                outcome: "error",
+                requestAttemptId,
+                terminationReason: event.terminationReason || "upstream_error",
+                upstreamStatusCode: attempt.upstreamStatusCode,
+            });
         } else if (eventType === "stream_close" && attempt.outcome !== "error") {
-            attempt.outcome = "success";
-            attempt.finishedAt = new Date().toISOString();
+            this.finishAttempt(requestId, {
+                authIndex,
+                outcome: "success",
+                requestAttemptId,
+                terminationReason: "upstream_complete",
+                upstreamStatusCode: attempt.upstreamStatusCode,
+            });
         }
+    }
+
+    finishAttempt(requestId, result = {}) {
+        if (!this.enabled || !result.requestAttemptId || !Number.isInteger(result.authIndex)) return false;
+        const tracker = this.activeRequests.get(requestId);
+        const attempt = tracker?.attempts.find(candidate => candidate.requestAttemptId === result.requestAttemptId);
+        if (!attempt || attempt.authIndex !== result.authIndex) return false;
+        if (attempt.finishedAt) {
+            if (result.outcome === attempt.outcome && !attempt.errorMessage && typeof result.errorMessage === "string")
+                attempt.errorMessage = result.errorMessage;
+            return false;
+        }
+        attempt.finishedAt = new Date().toISOString();
+        attempt.durationMs = Math.max(0, Date.parse(attempt.finishedAt) - Date.parse(attempt.startedAt));
+        attempt.outcome = ["success", "error", "aborted", "unknown"].includes(result.outcome)
+            ? result.outcome
+            : "unknown";
+        const upstreamStatus = result.upstreamStatusCode;
+        if (Number.isInteger(upstreamStatus) && upstreamStatus >= 100 && upstreamStatus <= 599) {
+            attempt.upstreamStatusCode = upstreamStatus;
+            attempt.statusCode = upstreamStatus;
+        }
+        const localStatus = result.localStatusCode ?? result.statusCode;
+        if (Number.isInteger(localStatus) && localStatus >= 100 && localStatus <= 599)
+            attempt.localStatusCode = localStatus;
+        attempt.terminationReason = typeof result.terminationReason === "string" ? result.terminationReason : null;
+        attempt.errorMessage = typeof result.errorMessage === "string" ? result.errorMessage : null;
+        attempt.retryReason = typeof result.retryReason === "string" ? result.retryReason : null;
+        return true;
     }
 
     finishRequest(requestId, result = {}) {
@@ -210,18 +299,37 @@ class UsageStatsService {
         const statusCode = Number.isFinite(result.statusCode) ? Number(result.statusCode) : null;
         const durationMs = Math.max(0, finishedAtMs - tracker.startedAtMs);
         const accountKey = this._buildAccountKey(finalAuthIndex, finalAccountName);
-        const attempts = tracker.attempts.map((attempt, index) => {
+        const attempts = tracker.attempts.map(attempt => {
             const capture = tracker.tokenCaptures.get(attempt.requestAttemptId);
             const tokenUsage = capture?.finish() || null;
-            const isLastAttempt = index === tracker.attempts.length - 1;
+            const firstTextLatencyMs =
+                capture?.firstTextAtMs == null
+                    ? null
+                    : Math.max(0, capture.firstTextAtMs - Date.parse(attempt.startedAt));
+            const generationMs =
+                capture?.lastTextAtMs > capture?.firstTextAtMs ? capture.lastTextAtMs - capture.firstTextAtMs : null;
+            const bodyTokens =
+                tokenUsage?.outputTokens != null && tokenUsage?.thoughtTokens != null
+                    ? tokenUsage.outputTokens - tokenUsage.thoughtTokens
+                    : null;
+            const generationTps =
+                tracker.isStreaming && generationMs > 0 && bodyTokens >= 0 && bodyTokens != null
+                    ? Number((bodyTokens / (generationMs / 1000)).toFixed(2))
+                    : null;
             const finishedAt = attempt.finishedAt || new Date(finishedAtMs).toISOString();
-            const attemptOutcome = attempt.outcome || (isLastAttempt ? outcome : "error");
+            const attemptOutcome = attempt.outcome || "unknown";
             return {
                 ...attempt,
+                cacheDecision: attempt.cacheDecision || null,
+                durationMs: attempt.durationMs ?? Math.max(0, Date.parse(finishedAt) - Date.parse(attempt.startedAt)),
                 finishedAt,
+                firstTextLatencyMs,
+                generationTps,
                 outcome: attemptOutcome,
                 rawUsageMetadata: capture?.rawUsageMetadata || null,
-                statusCode: attempt.statusCode ?? (isLastAttempt ? statusCode : null),
+                statusCode: attempt.statusCode ?? null,
+                terminationReason:
+                    attempt.terminationReason || (attempt.finishedAt ? null : "request_closed_without_call_outcome"),
                 tokenUsage,
                 usageState: this._getUsageState(tokenUsage, attemptOutcome),
             };
@@ -240,12 +348,28 @@ class UsageStatsService {
             apiKeyId: tracker.apiKeyId,
             attemptCount: tracker.attemptCount,
             attempts,
+            cacheDecision: attempts.at(-1)?.cacheDecision || null,
             clientIp: tracker.clientIp,
+            conversationConfigChanged: tracker.conversationConfigChanged || false,
+            conversationDate: tracker.conversationDate || null,
+            conversationId: tracker.conversationId || null,
+            conversationMatch: tracker.conversationMatch || null,
+            conversationNumber: tracker.conversationNumber || null,
+            conversationReused: tracker.conversationId ? tracker.conversationReused : null,
+            conversationSource: tracker.conversationSource || null,
             durationMs,
             errorMessage: result.errorMessage || null,
             finalAccountName,
             finalAuthIndex,
             finishedAt: new Date(finishedAtMs).toISOString(),
+            firstTextLatencyMs: attempts.some(attempt => attempt.firstTextLatencyMs != null)
+                ? Math.min(
+                      ...attempts
+                          .filter(attempt => attempt.firstTextLatencyMs != null)
+                          .map(attempt => Date.parse(attempt.startedAt) + attempt.firstTextLatencyMs)
+                  ) - tracker.startedAtMs
+                : null,
+            generationTps: attempts.length === 1 ? attempts[0].generationTps : null,
             initialAccountName: tracker.initialAccountName,
             initialAuthIndex: tracker.initialAuthIndex,
             isStreaming: tracker.isStreaming,
@@ -331,11 +455,141 @@ class UsageStatsService {
     }
 
     getOverview(query, nowMs = Date.now()) {
-        return buildOverview(this.records, query, this.enabled ? this.activeRequests.size : 0, this.sequence, nowMs);
+        const overview = buildOverview(
+            this.records,
+            query,
+            this.enabled ? this.activeRequests.size : 0,
+            this.sequence,
+            nowMs
+        );
+        const selectedLabel = this.conversationLabels.labels.get(query.conversationId);
+        if (
+            selectedLabel &&
+            !overview.filterOptions.conversations.some(item => item.conversationId === query.conversationId)
+        )
+            overview.filterOptions.conversations.push({ ...selectedLabel, conversationId: query.conversationId });
+        const active = Array.from(this.activeRequests.values());
+        const activeCalls = projectAttempts(active).filter(attempt => !attempt.finishedAt);
+        overview.summary.inProgressCount = exportRecords(activeCalls, { ...query, view: "requests" }).length;
+        const pending = exportRecords(
+            active
+                .filter(tracker => tracker.attempts.length === 0)
+                .map(tracker => ({ ...tracker, accountKey: "unassigned", outcome: "unknown", statusCode: null })),
+            { ...query, view: "requests" }
+        );
+        overview.summary.waitingCount = pending.length;
+        overview.summary.queuedCount = pending.filter(tracker => tracker.queueState === "queued").length;
+        overview.summary.cancelledCount = overview.summary.abortedCount;
+        if (query.view !== "requests" && !query.accountKey) {
+            const legacy = exportRecords(this.records, { ...query, view: "requests" }).filter(
+                record =>
+                    record.attemptCount > 1 &&
+                    !(record.attempts || []).some(attempt => Object.hasOwn(attempt, "tokenUsage"))
+            );
+            overview.summary.historyUnattributedRequestCount = legacy.length;
+            overview.summary.historyUnattributedTokenUsage = sumTokenUsage(legacy.map(record => record.tokenUsage));
+        }
+        return overview;
     }
 
     getRequests(query) {
         return listRequests(this.records, query);
+    }
+
+    getActive(query, nowMs = Date.now()) {
+        // A public snapshot contains metadata only, never capture buffers or request contents.
+        const parents = Array.from(this.activeRequests.values()).map(tracker => {
+            const last = tracker.attempts.at(-1);
+            const live = tracker.attempts.some(attempt => !attempt.finishedAt);
+            return {
+                accountKey: last?.accountKey || "unassigned",
+                active: true,
+                apiFormat: tracker.apiFormat,
+                apiKeyId: tracker.apiKeyId,
+                attemptCount: tracker.attemptCount,
+                attempts: tracker.attempts.map(attempt => {
+                    const capture = tracker.tokenCaptures.get(attempt.requestAttemptId);
+                    return {
+                        ...attempt,
+                        active: !attempt.finishedAt,
+                        durationMs: attempt.durationMs ?? Math.max(0, nowMs - Date.parse(attempt.startedAt)),
+                        outcome: attempt.finishedAt ? attempt.outcome : "in_progress",
+                        rawUsageMetadata: capture?.rawUsageMetadata || null,
+                        tokenUsage: capture?.usage || null,
+                        usageState: capture?.usage ? "partial" : "unreported",
+                    };
+                }),
+                cacheDecision: last?.cacheDecision || null,
+                clientIp: tracker.clientIp,
+                conversationConfigChanged: tracker.conversationConfigChanged || false,
+                conversationDate: tracker.conversationDate || null,
+                conversationId: tracker.conversationId || null,
+                conversationMatch: tracker.conversationMatch || null,
+                conversationNumber: tracker.conversationNumber || null,
+                conversationReused: tracker.conversationId ? tracker.conversationReused : null,
+                conversationSource: tracker.conversationSource || null,
+                durationMs: Math.max(0, nowMs - tracker.startedAtMs),
+                finalAccountName: last?.accountName || null,
+                finalAuthIndex: last?.authIndex ?? null,
+                finishedAt: null,
+                isStreaming: tracker.isStreaming,
+                method: tracker.method,
+                metricScope: "requests",
+                model: tracker.model,
+                outcome: live ? "in_progress" : tracker.queueState === "queued" ? "queued" : "waiting",
+                path: tracker.path,
+                requestCategory: tracker.requestCategory,
+                requestId: tracker.requestId,
+                startedAt: tracker.startedAt,
+                statusCode: null,
+                streamMode: tracker.streamMode,
+                tokenUsage: null,
+                usageState: "unreported",
+            };
+        });
+        const records =
+            query.view === "requests"
+                ? parents
+                : projectAttempts(parents)
+                      .filter(record => !record.finishedAt)
+                      .map(record => ({
+                          ...record,
+                          active: true,
+                          durationMs: Math.max(0, nowMs - Date.parse(record.startedAt)),
+                          outcome: "in_progress",
+                      }));
+        const items = exportRecords(records, {
+            ...query,
+            afterSequence: null,
+            snapshotSequence: null,
+            view: "requests",
+        }).sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt));
+        return {
+            asOf: new Date(nowMs).toISOString(),
+            hasMore: false,
+            items,
+            metricScope: query.view,
+            totalMatched: items.length,
+        };
+    }
+
+    getRequest(requestId) {
+        return (
+            this.records.find(record => record.requestId === requestId) ||
+            this.getActive({
+                fromMs: null,
+                maxDurationMs: null,
+                minDurationMs: null,
+                statusCode: null,
+                toMs: null,
+                view: "requests",
+            }).items.find(record => record.requestId === requestId) ||
+            null
+        );
+    }
+
+    exportRecords(query) {
+        return exportRecords(this.records, query);
     }
 
     /**
@@ -572,6 +826,10 @@ class UsageStatsService {
      * sequence so new records continue after the current data set.
      */
     _replaceRecords(records) {
+        if (this.conversationLabels) {
+            this.conversationLabels.hydrate(records);
+            this._saveConversationLabels();
+        }
         this.records = records;
         this.sequence = 0;
         for (const record of records) {
@@ -615,6 +873,7 @@ class UsageStatsService {
                 : `${tracker.requestId}:attempt-${tracker.attemptCount + 1}`;
         const existing = tracker.attempts.find(attempt => attempt.requestAttemptId === attemptId);
         if (existing) {
+            if (authIndex !== null && existing.authIndex !== null && existing.authIndex !== authIndex) return null;
             if (authIndex !== null) {
                 const savedAccountName = normalizedAccountName ?? existing.accountName;
                 existing.accountKey = this._buildAccountKey(authIndex, savedAccountName);
@@ -624,22 +883,20 @@ class UsageStatsService {
             return existing;
         }
 
-        const previous = tracker.attempts[tracker.attempts.length - 1];
-        if (previous && !previous.finishedAt) {
-            previous.finishedAt = new Date().toISOString();
-            previous.outcome = "error";
-        }
-
         tracker.attemptCount += 1;
         const attempt = {
             accountKey,
             accountName: normalizedAccountName,
             authIndex,
+            errorMessage: null,
             finishedAt: null,
+            localStatusCode: null,
             outcome: null,
             requestAttemptId: attemptId,
             startedAt: new Date().toISOString(),
             statusCode: null,
+            terminationReason: null,
+            upstreamStatusCode: null,
         };
         tracker.attempts.push(attempt);
         return attempt;
@@ -739,8 +996,8 @@ class UsageStatsService {
         return {
             ...record,
             apiKeyId: this._normalizeApiKeyId(record?.apiKeyId),
-            durationMs: this._normalizeDurationMs(record?.durationMs),
-            outcome: this._normalizeOutcome(record?.outcome),
+            durationMs: Number.isFinite(record?.durationMs) && record.durationMs >= 0 ? record.durationMs : null,
+            outcome: ["success", "error", "aborted"].includes(record?.outcome) ? record.outcome : "unknown",
             statusCode:
                 rawStatusCode !== null &&
                 rawStatusCode !== undefined &&

@@ -29,28 +29,8 @@
             </div>
         </header>
 
-        <div class="accounts-status-strip" :aria-label="t('accountsStatusSummary')">
-            <div class="accounts-status-item">
-                <span class="accounts-status-dot is-ready"></span>
-                <span>{{ t("accountsAvailable") }}</span>
-                <strong>{{ statusCounts.available }}</strong>
-            </div>
-            <div class="accounts-status-item">
-                <span class="accounts-status-dot is-cooldown"></span>
-                <span>{{ t("healthCooldown") }}</span>
-                <strong>{{ statusCounts.cooldown }}</strong>
-            </div>
-            <div class="accounts-status-item">
-                <span class="accounts-status-dot is-reauth"></span>
-                <span>{{ t("healthReauth") }}</span>
-                <strong>{{ statusCounts.reauth }}</strong>
-            </div>
-            <div class="accounts-status-item">
-                <span class="accounts-status-dot is-disabled"></span>
-                <span>{{ t("healthDisabled") }}</span>
-                <strong>{{ statusCounts.disabled }}</strong>
-            </div>
-        </div>
+        <p v-if="statusStale" class="accounts-status-stale" role="status">{{ t("accountStatusHelp_stale") }}</p>
+        <PoolCapacitySummary :capacity="poolCapacity" :stale="statusStale" :t="t" />
 
         <div class="accounts-toolbar">
             <div class="accounts-toolbar-main">
@@ -62,11 +42,9 @@
                     <span class="sr-only">{{ t("accountsFilterStatus") }}</span>
                     <select v-model="statusFilter" :aria-label="t('accountsFilterStatus')">
                         <option value="all">{{ t("accountsAllStatuses") }}</option>
-                        <option value="ready">{{ t("accountsAvailable") }}</option>
-                        <option value="cooldown">{{ t("healthCooldown") }}</option>
-                        <option value="reauth">{{ t("healthReauth") }}</option>
-                        <option value="disabled">{{ t("healthDisabled") }}</option>
-                        <option value="excluded">{{ t("accountsExcluded") }}</option>
+                        <option v-for="status in filterStates" :key="status" :value="status">
+                            {{ t(`accountStatus_${status}`) }}
+                        </option>
                     </select>
                 </label>
                 <div class="accounts-range" :aria-label="t('usageTimeRange')">
@@ -150,7 +128,6 @@
                             </th>
                             <th>{{ t("account") }}</th>
                             <th>{{ t("accountStatus") }}</th>
-                            <th>{{ t("accountsLastFailure") }}</th>
                             <th>{{ t("usageLastUsed") }}</th>
                             <th>{{ t("accountsCallsAttempts") }}</th>
                             <th>{{ t("usageTotalTokens") }}</th>
@@ -182,25 +159,18 @@
                                     <span v-if="account.isExpired" class="accounts-tag is-issue">{{
                                         t("tagExpired")
                                     }}</span>
-                                    <span v-if="account.serving" class="accounts-tag">{{ t("consoleWarmed") }}</span>
-                                    <span v-else-if="account.hasContext" class="accounts-tag">{{
-                                        t("accountsContextReady")
-                                    }}</span>
                                 </div>
                             </td>
                             <td>
-                                <span class="accounts-health" :class="`is-${healthTone(account)}`">
-                                    <span class="accounts-status-dot" :class="`is-${healthTone(account)}`"></span>
-                                    {{ healthLabel(account) }}
-                                </span>
-                                <small
-                                    v-if="account.health?.mode === 'cooldown' && account.health?.until"
-                                    class="accounts-muted"
-                                >
-                                    {{ t("accountsRemaining", { time: cooldownRemaining(account.health.until) }) }}
-                                </small>
+                                <AccountRuntimeState
+                                    :account="account"
+                                    :stale="statusStale"
+                                    :t="t"
+                                    compact
+                                    @open="openDetails(account)"
+                                />
+                                <AccountTestResult :result="account.lastTest" :t="t" @open="openTest(account.index)" />
                             </td>
-                            <td>{{ account.health?.lastStatus ? `HTTP ${account.health.lastStatus}` : "—" }}</td>
                             <td>{{ formatTime(statsFor(account)?.lastUsedAt) }}</td>
                             <td class="accounts-number-cell">
                                 <template v-if="statsFor(account)">
@@ -231,6 +201,7 @@
                                         :is-busy="isBusy"
                                         :t="t"
                                         @details="openDetails"
+                                        @test="index => openTest(index, true)"
                                         @health="(item, action) => emit('health', item, action)"
                                         @reauth="index => emit('reauth', index)"
                                         @download="index => emit('download', index)"
@@ -256,23 +227,20 @@
                             <span class="accounts-index">#{{ account.index }}</span>
                             <strong>{{ displayName(account) }}</strong>
                         </button>
-                        <span class="accounts-health" :class="`is-${healthTone(account)}`">{{
-                            healthLabel(account)
-                        }}</span>
                     </div>
+                    <AccountRuntimeState
+                        :account="account"
+                        :stale="statusStale"
+                        :t="t"
+                        compact
+                        @open="openDetails(account)"
+                    />
+                    <AccountTestResult :result="account.lastTest" :t="t" @open="openTest(account.index)" />
                     <div class="accounts-tags">
                         <span v-if="account.isInvalid" class="accounts-tag is-issue">{{ t("jsonFormatError") }}</span>
                         <span v-if="account.isDuplicate" class="accounts-tag is-issue">{{ t("duplicateAuth") }}</span>
                         <span v-if="account.isExpired" class="accounts-tag is-issue">{{ t("tagExpired") }}</span>
-                        <span v-if="account.serving" class="accounts-tag">{{ t("consoleWarmed") }}</span>
-                        <span v-else-if="account.hasContext" class="accounts-tag">{{ t("accountsContextReady") }}</span>
                     </div>
-                    <p
-                        v-if="account.health?.mode === 'cooldown' && account.health?.until"
-                        class="accounts-cooldown-note"
-                    >
-                        {{ t("accountsRemaining", { time: cooldownRemaining(account.health.until) }) }}
-                    </p>
                     <dl class="accounts-card-metrics">
                         <div>
                             <dt>{{ t("usageLastUsed") }}</dt>
@@ -292,10 +260,6 @@
                             <dt>{{ t("usageTotalTokens") }}</dt>
                             <dd>{{ formatTokens(statsFor(account)?.tokenUsage?.totalTokens) }}</dd>
                         </div>
-                        <div>
-                            <dt>{{ t("accountsLastFailure") }}</dt>
-                            <dd>{{ account.health?.lastStatus ? `HTTP ${account.health.lastStatus}` : "—" }}</dd>
-                        </div>
                     </dl>
                     <div class="accounts-card-actions">
                         <AccountActions
@@ -303,6 +267,7 @@
                             :is-busy="isBusy"
                             :t="t"
                             @details="openDetails"
+                            @test="index => openTest(index, true)"
                             @health="(item, action) => emit('health', item, action)"
                             @reauth="index => emit('reauth', index)"
                             @download="index => emit('download', index)"
@@ -315,16 +280,22 @@
 
         <p class="accounts-footnote">{{ t("accountsIdentityScope") }}</p>
 
+        <AccountTestDialog
+            v-model:visible="testOpen"
+            :account="testAccount"
+            :auto-run="testAutoRun"
+            :t="t"
+            @completed="refresh"
+        />
+
         <el-drawer
             v-model="detailsOpen"
             :size="'min(100vw, 560px)'"
             :title="selectedAccount ? `#${selectedAccount.index} ${displayName(selectedAccount)}` : ''"
         >
             <template v-if="selectedAccount">
+                <AccountRuntimeState :account="selectedAccount" :stale="statusStale" :t="t" expanded />
                 <div class="accounts-detail-tags">
-                    <span class="accounts-health" :class="`is-${healthTone(selectedAccount)}`">{{
-                        healthLabel(selectedAccount)
-                    }}</span>
                     <span v-if="selectedAccount.isInvalid" class="accounts-tag is-issue">{{
                         t("jsonFormatError")
                     }}</span>
@@ -332,18 +303,7 @@
                         t("duplicateAuth")
                     }}</span>
                     <span v-if="selectedAccount.isExpired" class="accounts-tag is-issue">{{ t("tagExpired") }}</span>
-                    <span v-if="selectedAccount.serving" class="accounts-tag">{{ t("consoleWarmed") }}</span>
-                    <span v-else-if="selectedAccount.hasContext" class="accounts-tag">{{
-                        t("accountsContextReady")
-                    }}</span>
                 </div>
-                <p
-                    v-if="selectedAccount.health?.mode === 'cooldown' && selectedAccount.health?.until"
-                    class="accounts-detail-note"
-                >
-                    {{ t("accountsRemaining", { time: cooldownRemaining(selectedAccount.health.until) }) }} ·
-                    {{ t("healthUntil", { time: formatTime(selectedAccount.health.until) }) }}
-                </p>
                 <p
                     v-if="
                         selectedAccount.isDuplicate &&
@@ -379,6 +339,19 @@
                 <p class="accounts-detail-note">{{ t("accountsRangeNote") }}</p>
                 <div class="accounts-detail-actions">
                     <button
+                        type="button"
+                        class="accounts-button"
+                        :disabled="
+                            isBusy ||
+                            canReauthenticate(selectedAccount) ||
+                            selectedAccount.lastTest?.status === 'running' ||
+                            !!selectedAccount.inFlight
+                        "
+                        @click="openTest(selectedAccount.index, true)"
+                    >
+                        {{ t("accountTestButton") }}
+                    </button>
+                    <button
                         v-if="canReauthenticate(selectedAccount)"
                         type="button"
                         class="accounts-button accounts-button-primary"
@@ -390,14 +363,14 @@
                     <div class="accounts-detail-enabled">
                         <span>{{ t("accountsEnabled") }}</span>
                         <el-switch
-                            :model-value="selectedAccount.health?.mode !== 'disabled'"
+                            :model-value="accountEnabled(selectedAccount)"
                             :disabled="isBusy || selectedAccount.isInvalid"
                             :aria-label="t('accountsEnabledNamed', { index: selectedAccount.index })"
                             :before-change="toggleSelectedEnabled"
                         />
                     </div>
                     <button
-                        v-if="canRetryWithoutReauth(selectedAccount) || selectedAccount.health?.mode === 'cooldown'"
+                        v-if="canRetryWithoutReauth(selectedAccount)"
                         type="button"
                         class="accounts-button"
                         :disabled="isBusy || selectedAccount.isInvalid"
@@ -458,10 +431,17 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import AccountActions from "./AccountActions.vue";
+import AccountRuntimeState from "./AccountRuntimeState.vue";
+import AccountTestDialog from "./AccountTestDialog.vue";
+import AccountTestResult from "./AccountTestResult.vue";
+import PoolCapacitySummary from "./PoolCapacitySummary.vue";
+import { accountEnabled, accountStatus } from "../utils/runtimeLabels";
 
 const props = defineProps({
     accounts: { default: () => [], type: Array },
     isBusy: { default: false, type: Boolean },
+    poolCapacity: { default: null, type: Object },
+    statusStale: { default: false, type: Boolean },
     t: { required: true, type: Function },
 });
 const emit = defineEmits([
@@ -484,6 +464,7 @@ const ranges = [
 ];
 const search = ref("");
 const statusFilter = ref("all");
+const filterStates = ["enabled", "processing", "disabled"];
 const statsRange = ref("24h");
 const stats = ref(null);
 const statsError = ref("");
@@ -491,53 +472,35 @@ const statsLoading = ref(false);
 const selected = ref(new Set());
 const selectedAccount = ref(null);
 const detailsOpen = ref(false);
+const testOpen = ref(false);
+const testIndex = ref(null);
+const testAutoRun = ref(false);
+const testAccount = computed(() => props.accounts.find(account => account.index === testIndex.value) || null);
+const openTest = (index, autoRun = false) => {
+    testIndex.value = index;
+    testAutoRun.value = autoRun;
+    testOpen.value = true;
+};
 const toggleSelectedEnabled = () => {
     const account = selectedAccount.value;
     if (account && !props.isBusy && !account.isInvalid) {
-        emit("health", account, account.health?.mode === "disabled" ? "enable" : "disable");
+        emit("health", account, accountEnabled(account) ? "disable" : "enable");
     }
     return false;
 };
 const recentAttempts = ref([]);
 const attemptsLoading = ref(false);
 const attemptsError = ref("");
-const clockNow = ref(Date.now());
 let statsGeneration = 0;
 let attemptsGeneration = 0;
 let refreshTimer = null;
-let clockTimer = null;
 
-const statusCounts = computed(() => {
-    const counts = { available: 0, cooldown: 0, disabled: 0, reauth: 0 };
-    for (const account of props.accounts) {
-        const mode = account.health?.mode || "active";
-        if (mode === "cooldown" || mode === "reauth" || mode === "disabled") counts[mode] += 1;
-        else if (account.isRotation) counts.available += 1;
-    }
-    return counts;
-});
-const healthTone = account => {
-    const mode = account.health?.mode;
-    if (mode === "cooldown" || mode === "reauth" || mode === "disabled") return mode;
-    return account.isRotation ? "ready" : "excluded";
-};
-const healthLabel = account => {
-    const tone = healthTone(account);
-    if (tone === "cooldown") return t("healthCooldown");
-    if (tone === "reauth") return t("healthReauth");
-    if (tone === "disabled") return t("healthDisabled");
-    if (account.health?.probeRequired) {
-        return t(account.health.probeInFlight ? "consoleProbing" : "consoleProbeRequired");
-    }
-    return tone === "ready" ? t("accountsAvailable") : t("accountsExcluded");
-};
 const canReauthenticate = account => !account.isInvalid && (account.isExpired || account.health?.mode === "reauth");
 const canRetryWithoutReauth = account => canReauthenticate(account) && account.health?.mode !== "disabled";
 const healthActionLabel = account => {
     const mode = account.health?.mode;
     if (mode === "disabled") return t("healthEnable");
     if (account.isExpired || mode === "reauth") return t("accountsRetryWithoutReauth");
-    if (mode === "cooldown") return t("accountsClearCooldown");
     return t("healthDisable");
 };
 const displayName = account => account.name || (account.isInvalid ? t("jsonFormatError") : t("unnamedAccount"));
@@ -548,7 +511,7 @@ const statsUpdatedAt = computed(() => stats.value?.asOf || null);
 const filteredAccounts = computed(() => {
     const query = search.value.toLowerCase();
     return props.accounts.filter(account => {
-        if (statusFilter.value !== "all" && healthTone(account) !== statusFilter.value) return false;
+        if (statusFilter.value !== "all" && accountStatus(account).filterState !== statusFilter.value) return false;
         return !query || `${account.index} ${account.name || ""}`.toLowerCase().includes(query);
     });
 });
@@ -560,9 +523,10 @@ const allVisibleSelected = computed(
 const someVisibleSelected = computed(() => filteredAccounts.value.some(account => selected.value.has(account.index)));
 const selectedStats = computed(() => (selectedAccount.value ? statsFor(selectedAccount.value) : null));
 const sampleSuccessRate = computed(() => {
-    if (!recentAttempts.value.length) return "—";
-    const successes = recentAttempts.value.filter(attempt => attempt.outcome === "success").length;
-    return `${Math.round((successes / recentAttempts.value.length) * 100)}%`;
+    const completed = recentAttempts.value.filter(attempt => ["success", "error", "aborted"].includes(attempt.outcome));
+    if (!completed.length) return "—";
+    const successes = completed.filter(attempt => attempt.outcome === "success").length;
+    return `${Math.round((successes / completed.length) * 100)}%`;
 });
 
 const formatNumber = value => (Number.isFinite(value) ? new Intl.NumberFormat().format(value) : "—");
@@ -571,15 +535,6 @@ const formatTime = value => {
     if (!value) return "—";
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString();
-};
-const cooldownRemaining = until => {
-    const remainingSeconds = Math.max(0, Math.ceil((Number(until) - clockNow.value) / 1000));
-    const hours = Math.floor(remainingSeconds / 3600);
-    const minutes = Math.floor((remainingSeconds % 3600) / 60);
-    const seconds = remainingSeconds % 60;
-    return hours
-        ? `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
-        : `${minutes}:${String(seconds).padStart(2, "0")}`;
 };
 const toggleSelected = index => {
     const next = new Set(selected.value);
@@ -633,12 +588,13 @@ const loadRecentAttempts = async account => {
             limit: "20",
             range: statsRange.value,
             requestCategory: "generation",
+            view: "attempts",
         });
         const result = await readJson(`/api/usage-stats/requests?${params}`);
         if (generation !== attemptsGeneration) return;
         const matches = [];
         for (const record of result.items || []) {
-            for (const attempt of record.attempts || []) {
+            for (const attempt of [record]) {
                 if (!attempt.requestAttemptId) continue;
                 const sameAccount = account.name
                     ? String(attempt.accountName || "").toLowerCase() === account.name.trim().toLowerCase()
@@ -667,7 +623,8 @@ const openDetails = account => {
 const attemptLabel = attempt => {
     if (attempt.outcome === "success") return t("accountsAttemptSuccess");
     if (attempt.outcome === "aborted") return t("accountsAttemptAborted");
-    return t("accountsAttemptFailed");
+    if (attempt.outcome === "error") return t("accountsAttemptFailed");
+    return t("usageOutcomeUnknown");
 };
 const refresh = () => {
     emit("refresh");
@@ -692,9 +649,6 @@ watch(
 );
 onMounted(() => {
     loadStats();
-    clockTimer = window.setInterval(() => {
-        if (!document.hidden && statusCounts.value.cooldown) clockNow.value = Date.now();
-    }, 1000);
     refreshTimer = window.setInterval(() => {
         if (!document.hidden) loadStats();
     }, 30000);
@@ -703,9 +657,18 @@ onBeforeUnmount(() => {
     statsGeneration += 1;
     attemptsGeneration += 1;
     if (refreshTimer !== null) window.clearInterval(refreshTimer);
-    if (clockTimer !== null) window.clearInterval(clockTimer);
 });
-defineExpose({ clearSelection: () => (selected.value = new Set()), refresh });
+defineExpose({
+    clearSelection: () => (selected.value = new Set()),
+    focusAccount: index => {
+        const account = props.accounts.find(item => item.index === index);
+        if (account) {
+            search.value = account.name || String(index);
+            openDetails(account);
+        }
+    },
+    refresh,
+});
 </script>
 
 <style lang="less" scoped>
@@ -1073,6 +1036,12 @@ defineExpose({ clearSelection: () => (selected.value = new Set()), refresh });
 }
 .accounts-health.is-cooldown {
     color: @warning-color;
+}
+.accounts-health.is-verifying {
+    color: @warning-color;
+}
+.accounts-status-dot.is-verifying {
+    background: @warning-color;
 }
 .accounts-health.is-reauth {
     color: @error-color;

@@ -24,7 +24,7 @@ function managerFixture() {
         authSource: {
             getCanonicalIndex: index => index,
             getRotationIndices: () => [0, 1, 2, 3],
-            health: { isAvailable: () => true },
+            health: { getStatus: () => ({ mode: "active" }), isAvailable: () => true },
             isExpired: () => false,
             pendingRefreshIndices: new Set(),
             setPendingRefresh(index, pending) {

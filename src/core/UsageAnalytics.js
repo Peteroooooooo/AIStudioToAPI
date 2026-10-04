@@ -66,6 +66,8 @@ function accountIdentitySource(accountKey) {
 }
 
 function parseUsageQuery(rawQuery = {}, nowMs = Date.now(), includePagination = false) {
+    const view = scalar(rawQuery, "view", 16) || "attempts";
+    if (!["attempts", "requests"].includes(view)) throw new UsageQueryError("view");
     const requestedRange = scalar(rawQuery, "range", 16) || "24h";
     if (requestedRange !== "all" && requestedRange !== "custom" && !RANGE_DURATION_MS[requestedRange]) {
         throw new UsageQueryError("range");
@@ -77,8 +79,8 @@ function parseUsageQuery(rawQuery = {}, nowMs = Date.now(), includePagination = 
     if (requestedRange === "custom" && !custom) throw new UsageQueryError("from");
 
     const rangeKey = custom ? "custom" : requestedRange;
-    const fromMs = custom ? customFrom : rangeKey === "all" ? null : nowMs - RANGE_DURATION_MS[rangeKey];
-    const toMs = custom ? (customTo ?? nowMs) : rangeKey === "all" ? null : nowMs;
+    let fromMs = custom ? customFrom : rangeKey === "all" ? null : nowMs - RANGE_DURATION_MS[rangeKey];
+    let toMs = custom ? (customTo ?? nowMs) : rangeKey === "all" ? null : nowMs;
     if (fromMs !== null && toMs !== null && fromMs > toMs) throw new UsageQueryError("from");
 
     const model = scalar(rawQuery, "model");
@@ -103,7 +105,20 @@ function parseUsageQuery(rawQuery = {}, nowMs = Date.now(), includePagination = 
         throw new UsageQueryError("timezone");
     }
     const outcome = scalar(rawQuery, "outcome", 16);
-    if (outcome && !["success", "error", "aborted"].includes(outcome)) throw new UsageQueryError("outcome");
+    if (outcome && !["success", "error", "aborted", "unknown"].includes(outcome)) throw new UsageQueryError("outcome");
+    const clientIp = scalar(rawQuery, "clientIp", 128);
+    const conversationId = scalar(rawQuery, "conversationId", 64);
+    if (conversationId && !/^chat_[1-9]\d*$/.test(conversationId)) throw new UsageQueryError("conversationId");
+    const statusOrigin = scalar(rawQuery, "statusOrigin", 16);
+    if (statusOrigin && !["client", "upstream", "local", "unknown"].includes(statusOrigin))
+        throw new UsageQueryError("statusOrigin");
+    const requestOrigin = scalar(rawQuery, "requestOrigin", 16);
+    if (requestOrigin && !["production", "test"].includes(requestOrigin)) throw new UsageQueryError("requestOrigin");
+    const rawRetried = scalar(rawQuery, "retried", 5);
+    if (rawRetried && !["true", "false"].includes(rawRetried)) throw new UsageQueryError("retried");
+    const retried = rawRetried ? rawRetried === "true" : null;
+    const afterSequence = parseNonnegativeInteger(rawQuery, "afterSequence");
+    const requestedSnapshot = parseNonnegativeInteger(rawQuery, "snapshotSequence");
     const q = scalar(rawQuery, "q").toLowerCase();
     const rawStatus = scalar(rawQuery, "statusCode", 3);
     const statusCode = rawStatus ? Number(rawStatus) : null;
@@ -113,6 +128,7 @@ function parseUsageQuery(rawQuery = {}, nowMs = Date.now(), includePagination = 
 
     let limit = 20;
     let cursor = null;
+    let snapshotSequence = requestedSnapshot;
     if (includePagination) {
         const rawLimit = scalar(rawQuery, "limit", 3);
         if (rawLimit) {
@@ -121,20 +137,44 @@ function parseUsageQuery(rawQuery = {}, nowMs = Date.now(), includePagination = 
                 throw new UsageQueryError("limit");
             }
         }
-        const rawCursor = scalar(rawQuery, "cursor", 16);
+        const rawCursor = scalar(rawQuery, "cursor", 160);
         if (rawCursor) {
-            cursor = Number(rawCursor);
-            if (!/^\d+$/.test(rawCursor) || !Number.isSafeInteger(cursor) || cursor < 1) {
-                throw new UsageQueryError("cursor");
+            if (view === "attempts" && /^\d+:\d+:\d+:(?:\d+|-):(?:\d+|-)$/.test(rawCursor)) {
+                const [snapshot, sequence, attempt, frozenFrom, frozenTo] = rawCursor.split(":");
+                if (
+                    [snapshot, sequence, attempt, frozenFrom, frozenTo].some(
+                        value => value !== "-" && !Number.isSafeInteger(Number(value))
+                    )
+                )
+                    throw new UsageQueryError("cursor");
+                snapshotSequence = Number(snapshot);
+                if (snapshotSequence < 1 || Number(sequence) < 1 || Number(sequence) > snapshotSequence)
+                    throw new UsageQueryError("cursor");
+                fromMs = frozenFrom === "-" ? null : Number(frozenFrom);
+                toMs = frozenTo === "-" ? null : Number(frozenTo);
+                if (fromMs !== null && toMs !== null && fromMs > toMs) throw new UsageQueryError("cursor");
+                cursor = `${sequence}:${attempt}`;
+            } else {
+                if (
+                    !/^\d+(?::\d+)?$/.test(rawCursor) ||
+                    rawCursor.split(":").some(value => !Number.isSafeInteger(Number(value)))
+                ) {
+                    throw new UsageQueryError("cursor");
+                }
+                if (Number(rawCursor.split(":")[0]) < 1) throw new UsageQueryError("cursor");
+                cursor = view === "requests" && !rawCursor.includes(":") ? Number(rawCursor) : rawCursor;
             }
         }
     }
 
     return {
         accountKey,
+        afterSequence,
         apiFormat,
         apiKeyId,
         cacheState,
+        clientIp,
+        conversationId,
         cursor,
         fromMs,
         granularity,
@@ -146,10 +186,127 @@ function parseUsageQuery(rawQuery = {}, nowMs = Date.now(), includePagination = 
         q,
         rangeKey,
         requestCategory,
+        requestOrigin,
+        retried,
+        snapshotSequence,
         statusCode,
+        statusOrigin,
         timezone,
         toMs,
+        view,
     };
+}
+
+// Each projected row owns exactly one upstream call. Parent results remain accessible
+// through the explicit request detail endpoint and never replace the call's outcome.
+function projectAttempts(records) {
+    return records.flatMap((parent, parentIndex) => {
+        const sequence =
+            Number.isSafeInteger(parent.sequence) && parent.sequence > 0 ? parent.sequence : parentIndex + 1;
+        const savedAttempts = Array.isArray(parent.attempts) ? parent.attempts : [];
+        const calls = savedAttempts.length
+            ? savedAttempts
+            : parent.attemptCount === 1
+              ? [
+                    {
+                        accountKey: parent.accountKey,
+                        accountName: parent.finalAccountName,
+                        authIndex: parent.finalAuthIndex,
+                        historicalIncomplete: true,
+                        tokenUsage: parent.tokenUsage,
+                    },
+                ]
+              : [];
+        return calls.map((attempt, attemptIndex) => {
+            const startedAt = attempt.startedAt || null;
+            const finishedAt = attempt.finishedAt || null;
+            const startMs = Date.parse(startedAt);
+            const finishMs = Date.parse(finishedAt);
+            const durationMs = Number.isFinite(attempt.durationMs)
+                ? attempt.durationMs
+                : Number.isFinite(startMs) && Number.isFinite(finishMs) && finishMs >= startMs
+                  ? finishMs - startMs
+                  : null;
+            const canAttributeLegacyUsage =
+                calls.length === 1 &&
+                parent.attemptCount === 1 &&
+                !Object.hasOwn(attempt, "tokenUsage") &&
+                !attempt.requestAttemptId;
+            const tokenUsage = normalizeTokenUsage(canAttributeLegacyUsage ? parent.tokenUsage : attempt.tokenUsage);
+            const accountKey = getAttemptAccountKey(attempt);
+            const hasStatusOrigin =
+                Object.hasOwn(attempt, "upstreamStatusCode") || Object.hasOwn(attempt, "localStatusCode");
+            const upstreamStatusCode = Object.hasOwn(attempt, "upstreamStatusCode") ? attempt.upstreamStatusCode : null;
+            const localStatusCode = attempt.localStatusCode ?? null;
+            const legacyStatusCode = hasStatusOrigin ? null : (attempt.statusCode ?? null);
+            const outcome = ["success", "error", "aborted"].includes(attempt.outcome) ? attempt.outcome : "unknown";
+            const call = {
+                ...attempt,
+                accountKey,
+                durationMs,
+                finishedAt,
+                legacyStatusCode,
+                localStatusCode,
+                outcome,
+                startedAt,
+                statusCode: upstreamStatusCode ?? localStatusCode ?? legacyStatusCode,
+                statusOrigin:
+                    upstreamStatusCode !== null
+                        ? "upstream"
+                        : localStatusCode !== null
+                          ? "local"
+                          : legacyStatusCode !== null
+                            ? "legacy-unknown"
+                            : "unknown",
+                tokenUsage,
+                upstreamStatusCode,
+            };
+            return {
+                ...call,
+                apiFormat: parent.apiFormat,
+                apiKeyId: parent.apiKeyId,
+                attemptCount: 1,
+                attemptIndex,
+                attempts: [call],
+                clientIp: parent.clientIp,
+                conversationConfigChanged: parent.conversationConfigChanged || false,
+                conversationDate: parent.conversationDate || null,
+                conversationId: parent.conversationId || null,
+                conversationMatch: parent.conversationMatch || null,
+                conversationNumber: parent.conversationNumber || null,
+                conversationReused: parent.conversationReused ?? null,
+                conversationSource: parent.conversationSource || null,
+                cursorKey: `${sequence}:${attemptIndex}`,
+                errorMessage: attempt.errorMessage || null,
+                finalAccountName: attempt.accountName || accountNameFromKey(attempt.accountKey),
+                finalAuthIndex: attempt.authIndex ?? null,
+                historicalIncomplete: Boolean(
+                    attempt.historicalIncomplete || !startedAt || !attempt.outcome || legacyStatusCode !== null
+                ),
+                historyTime: startedAt || parent.startedAt || parent.finishedAt || null,
+                isStreaming: parent.isStreaming,
+                method: parent.method,
+                metricScope: "attempts",
+                model: parent.model,
+                parentAttemptCount: parent.attemptCount || savedAttempts.length,
+                parentSequence: sequence,
+                path: parent.path,
+                requestAttemptId: attempt.requestAttemptId || `${parent.requestId}:historical-${attemptIndex + 1}`,
+                requestCategory: parent.requestCategory,
+                requestId: parent.requestId,
+                sequence,
+                streamMode: parent.streamMode,
+                terminationReason: attempt.terminationReason || null,
+                timeSource: startedAt ? "attempt" : "parent-fallback",
+                tokenSource: canAttributeLegacyUsage ? "legacy-single-call" : "attempt",
+                usageState: attempt.usageState || (tokenUsage ? "partial" : "unreported"),
+            };
+        });
+    });
+}
+
+function recordsForView(records, query) {
+    return query.view === "requests" ? records : projectAttempts(records);
 }
 
 function getAccountKey(record) {
@@ -173,7 +330,7 @@ function getCacheState(record) {
 }
 
 function getRecordTime(record) {
-    const startedAt = Date.parse(record.startedAt);
+    const startedAt = Date.parse(record.startedAt || record.historyTime);
     if (Number.isFinite(startedAt)) return startedAt;
     const finishedAt = Date.parse(record.finishedAt);
     return Number.isFinite(finishedAt) ? finishedAt : null;
@@ -186,6 +343,29 @@ function matchesTime(record, query) {
 }
 
 function matchesFilters(record, query) {
+    const sequence = record.parentSequence ?? record.sequence;
+    if (query.snapshotSequence != null && sequence > query.snapshotSequence) return false;
+    if (query.afterSequence != null && !(sequence > query.afterSequence)) return false;
+    if (query.clientIp && record.clientIp !== query.clientIp) return false;
+    if (
+        query.requestOrigin &&
+        (record.requestCategory === "account_test" ? "test" : "production") !== query.requestOrigin
+    )
+        return false;
+    if (query.retried != null && (record.parentAttemptCount ?? record.attemptCount) > 1 !== query.retried) return false;
+    if (query.statusOrigin) {
+        const isCall = record.metricScope === "attempts";
+        const originMatches = isCall
+            ? query.statusOrigin === "upstream"
+                ? record.upstreamStatusCode != null
+                : query.statusOrigin === "local"
+                  ? record.localStatusCode != null
+                  : query.statusOrigin === "unknown" &&
+                    record.upstreamStatusCode == null &&
+                    record.localStatusCode == null
+            : (record.attemptCount === 0 ? "local" : "client") === query.statusOrigin;
+        if (!originMatches) return false;
+    }
     if (
         query.accountKey &&
         getAccountKey(record) !== query.accountKey &&
@@ -198,10 +378,23 @@ function matchesFilters(record, query) {
         return false;
     if (query.model && (record.model || "unknown") !== query.model) return false;
     if (query.apiKeyId && (record.apiKeyId || "unknown") !== query.apiKeyId) return false;
+    if (query.conversationId && record.conversationId !== query.conversationId) return false;
     if (query.requestCategory && (record.requestCategory || "unknown") !== query.requestCategory) return false;
     if (query.apiFormat && (record.apiFormat || "unknown") !== query.apiFormat) return false;
     if (query.outcome && record.outcome !== query.outcome) return false;
-    if (query.statusCode !== null && record.statusCode !== query.statusCode) return false;
+    if (query.statusCode !== null) {
+        const codes =
+            record.metricScope === "attempts"
+                ? query.statusOrigin === "upstream"
+                    ? [record.upstreamStatusCode]
+                    : query.statusOrigin === "local"
+                      ? [record.localStatusCode]
+                      : query.statusOrigin === "unknown"
+                        ? [record.legacyStatusCode]
+                        : [record.upstreamStatusCode, record.localStatusCode, record.legacyStatusCode]
+                : [record.statusCode];
+        if (!codes.includes(query.statusCode)) return false;
+    }
     if (query.cacheState && getCacheState(record) !== query.cacheState) return false;
     if (
         (query.minDurationMs !== null || query.maxDurationMs !== null) &&
@@ -213,6 +406,7 @@ function matchesFilters(record, query) {
     if (query.q) {
         const searchable = [
             record.requestId,
+            record.sequence,
             record.model,
             record.finalAccountName,
             record.apiKeyId,
@@ -244,23 +438,37 @@ function createCounts() {
     return {
         abortedCount: 0,
         attemptCount: 0,
+        cacheAnomalyCount: 0,
         cacheReadCoverage: 0,
         cacheReadEligibleInputTokens: 0,
         cacheReadRate: null,
+        completedCount: 0,
         errorCount: 0,
         successCount: 0,
         tokenUsage: Object.fromEntries(TOKEN_FIELDS.map(field => [field, null])),
         tokenUsageCoverage: Object.fromEntries(TOKEN_FIELDS.map(field => [field, 0])),
         totalRequests: 0,
         touchedRequests: 0,
+        unknownCount: 0,
     };
 }
 
 function addRequestCounts(counts, record) {
     counts.totalRequests += 1;
+    if ((record.finishedAt || record.startedAt || "") > (counts.lastUsedAt || ""))
+        counts.lastUsedAt = record.finishedAt || record.startedAt;
+    if (!counts.recentOutcomes) counts.recentOutcomes = [];
+    if (counts.recentOutcomes.length < 8)
+        counts.recentOutcomes.push({
+            outcome: record.outcome,
+            startedAt: record.startedAt,
+            statusCode: record.statusCode,
+        });
     if (record.outcome === "success") counts.successCount += 1;
     else if (record.outcome === "aborted") counts.abortedCount += 1;
-    else counts.errorCount += 1;
+    else if (record.outcome === "error") counts.errorCount += 1;
+    else counts.unknownCount += 1;
+    if (["success", "error", "aborted"].includes(record.outcome)) counts.completedCount += 1;
 }
 
 function addUsage(counts, rawUsage) {
@@ -277,15 +485,20 @@ function addUsage(counts, rawUsage) {
 function addCachePair(counts, rawUsage) {
     const usage = normalizeTokenUsage(rawUsage);
     if (!usage || usage.inputTokens === null || usage.cachedInputTokens === null) return;
+    if (usage.cachedInputTokens > usage.inputTokens) {
+        counts.cacheAnomalyCount += 1;
+        return;
+    }
     counts.cacheReadCoverage += 1;
     counts.cacheReadEligibleInputTokens += usage.inputTokens;
     counts._cachedInputForRate = (counts._cachedInputForRate || 0) + usage.cachedInputTokens;
 }
 
 function finishCounts(counts) {
-    counts.cacheReadRate = counts.cacheReadEligibleInputTokens
-        ? Number((((counts._cachedInputForRate || 0) / counts.cacheReadEligibleInputTokens) * 100).toFixed(1))
-        : null;
+    counts.cacheReadRate =
+        !counts.cacheAnomalyCount && counts.cacheReadEligibleInputTokens
+            ? Number((((counts._cachedInputForRate || 0) / counts.cacheReadEligibleInputTokens) * 100).toFixed(1))
+            : null;
     delete counts._cachedInputForRate;
     return counts;
 }
@@ -427,7 +640,8 @@ function buildTrend(records, query, nowMs) {
 }
 
 function buildOverview(records, query, activeRequests = 0, latestSequence = 0, nowMs = Date.now()) {
-    const summary = { ...createCounts(), avgDurationMs: 0, retriedRequests: 0, successRate: 0 };
+    records = recordsForView(records, query);
+    const summary = { ...createCounts(), avgDurationMs: null, durationCoverage: 0, retriedRequests: 0, successRate: 0 };
     const accountMap = new Map();
     const modelMap = new Map();
     const apiKeyMap = new Map();
@@ -436,6 +650,7 @@ function buildOverview(records, query, activeRequests = 0, latestSequence = 0, n
     const optionApiKeys = new Set();
     const optionCategories = new Set();
     const optionFormats = new Set();
+    const optionConversations = new Map();
     const matchedRecords = [];
     const recentFailures = [];
     let totalDurationMs = 0;
@@ -451,6 +666,12 @@ function buildOverview(records, query, activeRequests = 0, latestSequence = 0, n
         optionApiKeys.add(apiKeyId);
         optionCategories.add(record.requestCategory || "unknown");
         optionFormats.add(record.apiFormat || "unknown");
+        if (record.conversationId)
+            optionConversations.set(record.conversationId, {
+                conversationDate: record.conversationDate,
+                conversationId: record.conversationId,
+                conversationNumber: record.conversationNumber,
+            });
         if (!optionAccounts.has(finalAccountKey)) {
             optionAccounts.set(finalAccountKey, {
                 accountKey: finalAccountKey,
@@ -473,6 +694,7 @@ function buildOverview(records, query, activeRequests = 0, latestSequence = 0, n
         matchedRecords.push(record);
         addRecord(summary, record, query);
         totalDurationMs += Number.isFinite(record.durationMs) ? record.durationMs : 0;
+        if (Number.isFinite(record.durationMs)) summary.durationCoverage += 1;
         if (record.attemptCount > 1) summary.retriedRequests += 1;
         if (record.outcome === "error" && recentFailures.length < 5) {
             recentFailures.push({
@@ -491,6 +713,7 @@ function buildOverview(records, query, activeRequests = 0, latestSequence = 0, n
                     ...createCounts(),
                     accountKey: finalAccountKey,
                     avgDurationMs: 0,
+                    durationCoverage: 0,
                     finalAccountName: record.finalAccountName || accountNameFromKey(record.accountKey),
                     finalAuthIndex: record.finalAuthIndex ?? null,
                     identitySource: accountIdentitySource(finalAccountKey),
@@ -503,6 +726,7 @@ function buildOverview(records, query, activeRequests = 0, latestSequence = 0, n
             }
             addRequestCounts(finalAccount, record);
             finalAccount.totalDurationMs += Number.isFinite(record.durationMs) ? record.durationMs : 0;
+            if (Number.isFinite(record.durationMs)) finalAccount.durationCoverage += 1;
             if ((record.finishedAt || "") > (finalAccount.lastUsedAt || ""))
                 finalAccount.lastUsedAt = record.finishedAt;
         }
@@ -517,6 +741,7 @@ function buildOverview(records, query, activeRequests = 0, latestSequence = 0, n
                     ...createCounts(),
                     accountKey: event.accountKey,
                     avgDurationMs: 0,
+                    durationCoverage: 0,
                     finalAccountName: event.accountName,
                     finalAuthIndex: event.authIndex,
                     identitySource: accountIdentitySource(event.accountKey),
@@ -552,16 +777,33 @@ function buildOverview(records, query, activeRequests = 0, latestSequence = 0, n
         addRecord(apiKeyStats, record, query);
     }
 
-    summary.avgDurationMs = summary.totalRequests ? Math.round(totalDurationMs / summary.totalRequests) : 0;
-    summary.successRate = rate(summary.successCount, summary.totalRequests);
+    summary.avgDurationMs = summary.durationCoverage ? Math.round(totalDurationMs / summary.durationCoverage) : null;
+    if (query.view !== "requests")
+        summary.retriedRequests = new Set(
+            matchedRecords.filter(record => record.parentAttemptCount > 1).map(record => record.requestId)
+        ).size;
+    summary.successRate =
+        summary.successCount + summary.errorCount
+            ? rate(summary.successCount, summary.successCount + summary.errorCount)
+            : null;
+    summary.clientRequestCount = new Set(matchedRecords.map(record => record.requestId)).size;
     summary.activeRequests = activeRequests;
     finishCounts(summary);
     const accounts = Array.from(accountMap.values())
         .map(account => {
-            account.avgDurationMs = account.totalRequests
-                ? Math.round(account.totalDurationMs / account.totalRequests)
-                : 0;
-            account.successRate = rate(account.successCount, account.totalRequests);
+            account.avgDurationMs = account.durationCoverage
+                ? Math.round(account.totalDurationMs / account.durationCoverage)
+                : null;
+            account.successRate =
+                account.successCount + account.errorCount
+                    ? rate(account.successCount, account.successCount + account.errorCount)
+                    : null;
+            account.clientRequestCount = new Set(
+                matchedRecords
+                    .filter(record => getAccountKey(record) === account.accountKey)
+                    .map(record => record.requestId)
+            ).size;
+            if (query.view !== "requests") account.touchedRequests = account.clientRequestCount;
             return finishCounts(account);
         })
         .sort(
@@ -571,10 +813,26 @@ function buildOverview(records, query, activeRequests = 0, latestSequence = 0, n
                 a.accountKey.localeCompare(b.accountKey)
         );
     const models = Array.from(modelMap.values())
-        .map(model => finishCounts({ ...model, successRate: rate(model.successCount, model.totalRequests) }))
+        .map(model =>
+            finishCounts({
+                ...model,
+                successRate:
+                    model.successCount + model.errorCount
+                        ? rate(model.successCount, model.successCount + model.errorCount)
+                        : null,
+            })
+        )
         .sort((a, b) => b.totalRequests - a.totalRequests || a.model.localeCompare(b.model));
     const apiKeys = Array.from(apiKeyMap.values())
-        .map(apiKey => finishCounts({ ...apiKey, successRate: rate(apiKey.successCount, apiKey.totalRequests) }))
+        .map(apiKey =>
+            finishCounts({
+                ...apiKey,
+                successRate:
+                    apiKey.successCount + apiKey.errorCount
+                        ? rate(apiKey.successCount, apiKey.successCount + apiKey.errorCount)
+                        : null,
+            })
+        )
         .sort((a, b) => b.totalRequests - a.totalRequests || a.apiKeyId.localeCompare(b.apiKeyId));
     const { bucketMs, granularity, trend } = buildTrend(matchedRecords, query, nowMs);
 
@@ -588,10 +846,12 @@ function buildOverview(records, query, activeRequests = 0, latestSequence = 0, n
             apiKeys: Array.from(optionApiKeys)
                 .sort()
                 .map(apiKeyId => ({ apiKeyId })),
+            conversations: [...optionConversations.values()],
             models: Array.from(optionModels).sort(),
             requestCategories: Array.from(optionCategories).sort(),
         },
         latestSequence,
+        metricScope: query.view || "attempts",
         models,
         range: {
             bucketMs,
@@ -600,7 +860,8 @@ function buildOverview(records, query, activeRequests = 0, latestSequence = 0, n
             key: query.rangeKey,
             timezone: query.timezone,
             to: query.toMs === null ? null : new Date(query.toMs).toISOString(),
-            tokenUsageScope: query.accountKey ? "matching-attempts" : "request",
+            tokenUsageScope:
+                query.view === "requests" ? (query.accountKey ? "matching-attempts" : "request") : "attempt",
         },
         recentFailures,
         summary,
@@ -609,15 +870,28 @@ function buildOverview(records, query, activeRequests = 0, latestSequence = 0, n
 }
 
 function listRequests(records, query) {
+    records = recordsForView(records, query);
+    const snapshotSequence =
+        query.snapshotSequence ??
+        records.reduce((max, record) => Math.max(max, record.parentSequence || record.sequence || 0), 0);
     const items = [];
     let hasMore = false;
     let totalMatched = 0;
     for (let index = records.length - 1; index >= 0; index -= 1) {
         const record = records[index];
         if (!matchesTime(record, query) || !matchesFilters(record, query)) continue;
-        totalMatched += 1;
         const sequence = Number.isSafeInteger(record.sequence) && record.sequence > 0 ? record.sequence : index + 1;
-        if (query.cursor !== null && sequence >= query.cursor) continue;
+        if (sequence > snapshotSequence) continue;
+        totalMatched += 1;
+        if (query.cursor !== null) {
+            if (query.view === "requests") {
+                if (sequence >= Number(query.cursor)) continue;
+            } else {
+                const [cursorSequence, cursorIndex = 0] = String(query.cursor).split(":").map(Number);
+                if (sequence > cursorSequence || (sequence === cursorSequence && record.attemptIndex >= cursorIndex))
+                    continue;
+            }
+        }
         if (items.length < query.limit) {
             items.push({
                 ...record,
@@ -631,10 +905,19 @@ function listRequests(records, query) {
     return {
         hasMore,
         items,
-        nextCursor: hasMore ? items[items.length - 1].sequence : null,
-        tokenUsageScope: query.accountKey ? "matching-attempts" : "request",
+        metricScope: query.view || "attempts",
+        nextCursor: hasMore
+            ? query.view === "requests"
+                ? items[items.length - 1].sequence
+                : `${snapshotSequence}:${items[items.length - 1].cursorKey}:${query.fromMs ?? "-"}:${query.toMs ?? "-"}`
+            : null,
+        tokenUsageScope: query.view === "requests" ? (query.accountKey ? "matching-attempts" : "request") : "attempt",
         totalMatched,
     };
 }
 
-module.exports = { buildOverview, listRequests, parseUsageQuery, UsageQueryError };
+function exportRecords(records, query) {
+    return recordsForView(records, query).filter(record => matchesTime(record, query) && matchesFilters(record, query));
+}
+
+module.exports = { buildOverview, exportRecords, listRequests, parseUsageQuery, projectAttempts, UsageQueryError };

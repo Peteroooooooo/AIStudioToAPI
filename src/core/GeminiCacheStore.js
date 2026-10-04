@@ -45,6 +45,14 @@ class GeminiCacheStore {
         return Number.isSafeInteger(limit) && limit >= 0 ? limit : DEFAULT_MAX_ENTRIES;
     }
 
+    _expiresAt(entry) {
+        const upstream = Math.min(timestamp(entry.expireTime), timestamp(entry.upstreamExpireTime || entry.expireTime));
+        const ttl = this.config.cacheTtlSeconds;
+        return Number.isFinite(ttl) && ttl > 0
+            ? Math.min(upstream, timestamp(entry.ttlStartAt || entry.createdAt) + ttl * 1000)
+            : upstream;
+    }
+
     _identity(accountKey, model) {
         if ((typeof accountKey !== "string" && typeof accountKey !== "number") || !String(accountKey)) {
             throw new TypeError("A nonempty accountKey is required for Gemini cache isolation.");
@@ -103,7 +111,7 @@ class GeminiCacheStore {
         const hashes = this._prefixHashes("content-owner", model, googleRequest, searchLimit, scopeKey);
         const allowed = new Set(
             [...this.entries.values()]
-                .filter(entry => timestamp(entry.expireTime) > timestamp(now))
+                .filter(entry => this._expiresAt(entry) > timestamp(now))
                 .sort((left, right) => timestamp(right.lastUsedAt) - timestamp(left.lastUsedAt))
                 .slice(0, this._maxEntries())
                 .map(entry => entry.hash)
@@ -117,16 +125,19 @@ class GeminiCacheStore {
                     (entry.scopeKey || null) === (scopeKey || null) &&
                     entry.contentHash === hashes[entry.prefixLength] &&
                     allowed.has(entry.hash) &&
-                    isUsable(entry)
+                    isUsable({ ...entry, expireTime: new Date(this._expiresAt(entry)).toISOString() })
             )
             .sort((left, right) => right.prefixLength - left.prefixLength)
-            .map(entry => ({ entry: { ...entry }, prefixLength: entry.prefixLength }));
+            .map(entry => ({
+                entry: { ...entry, expireTime: new Date(this._expiresAt(entry)).toISOString() },
+                prefixLength: entry.prefixLength,
+            }));
     }
 
     _prune(entries, now = Date.now()) {
         const evicted = [];
         for (const [hash, entry] of entries) {
-            if (timestamp(entry.expireTime) <= now) {
+            if (this._expiresAt(entry) <= now) {
                 evicted.push({ ...entry });
                 entries.delete(hash);
             }
@@ -152,7 +163,9 @@ class GeminiCacheStore {
 
     _rememberEvicted(pendingDeletes, evicted) {
         for (const entry of evicted) {
-            if (timestamp(entry.expireTime) > Date.now()) pendingDeletes.set(this._deleteKey(entry), { ...entry });
+            const expireTime = entry.upstreamExpireTime || entry.expireTime;
+            if (timestamp(expireTime) > Date.now())
+                pendingDeletes.set(this._deleteKey(entry), { ...entry, expireTime });
         }
     }
 
@@ -193,7 +206,13 @@ class GeminiCacheStore {
             ) {
                 continue;
             }
-            this.entries.set(entry.hash, { ...entry });
+            const restored = {
+                ...entry,
+                ttlStartAt: entry.ttlStartAt || entry.createdAt,
+                upstreamExpireTime: entry.upstreamExpireTime || entry.expireTime,
+            };
+            restored.expireTime = new Date(this._expiresAt(restored)).toISOString();
+            this.entries.set(entry.hash, restored);
         }
         const savedPendingDeletes = Array.isArray(saved.pendingDeletes) ? saved.pendingDeletes : [];
         for (const entry of savedPendingDeletes) {
@@ -283,7 +302,7 @@ class GeminiCacheStore {
             return null;
         }
         const valid = [...this.entries.values()]
-            .filter(entry => timestamp(entry.expireTime) > nowMs)
+            .filter(entry => this._expiresAt(entry) > nowMs)
             .sort((left, right) => timestamp(right.lastUsedAt) - timestamp(left.lastUsedAt))
             .slice(0, limit);
         if (valid.length !== this.entries.size) this._scheduleMaintenance();
@@ -293,7 +312,8 @@ class GeminiCacheStore {
         for (let prefixLength = searchLimit; prefixLength >= 0; prefixLength--) {
             const hash = hashes[prefixLength];
             const entry = this.entries.get(hash);
-            if (entry && allowed.has(hash) && isUsable(entry)) return { entry: { ...entry }, prefixLength };
+            const effective = entry && { ...entry, expireTime: new Date(this._expiresAt(entry)).toISOString() };
+            if (effective && allowed.has(hash) && isUsable(effective)) return { entry: effective, prefixLength };
         }
         return null;
     }
@@ -311,6 +331,7 @@ class GeminiCacheStore {
         canRetireAncestor = () => true,
         conversationKey = null,
         ownerVersion = null,
+        ttlStartAt = null,
     }) {
         const identity = this._identity(accountKey, model);
         const contents = this._contents(googleRequest);
@@ -332,14 +353,15 @@ class GeminiCacheStore {
         return this._enqueue(async () => {
             const now = new Date().toISOString();
             const previous = this.entries.get(hash);
+            const sameResource = previous?.name === name;
             const entry = {
                 accountKey: identity.accountKey,
                 contentHash: this.contentKey({ googleRequest, model, prefixLength, scopeKey }),
                 conversationKey,
-                createdAt: previous?.createdAt || now,
+                createdAt: sameResource ? previous.createdAt : now,
                 expireTime: new Date(expiryMs).toISOString(),
                 hash,
-                hitCount: previous?.hitCount || 0,
+                hitCount: sameResource ? previous.hitCount || 0 : 0,
                 lastUsedAt: now,
                 model: identity.model,
                 name,
@@ -347,7 +369,10 @@ class GeminiCacheStore {
                 prefixLength,
                 scopeKey,
                 tokenCount,
+                ttlStartAt: ttlStartAt || (sameResource ? previous.ttlStartAt || previous.createdAt : now),
+                upstreamExpireTime: new Date(expiryMs).toISOString(),
             };
+            entry.expireTime = new Date(this._expiresAt(entry)).toISOString();
             const next = new Map(this.entries);
             next.set(hash, entry);
             const retired = [];
@@ -407,7 +432,7 @@ class GeminiCacheStore {
     hasCurrent(entry) {
         if (!entry?.hash) return false;
         const current = this.entries.get(entry.hash);
-        return Boolean(current && current.name === entry.name && timestamp(current.expireTime) > Date.now());
+        return Boolean(current && current.name === entry.name && this._expiresAt(current) > Date.now());
     }
 
     async recordHit(entry) {
@@ -458,7 +483,7 @@ class GeminiCacheStore {
 
     stats() {
         const now = Date.now();
-        const active = [...this.entries.values()].filter(entry => timestamp(entry.expireTime) > now);
+        const active = [...this.entries.values()].filter(entry => this._expiresAt(entry) > now);
         return {
             entryCount: Math.min(active.length, this._maxEntries()),
             hitCount: active.reduce((sum, entry) => sum + (entry.hitCount || 0), 0),

@@ -22,6 +22,10 @@ const {
 } = require("../utils/CustomErrors");
 
 const WS_INIT_TIMEOUT_MS = 120000;
+const CONTEXT_INIT_TIMEOUT_MS = 300000;
+const BROWSER_RPC_TIMEOUT_MS = 15000;
+const CONTEXT_CLEANUP_TIMEOUT_MS = 5000;
+const POOL_REFILL_INTERVAL_MS = 10000;
 const LOGIN_CONFIRM_WAIT_MS = 1500;
 const EXPIRED_RECHECK_SCHEDULER_MS = 60 * 1000;
 const EXPIRED_RECHECK_INTERVAL_MS = 15 * 60 * 1000;
@@ -164,6 +168,7 @@ class BrowserManager {
             }
         }, EXPIRED_RECHECK_SCHEDULER_MS);
         this._expiredRecheckTimer.unref?.();
+        this._startPoolMaintenance();
     }
 
     get currentAuthIndex() {
@@ -232,6 +237,223 @@ class BrowserManager {
         });
     }
 
+    _ensurePoolState() {
+        this._accountRuntime ||= new Map();
+        this._initializationTokens ||= new Map();
+        this._candidateFailures ||= new Map();
+        this._transportFailedAccounts ||= new Set();
+        this._accountTestReservations ||= new Map();
+    }
+
+    _runtime(index, state, reason, phase = null, nextRetryAt = null) {
+        this._ensurePoolState();
+        const previous = this._accountRuntime.get(index);
+        this._accountRuntime.set(index, {
+            nextRetryAt,
+            phase,
+            reason,
+            since: previous?.state === state && previous?.phase === phase ? previous.since : Date.now(),
+            state,
+        });
+    }
+
+    getAccountRuntimeState(authIndex) {
+        this._ensurePoolState();
+        const recorded = this._accountRuntime.get(authIndex);
+        const health = this.authSource.health.getStatus?.(authIndex) || {};
+        const serving = this.getReadyAccountIndices().includes(authIndex);
+        let state = recorded?.state || "standby";
+        let reason = recorded?.reason || "not_loaded";
+        if (this.pendingContextClosures.has(authIndex)) {
+            state = "draining";
+            reason = this.pendingContextClosures.get(authIndex);
+        } else if (!this.authSource.getRotationIndices().includes(authIndex)) {
+            state = "unavailable";
+            reason = health.mode || "excluded";
+        } else if (this.initializingContexts.has(authIndex)) {
+            state = "initializing";
+            reason = "initialization_in_progress";
+        } else if (serving) {
+            state = health.probeRequired ? "verifying" : "ready";
+            reason = health.probeRequired ? (health.probeInFlight ? "probe_in_progress" : "probe_required") : null;
+        } else if (this.connectionRegistry?.isReconnectingInProgress?.(authIndex)) {
+            state = "reconnecting";
+            reason = "connection_recovery";
+        } else if (this._transportFailedAccounts.has(authIndex)) {
+            state = "stalled";
+            reason = recorded?.reason || "transport_failure";
+        } else if (this.contexts.has(authIndex)) {
+            state = "stalled";
+            reason = "connection_not_ready";
+        } else if (state === "ready" || state === "verifying" || state === "initializing" || state === "reconnecting") {
+            state = "standby";
+            reason = "not_loaded";
+        }
+        return {
+            authIndex,
+            connected: Boolean(this.connectionRegistry?.isAccountConnected?.(authIndex)),
+            hasContext: this.contexts.has(authIndex),
+            nextRetryAt: state === "stalled" ? recorded?.nextRetryAt || null : null,
+            phase: ["ready", "verifying", "standby", "unavailable"].includes(state) ? null : recorded?.phase || null,
+            reason,
+            serving,
+            since: recorded?.since || null,
+            state,
+        };
+    }
+
+    getPoolSnapshot() {
+        const indices = new Set([
+            ...(this.authSource.initialIndices || this.authSource.getRotationIndices()),
+            ...this.contexts.keys(),
+            ...this.initializingContexts,
+        ]);
+        const accounts = [...indices].map(index => this.getAccountRuntimeState(index));
+        const target = this.config.maxContexts || this.authSource.getRotationIndices().length;
+        const members = new Set(this.getReadyAccountIndices());
+        const count = state =>
+            accounts.filter(
+                account =>
+                    account.state === state &&
+                    (!["ready", "verifying"].includes(state) || members.has(account.authIndex))
+            ).length;
+        return {
+            accounts,
+            draining: count("draining"),
+            initializing: count("initializing"),
+            ready: count("ready"),
+            reconnecting: count("reconnecting"),
+            shortfall: Math.max(0, target - count("ready") - count("verifying")),
+            stalled: count("stalled"),
+            target,
+            verifying: count("verifying"),
+        };
+    }
+
+    _startPoolMaintenance() {
+        if (this._poolMaintenanceTimer) return;
+        this._poolMaintenanceTimer = setInterval(() => {
+            if (!this.browser || this.isClosingIntentionally) return;
+            this.rebalanceContextPool().catch(error => this.logger.warn(`[ContextPool] ${error.message}`));
+        }, POOL_REFILL_INTERVAL_MS);
+        this._poolMaintenanceTimer.unref?.();
+    }
+
+    _stopPoolMaintenance() {
+        clearInterval(this._poolMaintenanceTimer);
+        this._poolMaintenanceTimer = null;
+    }
+
+    _assertInitialization(token) {
+        if (!token) return;
+        if (token.cancelled || this._initializationTokens?.get(token.authIndex) !== token) {
+            throw new ContextAbortedError(token.authIndex, "initialization superseded or timed out");
+        }
+    }
+
+    isConnectionGenerationCurrent(authIndex, contextGeneration) {
+        const test = this._accountTestConnection;
+        if (test?.authIndex === authIndex && !test.cancelled && String(contextGeneration) === test.generation)
+            return true;
+        const recheck = this._recheckConnectionGenerations?.get(authIndex);
+        if (recheck && !this._expiredRecheckAborted && String(contextGeneration) === recheck) return true;
+        const token = this._initializationTokens?.get(authIndex);
+        if (!token) {
+            const residentGeneration = this.contexts.get(authIndex)?.generation;
+            if (residentGeneration) return String(contextGeneration) === residentGeneration;
+            return contextGeneration === undefined || contextGeneration === null || contextGeneration === "";
+        }
+        return !token.cancelled && String(contextGeneration) === String(token.generation);
+    }
+
+    async _bounded(operation, timeout, description, token = null, onLateResult = null) {
+        this._assertInitialization(token);
+        let timer;
+        let expired = false;
+        const pending = Promise.resolve().then(operation);
+        pending.then(
+            value => {
+                if ((expired || token?.cancelled) && onLateResult) {
+                    Promise.resolve(onLateResult(value)).catch(() => {});
+                }
+            },
+            () => {}
+        );
+        try {
+            const result = await Promise.race([
+                pending,
+                new Promise((_, reject) => {
+                    timer = setTimeout(
+                        () => {
+                            expired = true;
+                            const error = new Error(`${description} exceeded its deadline (${timeout}ms).`);
+                            error.code = "BROWSER_OPERATION_TIMEOUT";
+                            reject(error);
+                        },
+                        Math.max(1, timeout)
+                    );
+                }),
+                ...(token?.abortPromise ? [token.abortPromise] : []),
+            ]);
+            this._assertInitialization(token);
+            return result;
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    _initStage(token, phase, operation, limit = BROWSER_RPC_TIMEOUT_MS, onLateResult = null) {
+        this._runtime(token.authIndex, "initializing", "initialization_in_progress", phase);
+        this.logger.debug(`[Context#${token.authIndex}] Initialization phase: ${phase}`);
+        return this._bounded(
+            operation,
+            Math.min(limit, Math.max(1, token.deadline - Date.now())),
+            `Account #${token.authIndex} ${phase}`,
+            token,
+            onLateResult
+        );
+    }
+
+    async _cleanupOperation(operation, description) {
+        try {
+            await this._bounded(operation, this._cleanupTimeoutMs || CONTEXT_CLEANUP_TIMEOUT_MS, description);
+        } catch (error) {
+            this.logger.warn(`[ContextPool] ${description}: ${error.message}`);
+        }
+    }
+
+    _backOffCandidate(index, error) {
+        this._ensurePoolState();
+        const failures = (this._candidateFailures.get(index) || 0) + 1;
+        this._candidateFailures.set(index, failures);
+        this._runtime(
+            index,
+            "stalled",
+            error.message,
+            this._accountRuntime.get(index)?.phase,
+            Date.now() + Math.min(300000, 30000 * 2 ** Math.min(4, failures - 1))
+        );
+    }
+
+    markAccountTransportFailure(index, reason = "transport_failure") {
+        this._ensurePoolState();
+        this._transportFailedAccounts.add(index);
+        this._runtime(index, "stalled", reason, "close_unresponsive_context");
+        this._closeContextForPoolIfPossible(index, "transport_failure").catch(error =>
+            this.logger.warn(`[ContextPool] Failed to retire account #${index}: ${error.message}`)
+        );
+        if (this.browser && !this.isClosingIntentionally) {
+            this.rebalanceContextPool().catch(error => this.logger.warn(`[ContextPool] ${error.message}`));
+        }
+    }
+
+    markAccountTestRecovered(index) {
+        this._ensurePoolState();
+        this._transportFailedAccounts.delete(index);
+        this._candidateFailures.delete(index);
+        this._runtime(index, this.contexts.has(index) ? "ready" : "standby", "not_loaded");
+    }
+
     isAccountReady(authIndex) {
         const entry = this.contexts.get(authIndex);
         return Boolean(
@@ -242,6 +464,7 @@ class BrowserManager {
             !this.authSource.pendingRefreshIndices?.has(authIndex) &&
             !this.pendingContextClosures.has(authIndex) &&
             !this.initializingContexts.has(authIndex) &&
+            !this._transportFailedAccounts?.has(authIndex) &&
             this.connectionRegistry?.isAccountConnected(authIndex)
         );
     }
@@ -255,11 +478,15 @@ class BrowserManager {
     _getServingPoolOccupancy() {
         const eligible = new Set(this.authSource.getRotationIndices());
         return [...new Set([...this.contexts.keys(), ...this.initializingContexts])].filter(
-            index => eligible.has(index) && !this.pendingContextClosures.has(index)
+            index =>
+                eligible.has(index) &&
+                !this.pendingContextClosures.has(index) &&
+                (this.initializingContexts.has(index) || this.isAccountReady(index))
         ).length;
     }
 
     async ensureAccountReady(authIndex) {
+        if (this._accountTestConnection?.authIndex === authIndex) return false;
         if (this.isAccountReady(authIndex)) return true;
         if (!this.authSource.getRotationIndices().includes(authIndex)) return false;
         if (this._accountReadyTasks.has(authIndex)) return this._accountReadyTasks.get(authIndex);
@@ -305,6 +532,7 @@ class BrowserManager {
     }
 
     async ensureAccountPoolReady() {
+        this._startPoolMaintenance();
         // Existing ready accounts are never held behind another account's launch.
         if (this.getReadyAccountIndices().length > 0) {
             this.rebalanceContextPool().catch(error => this.logger.warn(`[ContextPool] ${error.message}`));
@@ -532,8 +760,22 @@ class BrowserManager {
         logPrefix = "[Browser]",
         timeout = WS_INIT_TIMEOUT_MS,
         authIndex = -1,
-        isBackgroundTask = false
+        isBackgroundTask = false,
+        initializationToken = null
     ) {
+        const token = initializationToken || { cancelled: false };
+        try {
+            return await this._bounded(
+                () => this._waitForWebSocketInitLoop(page, logPrefix, timeout, authIndex, isBackgroundTask, token),
+                timeout,
+                `${logPrefix} WebSocket initialization`
+            );
+        } finally {
+            if (!initializationToken) token.cancelled = true;
+        }
+    }
+
+    async _waitForWebSocketInitLoop(page, logPrefix, timeout, authIndex, isBackgroundTask, token) {
         this.logger.info(
             `${logPrefix} ⏳ Waiting for Continue/Launch button or WebSocket initialization (timeout: ${timeout / 1000}s)...`
         );
@@ -543,16 +785,35 @@ class BrowserManager {
         let continueClicked = false;
         let skipClicked = false;
         let iteration = 0;
+        const poll = async (phase, operation) => {
+            if (token.cancelled) throw new ContextAbortedError(authIndex, "WebSocket wait cancelled");
+            if (authIndex >= 0)
+                this._runtime(
+                    authIndex,
+                    logPrefix.includes("Reconnect") ? "reconnecting" : "initializing",
+                    "waiting_for_websocket",
+                    phase
+                );
+            const result = await this._bounded(
+                operation,
+                Math.min(BROWSER_RPC_TIMEOUT_MS, Math.max(1, timeout - (Date.now() - startTime))),
+                `${logPrefix} ${phase}`,
+                token.authIndex !== undefined ? token : null
+            );
+            if (token.cancelled) throw new ContextAbortedError(authIndex, "WebSocket wait cancelled");
+            return result;
+        };
 
         try {
             while (Date.now() - startTime < timeout) {
+                if (token.cancelled) throw new ContextAbortedError(authIndex, "WebSocket wait timed out");
                 this._throwIfContextInitAborted(authIndex, isBackgroundTask, logPrefix, "WebSocket wait");
 
                 // Read state fresh each iteration
                 const state = this._wsInitState.get(authIndex);
 
                 // Check if initialization succeeded
-                if (state && state.success) {
+                if (this.connectionRegistry?.isAccountConnected?.(authIndex)) {
                     return true;
                 }
 
@@ -564,11 +825,8 @@ class BrowserManager {
 
                 if (!continueClicked) {
                     const continueText = "Continue to the app";
-                    continueClicked = await this._clickButtonByTextIfVisible(
-                        page,
-                        continueText,
-                        logPrefix,
-                        `popup "${continueText}"`
+                    continueClicked = await poll("websocket_continue", () =>
+                        this._clickButtonByTextIfVisible(page, continueText, logPrefix, `popup "${continueText}"`)
                     );
                     if (continueClicked) {
                         this.logger.info(`${logPrefix} Found "${continueText}" button, clicking...`);
@@ -577,11 +835,8 @@ class BrowserManager {
 
                 if (!skipClicked) {
                     const skipText = "Skip";
-                    skipClicked = await this._clickButtonByTextIfVisible(
-                        page,
-                        skipText,
-                        logPrefix,
-                        `popup "${skipText}"`
+                    skipClicked = await poll("websocket_skip", () =>
+                        this._clickButtonByTextIfVisible(page, skipText, logPrefix, `popup "${skipText}"`)
                     );
                     if (skipClicked) {
                         this.logger.info(`${logPrefix} Found "${skipText}" button, clicking...`);
@@ -589,11 +844,11 @@ class BrowserManager {
                 }
 
                 if (iteration % 5 === 0) {
-                    await this._clickLaunchButtonIfVisible(page, logPrefix);
+                    await poll("websocket_launch", () => this._clickLaunchButtonIfVisible(page, logPrefix));
                 }
 
                 // Check for page errors
-                const errors = await this._checkPageErrors(page);
+                const errors = await poll("websocket_page_errors", () => this._checkPageErrors(page));
                 if (errors.appletFailed || errors.concurrentUpdates || errors.snapshotFailed) {
                     this.logger.warn(`${logPrefix} Detected page error: ${JSON.stringify(errors)}`);
                     return false;
@@ -604,7 +859,7 @@ class BrowserManager {
                         const vp = page.viewportSize() || { height: 1080, width: 1920 };
                         const randomX = Math.floor(Math.random() * (vp.width * 0.7));
                         const randomY = Math.floor(Math.random() * (vp.height * 0.7));
-                        await this._simulateHumanMovement(page, randomX, randomY);
+                        await poll("websocket_mouse", () => this._simulateHumanMovement(page, randomX, randomY));
                     } catch (e) {
                         // Ignore movement errors
                     }
@@ -651,7 +906,11 @@ class BrowserManager {
     async _captureStorageState(context) {
         // A partial fallback would overwrite existing IndexedDB credentials in the
         // auth file. Keep the previous snapshot unchanged if complete capture fails.
-        return context.storageState({ indexedDB: true });
+        return this._bounded(
+            () => context.storageState({ indexedDB: true }),
+            this._cleanupTimeoutMs || CONTEXT_CLEANUP_TIMEOUT_MS,
+            "Capture account storage state"
+        );
     }
 
     async _writeAuthFileFromContext(authIndex) {
@@ -784,7 +1043,8 @@ class BrowserManager {
      * Feature: Generate Privacy Protection Script (Stealth Mode)
      * Injects specific GPU info and masks webdriver properties to avoid bot detection.
      */
-    _getPrivacyProtectionScript(authIndex) {
+    _getPrivacyProtectionScript(authIndex, generationOverride = undefined) {
+        const contextGeneration = generationOverride ?? this._initializationTokens?.get(authIndex)?.generation ?? null;
         let seedSource = `account_salt_${authIndex}`;
 
         // Attempt to use accountName (email) for better consistency across index reordering
@@ -865,7 +1125,8 @@ class BrowserManager {
                                 console.log('[BrowserManager] Received authIndex request, responding with: ${authIndex}');
                                 event.source.postMessage({
                                     type: 'authIndexResponse',
-                                    authIndex: ${authIndex}
+                                    authIndex: ${authIndex},
+                                    contextGeneration: ${JSON.stringify(contextGeneration)}
                                 }, '*');
                             }
                         });
@@ -940,6 +1201,26 @@ class BrowserManager {
     //
     //     throw new Error('Unable to find "Code" button or alternatives (Smart Click Failed)');
     // }
+
+    async _installHostedClient(context, authIndex, contextGeneration) {
+        const source = await fs.promises.readFile(
+            path.join(__dirname, "..", "..", "scripts", "client", "build.js"),
+            "utf8"
+        );
+        // The Build App bundle lives on Google, so editing local client files alone
+        // cannot update it. Serve the matching local client only to this browser
+        // context; the hosted app and other scripts remain untouched.
+        const bootstrap = `
+            if (!window.chrome) window.chrome = {};
+            window.chrome._contextId = ${JSON.stringify(authIndex)};
+            window.chrome._contextGeneration = ${JSON.stringify(contextGeneration)};
+            window.__authIndexReady = Promise.resolve(${JSON.stringify(authIndex)});
+        `;
+        await context.route("https://ais-*.run.app/assets/index-*.js", async route => {
+            if (route.request().resourceType() !== "script") return route.continue();
+            await route.fulfill({ body: bootstrap + source, contentType: "application/javascript", status: 200 });
+        });
+    }
 
     /**
      * Helper: Load and configure build.js script content
@@ -1129,8 +1410,9 @@ class BrowserManager {
      * @param {number} authIndex - The auth index being checked (default: -1). A confirmed login redirect marks it expired.
      * @throws {Error} If any error condition is detected
      */
-    async _checkPageStatusAndErrors(page, logPrefix = "[Browser]", authIndex = -1) {
+    async _checkPageStatusAndErrors(page, logPrefix = "[Browser]", authIndex = -1, token = null) {
         let { currentUrl, pageTitle } = await this._readPageIdentity(page, logPrefix);
+        this._assertInitialization(token);
 
         this.logger.debug(`${logPrefix} [Diagnostic] URL: ${currentUrl}`);
         this.logger.debug(`${logPrefix} [Diagnostic] Title: "${pageTitle}"`);
@@ -1138,6 +1420,7 @@ class BrowserManager {
         // Check for various error conditions
         if (this._isLoginPage(currentUrl, pageTitle)) {
             const confirmed = await this._confirmLoginRequired(page, logPrefix);
+            this._assertInitialization(token);
             if (!confirmed) {
                 ({ currentUrl, pageTitle } = await this._readPageIdentity(page, logPrefix));
             } else {
@@ -1168,7 +1451,11 @@ class BrowserManager {
         const currentUrl = page.url();
         let pageTitle = "";
         try {
-            pageTitle = await page.title();
+            pageTitle = await this._bounded(
+                () => page.title(),
+                this._cleanupTimeoutMs || CONTEXT_CLEANUP_TIMEOUT_MS,
+                `${logPrefix} read page title`
+            );
         } catch (error) {
             this.logger.warn(`${logPrefix} Unable to get page title: ${error.message}`);
         }
@@ -1230,6 +1517,224 @@ class BrowserManager {
         }
     }
 
+    async withAccountTestConnection(authIndex, callback, { signal, timeoutMs = 90000, requestId } = {}) {
+        this._ensurePoolState();
+        if (this._accountTestReservations.has(authIndex))
+            throw Object.assign(new Error("busy"), { reason: "busy", status: 409 });
+        const reservation = {};
+        this._accountTestReservations.set(authIndex, reservation);
+        try {
+            return await this._withAccountTestConnection(authIndex, callback, { requestId, signal, timeoutMs });
+        } finally {
+            if (this._accountTestReservations.get(authIndex) === reservation)
+                this._accountTestReservations.delete(authIndex);
+            // Commit test health first, then let the pool act on the resulting switch.
+            setImmediate(() => this.notifyAccountIdle(authIndex));
+        }
+    }
+
+    async _withAccountTestConnection(authIndex, callback, { signal, timeoutMs, requestId }) {
+        if (this.isAccountReady(authIndex)) return callback();
+        const fail = (reason, status = 409) => Object.assign(new Error(reason), { reason, status });
+        const manual = () => this.authSource.health.isManualProbe?.(authIndex, requestId);
+        const eligible = () =>
+            this.authSource.getRotationIndices().includes(authIndex) ||
+            (manual() && (this.authSource.rotationIndices || []).includes(authIndex));
+        const entry = this.contexts.get(authIndex);
+        if (
+            manual() &&
+            entry?.page &&
+            !entry.page.isClosed() &&
+            !this.initializingContexts.has(authIndex) &&
+            !this.pendingContextClosures.has(authIndex) &&
+            !this._transportFailedAccounts?.has(authIndex) &&
+            this.connectionRegistry.isAccountConnected(authIndex)
+        )
+            return callback();
+        if (manual() && entry && !this.initializingContexts.has(authIndex) && !this._hasActiveQueueForAuth(authIndex))
+            await this.closeContext(authIndex);
+        if (
+            this._accountTestConnection ||
+            this._expiredRecheckTask ||
+            this._isSystemBusy() ||
+            this.contexts.has(authIndex) ||
+            this.initializingContexts.has(authIndex) ||
+            this._hasActiveQueueForAuth(authIndex) ||
+            this.authSource.pendingRefreshIndices?.has(authIndex)
+        )
+            throw fail("busy");
+        if (!eligible()) throw fail("excluded");
+        const test = { authIndex, cancelled: false, generation: randomUUID() };
+        this._accountTestConnection = test;
+        let context,
+            page,
+            reusable = false;
+        const deadline = Date.now() + timeoutMs;
+        let rejectAbort;
+        const aborted = new Promise((_, reject) => {
+            rejectAbort = reject;
+        });
+        aborted.catch(() => {});
+        const abort = () => {
+            test.cancelled = true;
+            rejectAbort(fail("cancelled", 499));
+            context?.close().catch(() => {});
+        };
+        signal?.addEventListener("abort", abort, { once: true });
+        const step = async operation => {
+            if (signal?.aborted || test.cancelled) throw fail("cancelled", 499);
+            if (!eligible()) throw fail("excluded");
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) throw fail("startup_timeout", 504);
+            try {
+                const result = await Promise.race([
+                    this._bounded(operation, remaining, `Account test #${authIndex}`),
+                    aborted,
+                ]);
+                if (signal?.aborted || test.cancelled) throw fail("cancelled", 499);
+                return result;
+            } catch (error) {
+                if (Date.now() >= deadline) throw fail("startup_timeout", 504);
+                throw error;
+            }
+        };
+        try {
+            await step(() => this._ensureBrowser());
+            // One temporary diagnostic context, separate from the serving pool.
+            if (
+                this.config.maxContexts > 0 &&
+                this.contexts.size + this.initializingContexts.size > this.config.maxContexts
+            )
+                throw fail("busy");
+            const savedAuth = this.authSource.getAuth(authIndex);
+            if (!savedAuth) throw fail("invalid", 404);
+            const stickyProxy = this.stickyProxyManager.getProxyForAuth(authIndex);
+            const proxy = stickyProxy?.proxy || parseProxyConfig(this.config.proxyUrl, this.config.proxyBypass);
+            context = await step(async () => {
+                const created = await this.browser.newContext({
+                    deviceScaleFactor: 1,
+                    storageState: savedAuth,
+                    viewport: { height: 1080, width: 1920 },
+                    ...(proxy ? { proxy } : {}),
+                });
+                if (test.cancelled || Date.now() >= deadline) {
+                    created.close().catch(() => {});
+                    throw fail("cancelled", 499);
+                }
+                context = created;
+                return created;
+            });
+            await step(() => context.addInitScript(this._getPrivacyProtectionScript(authIndex, test.generation)));
+            await step(() => this._installHostedClient(context, authIndex, test.generation));
+            page = await step(() => context.newPage());
+            const previewAuth = { status: null };
+            page.on("response", response => {
+                if (
+                    response
+                        .url()
+                        .includes(
+                            "/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GenerateAccessToken"
+                        )
+                ) {
+                    previewAuth.status = response.status();
+                    if (previewAuth.status >= 400)
+                        this.logger.warn(
+                            `[AccountTest#${authIndex}] Google Preview GenerateAccessToken returned HTTP ${previewAuth.status}`
+                        );
+                }
+            });
+            page.on("console", message => {
+                if (test.cancelled) return;
+                const text = message.text();
+                if (text.includes("[ProxyClient]"))
+                    this.logger.info(`[AccountTest#${authIndex}] ${text.replace("[ProxyClient] ", "")}`);
+            });
+            await step(() => this._navigateAndWakeUpPage(page, `[AccountTest#${authIndex}]`));
+            await step(() => this._checkPageStatusAndErrors(page, `[AccountTest#${authIndex}]`, authIndex));
+            const ready = await step(() =>
+                this._waitForWebSocketInit(
+                    page,
+                    `[AccountTest#${authIndex}]`,
+                    Math.max(1, deadline - Date.now()),
+                    authIndex,
+                    false
+                )
+            );
+            if (!ready || !this.connectionRegistry.isAccountConnected(authIndex)) throw fail("not_connected", 503);
+            // A socket can open before Google's parent page permits Preview API calls.
+            // Match normal activation and keep handling Launch while the iframe settles.
+            this._sendActiveTrigger(`[AccountTest#${authIndex}]`, page);
+            // AI Studio may replace its preview iframe just after the first socket opens.
+            // Wait for the same socket to remain connected before dispatching a real test.
+            let connection = this.connectionRegistry.getConnectionByAuth(authIndex, false);
+            let stableSince = Date.now();
+            // Cover one complete client reconnect interval (5s), including iframe replacement.
+            const settleMs = this._accountTestSettleMs ?? 6000;
+            let nextWakeupAt = 0;
+            while (Date.now() - stableSince < settleMs) {
+                if (Date.now() >= nextWakeupAt) {
+                    const launched = await step(() =>
+                        this._clickLaunchButtonIfVisible(page, `[AccountTest#${authIndex}]`)
+                    );
+                    if (launched) stableSince = Date.now();
+                    nextWakeupAt = Date.now() + 1000;
+                }
+                await step(() => page.waitForTimeout(100));
+                const next = this.connectionRegistry.getConnectionByAuth(authIndex, false);
+                if (next !== connection || !this.connectionRegistry.isAccountConnected(authIndex)) {
+                    connection = next;
+                    stableSince = Date.now();
+                }
+            }
+            if (!connection || !this.connectionRegistry.isAccountConnected(authIndex)) throw fail("not_connected", 503);
+            // An auxiliary authorization error alone must not refuse a working model call.
+            try {
+                const result = await callback({ previewAuth, temporary: true });
+                reusable = true;
+                return result;
+            } catch (error) {
+                // An actual upstream rejection still proves the browser transport works.
+                reusable = error.upstreamStatusCode >= 400 && !error.transportFailure;
+                throw error;
+            }
+        } finally {
+            signal?.removeEventListener("abort", abort);
+            const retain =
+                reusable &&
+                !test.cancelled &&
+                !signal?.aborted &&
+                !this.isClosingIntentionally &&
+                page &&
+                !page.isClosed() &&
+                this.connectionRegistry.isAccountConnected(authIndex) &&
+                !this.authSource.isExpired(authIndex) &&
+                this.authSource.health.getStatus(authIndex).mode !== "reauth" &&
+                eligible() &&
+                !this.contexts.has(authIndex) &&
+                (!this.config.maxContexts ||
+                    this.contexts.size + this.initializingContexts.size < this.config.maxContexts);
+            if (retain) {
+                this._initializationTokens.delete(authIndex);
+                this.contexts.set(authIndex, {
+                    context,
+                    generation: test.generation,
+                    healthMonitorInterval: null,
+                    page,
+                });
+                this._runtime(authIndex, "ready", null);
+                this._startHealthMonitor(authIndex);
+                this._startBackgroundWakeup(authIndex);
+            } else {
+                test.cancelled = true;
+                if (context) await this._cleanupOperation(() => context.close(), `Close account test #${authIndex}`);
+                this.connectionRegistry.closeConnectionByAuth(authIndex);
+                this._wsInitState.delete(authIndex);
+                this._runtime(authIndex, "standby", "not_loaded");
+            }
+            if (this._accountTestConnection === test) this._accountTestConnection = null;
+        }
+    }
+
     async recheckExpiredAccount(authIndex) {
         if (!Number.isInteger(authIndex) || !this.authSource.availableIndices.includes(authIndex)) {
             return { reason: "unavailable", recovered: false };
@@ -1240,7 +1745,7 @@ class BrowserManager {
         if (!this.authSource.isExpired(authIndex) && this.authSource.health?.getStatus(authIndex)?.mode !== "reauth") {
             return { reason: "not_expired", recovered: false };
         }
-        if (this._expiredRecheckTask) return { reason: "busy", recovered: false };
+        if (this._expiredRecheckTask || this._accountTestConnection) return { reason: "busy", recovered: false };
         this._expiredRecheckAborted = false;
         this._expiredRecheckIndex = authIndex;
         const task = this._runExpiredRecheck(authIndex).then(async result => {
@@ -1327,6 +1832,9 @@ class BrowserManager {
         let launchedBrowser = false;
         let writeSuspended = false;
         let committedHealthReauth = false;
+        this._recheckConnectionGenerations ||= new Map();
+        const contextGeneration = randomUUID();
+        this._recheckConnectionGenerations.set(authIndex, contextGeneration);
         try {
             if (
                 (!this.authSource.isExpired(authIndex) &&
@@ -1371,7 +1879,8 @@ class BrowserManager {
             this._expiredRecheckContext = context;
             if (this._expiredRecheckAborted) return { reason: "busy", recovered: false };
 
-            await context.addInitScript(this._getPrivacyProtectionScript(authIndex));
+            await context.addInitScript(this._getPrivacyProtectionScript(authIndex, contextGeneration));
+            if (context.route) await this._installHostedClient(context, authIndex, contextGeneration);
 
             const page = await context.newPage();
             const wsState = { failed: false, success: false };
@@ -1470,7 +1979,9 @@ class BrowserManager {
         } finally {
             if (writeSuspended && !committedHealthReauth) this.resumeAuthUpdates(authIndex);
             this._expiredRecheckContext = null;
-            if (context) await context.close().catch(() => {});
+            if (this._recheckConnectionGenerations.get(authIndex) === contextGeneration)
+                this._recheckConnectionGenerations.delete(authIndex);
+            if (context) await this._cleanupOperation(() => context.close(), `Close credential recheck #${authIndex}`);
             if (this._expiredRecheckBrowser === probeBrowser) this._expiredRecheckBrowser = null;
             const closeWhenIdle = launchedBrowser || this._recheckBrowserOrphaned;
             this._recheckBrowserOrphaned = false;
@@ -1495,7 +2006,7 @@ class BrowserManager {
         if (!this._expiredRecheckTask) return;
         this._expiredRecheckAborted = true;
         if (this._expiredRecheckContext) {
-            await this._expiredRecheckContext.close().catch(() => {});
+            await this._cleanupOperation(() => this._expiredRecheckContext.close(), "Stop credential recheck");
         }
         await this._expiredRecheckTask.catch(() => {});
     }
@@ -1581,7 +2092,7 @@ class BrowserManager {
 
                 // Buttons such as Reload/Continue can navigate the app. Leave pages
                 // serving generation or cache maintenance untouched until they drain.
-                if (this._hasActiveQueueForAuth(authIndex)) return;
+                if (this._hasActiveQueueForAuth(authIndex) || this._accountTestReservations?.has(authIndex)) return;
 
                 tickCount++;
 
@@ -1711,14 +2222,24 @@ class BrowserManager {
         try {
             const timestamp = new Date().toISOString().replace(/[:.]/g, "-").substring(0, 19);
             const screenshotPath = path.join(process.cwd(), `debug_screenshot_${suffix}_${timestamp}.png`);
-            await targetPage.screenshot({
-                fullPage: true,
-                path: screenshotPath,
-            });
+            await this._bounded(
+                () =>
+                    targetPage.screenshot({
+                        fullPage: true,
+                        path: screenshotPath,
+                        timeout: this._cleanupTimeoutMs || CONTEXT_CLEANUP_TIMEOUT_MS,
+                    }),
+                this._cleanupTimeoutMs || CONTEXT_CLEANUP_TIMEOUT_MS,
+                "Save failure screenshot"
+            );
             this.logger.info(`[Debug] Failure screenshot saved to: ${screenshotPath}`);
 
             const htmlPath = path.join(process.cwd(), `debug_page_source_${suffix}_${timestamp}.html`);
-            const htmlContent = await targetPage.content();
+            const htmlContent = await this._bounded(
+                () => targetPage.content(),
+                this._cleanupTimeoutMs || CONTEXT_CLEANUP_TIMEOUT_MS,
+                "Read failure page source"
+            );
             fs.writeFileSync(htmlPath, htmlContent);
             this.logger.info(`[Debug] Failure page source saved to: ${htmlPath}`);
         } catch (e) {
@@ -1764,7 +2285,7 @@ class BrowserManager {
         while (this.contexts.get(authIndex) === contextData && contextData.page && !contextData.page.isClosed()) {
             try {
                 const currentPage = contextData.page;
-                if (this._hasActiveQueueForAuth(authIndex)) {
+                if (this._hasActiveQueueForAuth(authIndex) || this._accountTestReservations?.has(authIndex)) {
                     await new Promise(r => setTimeout(r, 1000));
                     continue;
                 }
@@ -2111,6 +2632,7 @@ class BrowserManager {
      * Launch browser instance if not already running
      */
     async _ensureBrowser() {
+        this._startPoolMaintenance();
         if (this.browser) return;
         if (this._browserLaunchTask) return this._browserLaunchTask;
 
@@ -2169,6 +2691,9 @@ class BrowserManager {
 
         this.logger.info(`[ContextPool] Aborting background preload task...`);
         this._backgroundPreloadAbort = true;
+        for (const token of this._initializationTokens?.values() || []) {
+            if (token.background && token.pending) token.cancel();
+        }
 
         try {
             await this._backgroundPreloadTask;
@@ -2187,6 +2712,9 @@ class BrowserManager {
      * @param {number} maxPoolSize - Stop when this.contexts.size reaches this limit (0 = no limit)
      */
     async _preloadBackgroundContexts(indices, maxPoolSize = 0) {
+        this._ensurePoolState();
+        this._preloadDesiredIndices = [...indices];
+        this._preloadDesiredCap = maxPoolSize;
         // Dispatching through another healthy account must not keep cancelling a
         // slow pool member's initialization.
         if (this._backgroundPreloadTask) return;
@@ -2248,6 +2776,7 @@ class BrowserManager {
     }
 
     async _closeContextForPoolIfPossible(authIndex, reason) {
+        if (this._accountTestReservations?.has(authIndex)) return false;
         if (this.pendingContextClosures.get(authIndex) === "reauth") {
             return this._closePendingContextIfIdle(authIndex);
         }
@@ -2273,6 +2802,7 @@ class BrowserManager {
     }
 
     async _closePendingContextIfIdleImpl(authIndex) {
+        if (this._accountTestReservations?.has(authIndex)) return false;
         if (!this.pendingContextClosures.has(authIndex)) {
             return false;
         }
@@ -2374,7 +2904,22 @@ class BrowserManager {
 
         let aborted = false;
 
-        for (const authIndex of indices) {
+        const attempted = new Set();
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+            const latest = this._preloadDesiredIndices || indices;
+            const eligible = new Set(this.authSource.getRotationIndices());
+            const authIndex = latest.find(
+                index =>
+                    eligible.has(index) &&
+                    !attempted.has(index) &&
+                    !this.contexts.has(index) &&
+                    !this.initializingContexts.has(index) &&
+                    (this._accountRuntime?.get(index)?.nextRetryAt || 0) <= Date.now()
+            );
+            if (authIndex === undefined) break;
+            attempted.add(authIndex);
+            maxPoolSize = this._preloadDesiredCap ?? maxPoolSize;
             // Check if abort was requested
             if (this._backgroundPreloadAbort) {
                 this.logger.info(`[ContextPool] Background preload aborted by request`);
@@ -2403,6 +2948,7 @@ class BrowserManager {
             }
 
             // Skip if already exists or being initialized by another task
+            if (this._accountTestConnection?.authIndex === authIndex) continue;
             if (this.contexts.has(authIndex)) {
                 this.logger.debug(`[ContextPool] Context #${authIndex} already exists, skipping`);
                 continue;
@@ -2418,8 +2964,14 @@ class BrowserManager {
             try {
                 this.logger.info(`[ContextPool] Background preload init context #${authIndex}...`);
                 await this._initializeContext(authIndex, true); // Mark as background task
+                this._candidateFailures?.delete(authIndex);
                 this.logger.info(`✅ [ContextPool] Background context #${authIndex} ready.`);
             } catch (error) {
+                if (
+                    !isContextAbortedError(error) &&
+                    (this._accountRuntime?.get(authIndex)?.nextRetryAt || 0) <= Date.now()
+                )
+                    this._backOffCandidate(authIndex, error);
                 // Check if this is an abort error (user deleted the account during initialization or background preload was aborted)
                 const isAbortError = isContextAbortedError(error);
                 if (isAbortError) {
@@ -2428,6 +2980,11 @@ class BrowserManager {
                     aborted = true;
                 } else {
                     this.logger.error(`❌ [ContextPool] Background context #${authIndex} failed: ${error.message}`);
+                }
+            } finally {
+                if (!this._initializationTokens?.get(authIndex)?.pending) {
+                    this.initializingContexts.delete(authIndex);
+                    this.abortedContexts.delete(authIndex);
                 }
             }
             // Note: initializingContexts and abortedContexts cleanup is handled in _initializeContext's finally block
@@ -2627,6 +3184,7 @@ class BrowserManager {
     }
 
     async _rebalanceContextPool() {
+        this._ensurePoolState();
         const maxContexts = this.config.maxContexts;
         // maxContexts === 0 means unlimited pool size
         const isUnlimited = maxContexts === 0;
@@ -2637,9 +3195,10 @@ class BrowserManager {
         const currentCanonical =
             this._currentAuthIndex >= 0 ? this.authSource.getCanonicalIndex(this._currentAuthIndex) : null;
         const ordered = [
-            ...rotation.filter(index => this.contexts.has(index)),
-            ...rotation.filter(index => !this.contexts.has(index)),
-        ];
+            ...rotation.filter(index => this.isAccountReady(index)),
+            ...rotation.filter(index => this.initializingContexts.has(index)),
+            ...rotation.filter(index => !this.contexts.has(index) && !this.initializingContexts.has(index)),
+        ].filter(index => (this._accountRuntime?.get(index)?.nextRetryAt || 0) <= Date.now());
 
         // Targets = first maxContexts from ordered (or all available if unlimited)
         // In unlimited mode, include all valid accounts (rotation + duplicates), excluding expired
@@ -2649,6 +3208,21 @@ class BrowserManager {
             targets = new Set(rotation);
         } else {
             targets = new Set(ordered.slice(0, maxContexts));
+        }
+
+        // Stopped accounts may keep a connected page, after enabled accounts have their places.
+        for (const [index, entry] of this.contexts) {
+            if (!isUnlimited && targets.size >= maxContexts) break;
+            if (
+                this.authSource.health.getStatus(index).mode === "disabled" &&
+                (this.authSource.rotationIndices || []).includes(index) &&
+                !this.authSource.isExpired(index) &&
+                entry.page &&
+                !entry.page.isClosed() &&
+                this.connectionRegistry.isAccountConnected(index) &&
+                !this._transportFailedAccounts.has(index)
+            )
+                targets.add(index);
         }
 
         for (const idx of targets) {
@@ -2666,6 +3240,7 @@ class BrowserManager {
             currentCanonicalIndex !== this._currentAuthIndex;
 
         for (const idx of this.contexts.keys()) {
+            if (this._accountTestReservations.has(idx)) continue;
             // The compatibility pointer must not retain an unhealthy account.
             if (idx === this._currentAuthIndex && targets.has(idx)) continue;
 
@@ -2717,7 +3292,7 @@ class BrowserManager {
         }
 
         for (const index of targets) {
-            if (this.contexts.has(index) && !this.isAccountReady(index)) {
+            if (this.contexts.has(index) && !this.isAccountReady(index) && this.authSource.health.isAvailable(index)) {
                 this.ensureAccountReady(index).catch(error => {
                     this.logger.warn(`[ContextPool] Account #${index} recovery failed: ${error.message}`);
                 });
@@ -2748,6 +3323,26 @@ class BrowserManager {
      * @returns {Promise<{context, page}>}
      */
     async _initializeContext(authIndex, isBackgroundTask = false) {
+        this._ensurePoolState();
+        const previousToken = this._initializationTokens.get(authIndex);
+        previousToken?.cancel?.();
+        const token = {
+            authIndex,
+            background: isBackgroundTask,
+            cancelled: false,
+            deadline: Date.now() + (this._contextInitTimeoutMs || CONTEXT_INIT_TIMEOUT_MS),
+            generation: randomUUID(),
+            pending: true,
+        };
+        token.abortPromise = new Promise((_, reject) => {
+            token.cancel = () => {
+                if (token.cancelled) return;
+                token.cancelled = true;
+                reject(new ContextAbortedError(authIndex, "initialization cancelled"));
+            };
+        });
+        token.abortPromise.catch(() => {});
+        this._initializationTokens.set(authIndex, token);
         let context = null;
         let page = null;
 
@@ -2781,33 +3376,51 @@ class BrowserManager {
             // Check abort status before expensive operations
             this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
-            context = await this.browser.newContext({
-                deviceScaleFactor: 1,
-                storageState: storageStateObject,
-                viewport: { height: randomHeight, width: randomWidth },
-                ...(proxyConfig ? { proxy: proxyConfig } : {}),
-            });
+            context = await this._initStage(
+                token,
+                "create_context",
+                () =>
+                    this.browser.newContext({
+                        deviceScaleFactor: 1,
+                        storageState: storageStateObject,
+                        viewport: { height: randomHeight, width: randomWidth },
+                        ...(proxyConfig ? { proxy: proxyConfig } : {}),
+                    }),
+                BROWSER_RPC_TIMEOUT_MS,
+                lateContext => this._cleanupOperation(() => lateContext.close(), `Close late context #${authIndex}`)
+            );
 
             // Check abort status after context creation
             this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
             // Inject Privacy Script immediately after context creation
             const privacyScript = this._getPrivacyProtectionScript(authIndex);
-            await context.addInitScript(privacyScript);
+            await this._initStage(token, "inject_privacy", () => context.addInitScript(privacyScript));
+            if (context.route) {
+                await this._initStage(token, "install_client", () =>
+                    this._installHostedClient(context, authIndex, token.generation)
+                );
+            }
 
-            page = await context.newPage();
+            page = await this._initStage(
+                token,
+                "create_page",
+                () => context.newPage(),
+                BROWSER_RPC_TIMEOUT_MS,
+                latePage => this._cleanupOperation(() => latePage.close(), `Close late page #${authIndex}`)
+            );
 
             // Pure JS Wakeup (Focus & Mouse Movement)
             // Skip focus operations for background tasks to avoid window focus conflicts
             if (!isBackgroundTask) {
                 try {
-                    await page.bringToFront();
+                    await this._initStage(token, "focus_page", () => page.bringToFront());
                     // eslint-disable-next-line no-undef
-                    await page.evaluate(() => window.focus());
+                    await this._initStage(token, "focus_window", () => page.evaluate(() => window.focus()));
                     const vp = page.viewportSize() || { height: 1080, width: 1920 };
                     const startX = Math.floor(Math.random() * (vp.width * 0.5));
                     const startY = Math.floor(Math.random() * (vp.height * 0.5));
-                    await this._simulateHumanMovement(page, startX, startY);
+                    await this._initStage(token, "move_mouse", () => this._simulateHumanMovement(page, startX, startY));
                 } catch (e) {
                     this.logger.warn(`[Context#${authIndex}] Wakeup minor error: ${e.message}`);
                 }
@@ -2816,6 +3429,7 @@ class BrowserManager {
             }
 
             page.on("console", msg => {
+                if (token.cancelled || this._initializationTokens.get(authIndex) !== token) return;
                 const msgText = msg.text();
                 if (msgText.includes("Content-Security-Policy")) {
                     return;
@@ -2866,29 +3480,45 @@ class BrowserManager {
             // Check abort status before navigation (most time-consuming part)
             this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
-            await this._navigateAndWakeUpPage(page, `[Context#${authIndex}]`);
+            await this._initStage(
+                token,
+                "navigate",
+                () => this._navigateAndWakeUpPage(page, `[Context#${authIndex}]`),
+                185000
+            );
 
             // Check abort status after navigation
             this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
-            await this._checkPageStatusAndErrors(page, `[Context#${authIndex}]`, authIndex);
+            await this._initStage(
+                token,
+                "check_identity",
+                () => this._checkPageStatusAndErrors(page, `[Context#${authIndex}]`, authIndex, token),
+                60000
+            );
 
             this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
             // Wait for WebSocket initialization (no retry)
             // Check if initialization already succeeded (console listener may have detected it)
-            const wsState = this._wsInitState.get(authIndex);
-            if (wsState && wsState.success) {
+            if (this.connectionRegistry?.isAccountConnected?.(authIndex)) {
                 this.logger.info(`[Context#${authIndex}] ✅ WebSocket already initialized, skipping wait`);
             } else {
                 // Wait for WebSocket initialization (120 second timeout)
                 // This will throw an abort error if the context is aborted during wait
-                const initSuccess = await this._waitForWebSocketInit(
-                    page,
-                    `[Context#${authIndex}]`,
-                    WS_INIT_TIMEOUT_MS,
-                    authIndex,
-                    isBackgroundTask
+                const initSuccess = await this._initStage(
+                    token,
+                    "wait_websocket",
+                    () =>
+                        this._waitForWebSocketInit(
+                            page,
+                            `[Context#${authIndex}]`,
+                            WS_INIT_TIMEOUT_MS,
+                            authIndex,
+                            isBackgroundTask,
+                            token
+                        ),
+                    this._webSocketInitTimeoutMs || WS_INIT_TIMEOUT_MS
                 );
 
                 if (!initSuccess) {
@@ -2898,6 +3528,7 @@ class BrowserManager {
 
             // Final check before adding to contexts map
             this._throwIfContextInitAborted(authIndex, isBackgroundTask);
+            this._assertInitialization(token);
 
             // Save to contexts map - with atomic abort check to prevent race condition
             // between the check above and actually adding to the map
@@ -2907,19 +3538,39 @@ class BrowserManager {
                     healthMonitorInterval: null,
                     page,
                 });
-                this._startHealthMonitor(authIndex);
-                this._startBackgroundWakeup(authIndex);
             } else {
                 this._throwIfContextInitAborted(authIndex, isBackgroundTask);
             }
 
             // Update auth file
-            await this._updateAuthFile(authIndex);
+            try {
+                await this._initStage(
+                    token,
+                    "save_auth",
+                    () => this._updateAuthFile(authIndex),
+                    this._cleanupTimeoutMs || CONTEXT_CLEANUP_TIMEOUT_MS
+                );
+            } catch (error) {
+                if (isContextAbortedError(error)) throw error;
+                // Saving renewed cookies is optional; retain an accepted connection
+                // and the previous credential snapshot if capture is slow.
+                this.logger.warn(`[Auth Update] Could not refresh auth #${authIndex}: ${error.message}`);
+            }
+            this._assertInitialization(token);
+            this._runtime(authIndex, "ready", null);
+            this._transportFailedAccounts.delete(authIndex);
+            this._startHealthMonitor(authIndex);
+            this._startBackgroundWakeup(authIndex);
 
             return { context, page };
         } catch (error) {
+            token.cancel();
             // Check if this is an abort error
             const isAbortError = isContextAbortedError(error);
+            if (this._initializationTokens.get(authIndex) === token) {
+                if (isAbortError) this._runtime(authIndex, "standby", "initialization_cancelled");
+                else this._backOffCandidate(authIndex, error);
+            }
             // Check if this is an auth expiration error
             const isAuthExpired = isAuthExpiredError(error);
 
@@ -2936,11 +3587,14 @@ class BrowserManager {
 
             // Save debug artifacts before closing the page (only for non-abort errors)
             if (!isAbortError && page && !page.isClosed()) {
-                await this._saveDebugArtifacts("init_failed", authIndex, page);
+                await this._cleanupOperation(
+                    () => this._saveDebugArtifacts("init_failed", authIndex, page),
+                    `Save initialization diagnostics #${authIndex}`
+                );
             }
 
             // Remove from contexts map if it was added
-            if (this.contexts.has(authIndex)) {
+            if (this.contexts.get(authIndex)?.context === context) {
                 this.contexts.delete(authIndex);
                 this.logger.info(`[Browser] Removed failed context #${authIndex} from contexts map`);
             }
@@ -2948,7 +3602,7 @@ class BrowserManager {
             // Close context if it was created
             if (context) {
                 try {
-                    await context.close();
+                    await this._cleanupOperation(() => context.close(), `Close failed context #${authIndex}`);
                     if (isAbortError) {
                         this.logger.info(`[Browser] Cleaned up aborted context for index ${authIndex}`);
                     } else {
@@ -2961,8 +3615,11 @@ class BrowserManager {
             throw error;
         } finally {
             // Ensure cleanup of tracking sets even if error is thrown
-            this.initializingContexts.delete(authIndex);
-            this.abortedContexts.delete(authIndex);
+            token.pending = false;
+            if (this._initializationTokens.get(authIndex) === token) {
+                this.initializingContexts.delete(authIndex);
+                this.abortedContexts.delete(authIndex);
+            }
         }
     }
 
@@ -3155,6 +3812,22 @@ class BrowserManager {
         }
 
         const page = contextData.page;
+        const token = this._initializationTokens?.get(targetAuthIndex) || null;
+        const deadline = Date.now() + (this._contextInitTimeoutMs || CONTEXT_INIT_TIMEOUT_MS);
+        const reconnectStep = async (phase, operation, limit = BROWSER_RPC_TIMEOUT_MS) => {
+            if (this.contexts.get(targetAuthIndex) !== contextData)
+                throw new ContextAbortedError(targetAuthIndex, "reconnect context replaced");
+            this._runtime(targetAuthIndex, "reconnecting", "connection_recovery", phase);
+            const result = await this._bounded(
+                operation,
+                Math.min(limit, Math.max(1, deadline - Date.now())),
+                `Reconnect #${targetAuthIndex} ${phase}`,
+                token
+            );
+            if (this.contexts.get(targetAuthIndex) !== contextData)
+                throw new ContextAbortedError(targetAuthIndex, "reconnect context replaced");
+            return result;
+        };
 
         // Verify browser and page are still valid
         if (!this.browser || !page) {
@@ -3188,10 +3861,14 @@ class BrowserManager {
             this.logger.info("[Reconnect] Reset WebSocket initialization state");
 
             // Navigate to target page and wake it up
-            await this._navigateAndWakeUpPage(page, "[Reconnect]");
+            await reconnectStep("navigate", () => this._navigateAndWakeUpPage(page, "[Reconnect]"), 185000);
 
             // Check for cookie expiration, region restrictions, and other errors
-            await this._checkPageStatusAndErrors(page, "[Reconnect]", targetAuthIndex);
+            await reconnectStep(
+                "check_identity",
+                () => this._checkPageStatusAndErrors(page, "[Reconnect]", targetAuthIndex, token),
+                60000
+            );
 
             // Wait for WebSocket initialization (no retry)
             // Check if initialization already succeeded (console listener may have detected it)
@@ -3200,12 +3877,10 @@ class BrowserManager {
                 this.logger.info(`[Reconnect] ✅ WebSocket already initialized, skipping wait`);
             } else {
                 // Wait for WebSocket initialization (120 second timeout)
-                const initSuccess = await this._waitForWebSocketInit(
-                    page,
-                    "[Reconnect]",
-                    WS_INIT_TIMEOUT_MS,
-                    targetAuthIndex,
-                    false
+                const initSuccess = await reconnectStep(
+                    "wait_websocket",
+                    () => this._waitForWebSocketInit(page, "[Reconnect]", WS_INIT_TIMEOUT_MS, targetAuthIndex, false),
+                    this._webSocketInitTimeoutMs || WS_INIT_TIMEOUT_MS
                 );
 
                 if (!initSuccess) {
@@ -3217,7 +3892,11 @@ class BrowserManager {
             this._sendActiveTrigger("[Reconnect]", page);
 
             // [Auth Update] Save the refreshed cookies to the auth file immediately
-            await this._updateAuthFile(targetAuthIndex);
+            await reconnectStep(
+                "save_auth",
+                () => this._updateAuthFile(targetAuthIndex),
+                this._cleanupTimeoutMs || CONTEXT_CLEANUP_TIMEOUT_MS
+            );
 
             this.logger.info("==================================================");
             this.logger.info(`✅ [Reconnect] Lightweight reconnect successful for account #${targetAuthIndex}!`);
@@ -3226,6 +3905,7 @@ class BrowserManager {
             this.notifyUserActivity(targetAuthIndex);
             this._startHealthMonitor(targetAuthIndex);
             this._startBackgroundWakeup(targetAuthIndex);
+            this._runtime(targetAuthIndex, "ready", null);
 
             return true;
         } catch (error) {
@@ -3246,7 +3926,10 @@ class BrowserManager {
                     `❌ [Reconnect] Lightweight reconnect failed for account #${targetAuthIndex} (auth expired)`
                 );
                 // Auth is already marked as expired in _checkPageStatusAndErrors
-                await this._saveDebugArtifacts("reconnect_expired", targetAuthIndex, page);
+                await this._cleanupOperation(
+                    () => this._saveDebugArtifacts("reconnect_expired", targetAuthIndex, page),
+                    `Save reconnect diagnostics #${targetAuthIndex}`
+                );
                 // Close context for expired auth - it needs full re-initialization
                 await this.closeContext(targetAuthIndex);
                 return false;
@@ -3255,7 +3938,11 @@ class BrowserManager {
             this.logger.error(
                 `❌ [Reconnect] Lightweight reconnect failed for account #${targetAuthIndex}: ${error.message}`
             );
-            await this._saveDebugArtifacts("reconnect_failed", targetAuthIndex, page);
+            await this._cleanupOperation(
+                () => this._saveDebugArtifacts("reconnect_failed", targetAuthIndex, page),
+                `Save reconnect diagnostics #${targetAuthIndex}`
+            );
+            this._backOffCandidate(targetAuthIndex, error);
             // Keep context for non-expired failures - next request will try to refresh the page
             return false;
         }
@@ -3276,6 +3963,18 @@ class BrowserManager {
      * @param {number} authIndex - The auth index to close
      */
     async closeContext(authIndex) {
+        this._contextCloseTasks ||= new Map();
+        if (this._contextCloseTasks.has(authIndex)) return this._contextCloseTasks.get(authIndex);
+        const task = this._closeContextWithRefresh(authIndex);
+        this._contextCloseTasks.set(authIndex, task);
+        try {
+            return await task;
+        } finally {
+            if (this._contextCloseTasks.get(authIndex) === task) this._contextCloseTasks.delete(authIndex);
+        }
+    }
+
+    async _closeContextWithRefresh(authIndex) {
         const pendingReauth = this.pendingContextClosures.get(authIndex) === "reauth";
         try {
             return await this._closeContextImpl(authIndex);
@@ -3296,7 +3995,11 @@ class BrowserManager {
         if (this.initializingContexts.has(authIndex)) {
             this.logger.info(`[Browser] Context #${authIndex} is being initialized, marking for abort and waiting...`);
             this.abortedContexts.add(authIndex);
-            await this._waitForContextInit(authIndex);
+            this._initializationTokens?.get(authIndex)?.cancel?.();
+            await this._cleanupOperation(
+                () => this._waitForContextInit(authIndex),
+                `Wait for cancelled initialization #${authIndex}`
+            );
             this.abortedContexts.delete(authIndex);
         }
 
@@ -3308,6 +4011,7 @@ class BrowserManager {
                 this.contexts.size === 0 &&
                 this.initializingContexts.size === 0 &&
                 this.browser &&
+                !(this.authSource.availableIndices?.length > 0) &&
                 !this.isClosingIntentionally
             ) {
                 if (this._expiredRecheckBrowser === this.browser) this._recheckBrowserOrphaned = true;
@@ -3330,7 +4034,11 @@ class BrowserManager {
         ) {
             try {
                 const identity = await this._readPageIdentity(contextData.page, `[Context#${authIndex}]`);
-                if (!this._isLoginPage(identity.currentUrl, identity.pageTitle)) await this._updateAuthFile(authIndex);
+                if (!this._isLoginPage(identity.currentUrl, identity.pageTitle))
+                    await this._cleanupOperation(
+                        () => this._updateAuthFile(authIndex),
+                        `Save account before close #${authIndex}`
+                    );
             } catch (error) {
                 this.logger.warn(
                     `[Auth Update] Could not save auth #${authIndex} before context close: ${error.message}`
@@ -3349,6 +4057,7 @@ class BrowserManager {
         // This ensures that when context.close() triggers WebSocket disconnect,
         // _removeConnection will see that the context is already gone and skip reconnect logic
         this.contexts.delete(authIndex);
+        this._initializationTokens?.get(authIndex)?.cancel?.();
         if (
             this.contexts.size === 0 &&
             this.initializingContexts.size === 0 &&
@@ -3384,7 +4093,7 @@ class BrowserManager {
         // Close the context AFTER removing from map
         try {
             if (contextData.context) {
-                await contextData.context.close();
+                await this._cleanupOperation(() => contextData.context.close(), `Close context #${authIndex}`);
                 this.logger.info(`[Browser] Context #${authIndex} closed.`);
             }
         } catch (e) {
@@ -3398,6 +4107,7 @@ class BrowserManager {
             this.contexts.size === 0 &&
             this.initializingContexts.size === 0 &&
             this.browser &&
+            !(this.authSource.availableIndices?.length > 0) &&
             !this.isClosingIntentionally
         ) {
             if (this._expiredRecheckBrowser === this.browser) this._recheckBrowserOrphaned = true;
@@ -3413,6 +4123,10 @@ class BrowserManager {
      * Called when browser is closing or has disconnected
      */
     _cleanupAllContexts() {
+        this._stopPoolMaintenance();
+        for (const token of this._initializationTokens?.values() || []) token.cancel?.();
+        this._initializationTokens?.clear();
+        this._recheckConnectionGenerations?.clear();
         // Clean up all context health monitors
         for (const [authIndex, contextData] of this.contexts.entries()) {
             if (contextData.healthMonitorInterval) {
@@ -3449,6 +4163,9 @@ class BrowserManager {
         // Set flag to indicate intentional close - prevents ConnectionRegistry from
         // attempting lightweight reconnect when WebSocket disconnects
         this.isClosingIntentionally = true;
+        this._stopPoolMaintenance();
+        this._backgroundPreloadAbort = true;
+        for (const token of this._initializationTokens?.values() || []) token.cancel?.();
 
         // Legacy single health monitor cleanup (for backward compatibility)
         if (this.healthMonitorInterval) {
@@ -3466,7 +4183,10 @@ class BrowserManager {
                 try {
                     const identity = await this._readPageIdentity(page, `[Context#${authIndex}]`);
                     if (!this._isLoginPage(identity.currentUrl, identity.pageTitle))
-                        await this._updateAuthFile(authIndex);
+                        await this._cleanupOperation(
+                            () => this._updateAuthFile(authIndex),
+                            `Save account before browser close #${authIndex}`
+                        );
                 } catch (error) {
                     this.logger.warn(
                         `[Auth Update] Could not save auth #${authIndex} before browser close: ${error.message}`

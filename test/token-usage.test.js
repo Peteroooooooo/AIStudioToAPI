@@ -52,6 +52,7 @@ test("usage from separate backend attempts is saved without counting repeated st
     try {
         const service = new UsageStatsService(null, null, directory);
         service.startRequest("token-request", { model: "gemini-test", requestCategory: "generation" });
+        service.recordAttempt("token-request", 1, "first", "attempt-1");
         service.recordBackendChunk(
             "token-request",
             "attempt-1",
@@ -59,6 +60,13 @@ test("usage from separate backend attempts is saved without counting repeated st
                 usageMetadata: { candidatesTokenCount: 2, promptTokenCount: 10, totalTokenCount: 12 },
             })
         );
+        service.finishAttempt("token-request", {
+            authIndex: 1,
+            outcome: "error",
+            requestAttemptId: "attempt-1",
+            upstreamStatusCode: 503,
+        });
+        service.recordAttempt("token-request", 2, "second", "attempt-2");
         service.recordBackendChunk(
             "token-request",
             "attempt-2",
@@ -71,6 +79,12 @@ test("usage from separate backend attempts is saved without counting repeated st
                 },
             })
         );
+        service.finishAttempt("token-request", {
+            authIndex: 2,
+            outcome: "success",
+            requestAttemptId: "attempt-2",
+            upstreamStatusCode: 200,
+        });
         const saved = service.finishRequest("token-request", { outcome: "success", statusCode: 200 });
         assert.deepEqual(saved.tokenUsage, {
             cachedInputTokens: 0,
@@ -161,7 +175,7 @@ test("retry usage is attributed to the actual upstream account and persisted by 
                 accountKey: "1:first",
                 outcome: "error",
                 requestAttemptId: "attempt-1",
-                statusCode: 503,
+                statusCode: 200,
                 totalTokens: 12,
                 usageState: "partial",
             },
@@ -175,6 +189,7 @@ test("retry usage is attributed to the actual upstream account and persisted by 
             },
         ]
     );
+    assert.equal(saved.attempts[0].localStatusCode, 503);
     assert.deepEqual(saved.attempts[0].rawUsageMetadata, {
         candidatesTokenCount: 2,
         promptTokenCount: 10,

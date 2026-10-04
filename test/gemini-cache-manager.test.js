@@ -143,6 +143,65 @@ async function seed(manager, request, authIndex, prefixLength, name) {
     });
 }
 
+test("longer upstream TTL remains capped and rejected cache falls back without dropping request history", async () => {
+    const dataDir = tempDirectory();
+    const { manager } = fixture(dataDir);
+    try {
+        const body = googleRequest(["question", "answer", "next question"]);
+        const upstreamExpiresAt = new Date(Date.now() + 86_400_000).toISOString();
+        await manager.store.put({
+            accountKey: manager._accountKey(0),
+            expireTime: upstreamExpiresAt,
+            googleRequest: body,
+            model: "gemini-3.8-flash",
+            name: "cachedContents/day",
+            prefixLength: 2,
+            tokenCount: 200,
+        });
+        const request = proxyRequest(body);
+        const wire = manager.prepare(request, 0);
+        assert.equal(JSON.parse(wire.body).cachedContent, "cachedContents/day");
+        const selected = manager.describeAttempt(request);
+        assert.equal(selected.state, "selected");
+        assert.equal(selected.upstreamExpiresAt, upstreamExpiresAt);
+        assert.ok(Date.parse(selected.expiresAt) < Date.parse(upstreamExpiresAt) - 80_000_000);
+        assert.equal(manager.canFallback(request, { status: 404 }), true);
+        await manager.invalidateAndBypass(request);
+        assert.deepEqual(JSON.parse(manager.prepare(request, 0).body), body);
+        assert.equal(manager.describeAttempt(request).state, "fallback");
+    } finally {
+        await manager.close();
+        fs.rmSync(dataDir, { force: true, recursive: true });
+    }
+});
+
+test("cache cleanup yields to new cache creation and skips accounts serving a client", async () => {
+    const dataDir = tempDirectory();
+    const { manager, handler, requests } = fixture(dataDir);
+    try {
+        for (let index = 0; index < 6; index++)
+            await manager.store.rememberOrphan({
+                accountKey: manager._accountKey(0),
+                expireTime: new Date(Date.now() + 86_400_000).toISOString(),
+                name: `cachedContents/old-${index}`,
+            });
+        handler.accountScheduler = { getAccountLoad: () => ({ inFlight: 1 }) };
+        manager._deleteEvicted();
+        await manager.background;
+        assert.equal(requests.length, 0);
+        handler.accountScheduler.getAccountLoad = () => ({ inFlight: 0 });
+        manager._deleteEvicted();
+        manager._scheduleCreate(manager._requestInfo(proxyRequest(googleRequest(["new question"])), 0));
+        await manager.background;
+        const createdAt = requests.findIndex(({ request }) => request.path === "/v1beta/cachedContents");
+        assert.ok(createdAt > 0);
+        assert.equal(requests.slice(0, createdAt).filter(({ request }) => request.method === "DELETE").length, 1);
+    } finally {
+        await manager.close();
+        fs.rmSync(dataDir, { force: true, recursive: true });
+    }
+});
+
 test("cache hit sends only the dynamic suffix, and revisiting a session keeps its own prefix", async () => {
     const dataDir = tempDirectory();
     const { manager } = fixture(dataDir);

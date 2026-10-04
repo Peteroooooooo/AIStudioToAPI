@@ -65,6 +65,9 @@ class TokenUsageCapture {
     constructor() {
         this.usage = null;
         this.rawUsageMetadata = null;
+        this.firstTextAtMs = null;
+        this.lastTextAtMs = null;
+        this.lastIngestAtMs = null;
         this.lineBuffer = "";
         this.dataLines = [];
         this.skipLine = false;
@@ -75,6 +78,17 @@ class TokenUsageCapture {
             const response = JSON.parse(text);
             const responses = Array.isArray(response) ? response : [response];
             for (const item of responses) {
+                // Observe actual generated text. Thought frames, tool calls and headers are not first text.
+                const hasText = item?.candidates?.some(candidate =>
+                    candidate.content?.parts?.some(
+                        part => !part.thought && typeof part.text === "string" && part.text.length > 0
+                    )
+                );
+                if (hasText) {
+                    const at = this.lastIngestAtMs ?? Date.now();
+                    this.firstTextAtMs ??= at;
+                    this.lastTextAtMs = at;
+                }
                 const usage = fromUsageMetadata(item?.usageMetadata);
                 if (usage) {
                     this.usage = usage;
@@ -101,11 +115,12 @@ class TokenUsageCapture {
         }
     }
 
-    ingest(chunk) {
+    ingest(chunk, receivedAtMs = Date.now()) {
         if (typeof chunk !== "string" || !chunk) return;
+        this.lastIngestAtMs = receivedAtMs;
         const trimmed = chunk.trimStart();
         if (!this.lineBuffer && !this.dataLines.length && (trimmed.startsWith("{") || trimmed.startsWith("["))) {
-            if (!trimmed.includes('"usageMetadata"')) return;
+            if (!trimmed.includes('"usageMetadata"') && !trimmed.includes('"candidates"')) return;
             if (this._readJson(trimmed)) return;
         }
         if (this.skipLine) {
