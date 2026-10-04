@@ -281,7 +281,11 @@
                             :value="account.index"
                             :disabled="!account.connected"
                         >
-                            {{ t("modelCatalogProbeAccountOption", { index: account.index }) }}
+                            {{
+                                t("modelCatalogProbeAccountOption", {
+                                    index: accountDisplayIndex(runtimeAccounts, account.index),
+                                })
+                            }}
                             {{ account.connected ? "" : `· ${t("modelCatalogProbeDisconnected")}` }}
                         </option>
                     </select>
@@ -330,8 +334,12 @@
 <script setup>
 import { computed, onMounted, ref, watch } from "vue";
 import { ElMessage } from "element-plus";
+import { accountDisplayIndex } from "../utils/accountNumbers";
 
-const props = defineProps({ t: { required: true, type: Function } });
+const props = defineProps({
+    runtimeAccounts: { default: () => [], type: Array },
+    t: { required: true, type: Function },
+});
 const t = (key, options) => props.t(key, options);
 const catalog = ref({ models: [] });
 const busy = ref("");
@@ -421,7 +429,7 @@ const probeClass = probe => {
 const probeSummary = model => {
     const probe = latestProbe(model);
     if (!probe) return t("modelCatalogProbeNotChecked");
-    return `${probeStatusLabel(probe.status)} · #${probe.accountKey}${probe.stale ? ` · ${t("modelCatalogProbeStale")}` : ""}`;
+    return `${probeStatusLabel(probe.status)} · #${accountDisplayIndex(props.runtimeAccounts, Number(probe.accountKey))}${probe.stale ? ` · ${t("modelCatalogProbeStale")}` : ""}`;
 };
 const formatDate = value => {
     if (!value) return t("modelCatalogNeverSynced");

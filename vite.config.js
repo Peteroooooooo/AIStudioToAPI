@@ -11,7 +11,7 @@ const packageJson = require("./package.json");
 
 module.exports = defineConfig({
     define: {
-        __APP_VERSION__: JSON.stringify(process.env.VERSION || packageJson.version),
+        __APP_VERSION__: JSON.stringify(process.env.VERSION || packageJson.releaseName || packageJson.version),
     },
     base: "/",
     build: {

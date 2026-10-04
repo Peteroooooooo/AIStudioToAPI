@@ -161,7 +161,7 @@
                 @batch-download="handleAccountBatchDownload"
                 @refresh="updateContent"
             />
-            <ModelsView v-if="activeTab === 'models'" :t="t" />
+            <ModelsView v-if="activeTab === 'models'" :runtime-accounts="state.accountDetails" :t="t" />
             <!-- SETTINGS VIEW -->
             <div v-if="activeTab === 'settings'" class="view-container settings-view">
                 <header class="page-header settings-page-header">
@@ -173,7 +173,12 @@
                 </header>
 
                 <section class="status-card runtime-config-card" aria-labelledby="runtime-config-title">
-                    <PoolCapacitySummary :capacity="state.poolCapacity" :stale="!state.serviceConnected" :t="t" />
+                    <PoolCapacitySummary
+                        :accounts="state.accountDetails"
+                        :capacity="state.poolCapacity"
+                        :stale="!state.serviceConnected"
+                        :t="t"
+                    />
                     <div class="runtime-config-header">
                         <div>
                             <span class="runtime-config-eyebrow">{{ t("runtimeConfigEyebrow") }}</span>
@@ -538,6 +543,7 @@ import ModelsView from "../components/ModelsView.vue";
 import PoolCapacitySummary from "../components/PoolCapacitySummary.vue";
 import UsageAnalytics from "../components/UsageAnalytics.vue";
 import JSZip from "jszip";
+import { accountDisplayIndex, numberAccounts } from "../utils/accountNumbers";
 import escapeHtml from "../utils/escapeHtml";
 import I18n from "../utils/i18n";
 import { useTheme } from "../utils/useTheme";
@@ -1257,7 +1263,7 @@ const getAccountDisplayName = account => {
     }
     const name = account.name || t("unnamedAccount");
     if (account.isDuplicate && account.canonicalIndex !== null && account.canonicalIndex !== undefined) {
-        return `${name} (${t("duplicateAuthHint", { index: account.canonicalIndex })})`;
+        return `${name} (${t("duplicateAuthHint", { index: accountDisplayIndex(state.accountDetails, account.canonicalIndex) })})`;
     }
     return name;
 };
@@ -1337,12 +1343,16 @@ const deleteAccountByIndex = async targetIndex => {
         }
     };
 
-    ElMessageBox.confirm(`${t("confirmDelete")} #${targetIndex}${accountSuffix}?`, t("warningTitle"), {
-        cancelButtonText: t("cancel"),
-        confirmButtonText: t("ok"),
-        lockScroll: false,
-        type: "warning",
-    })
+    ElMessageBox.confirm(
+        `${t("confirmDelete")} #${accountDisplayIndex(state.accountDetails, targetIndex)}${accountSuffix}?`,
+        t("warningTitle"),
+        {
+            cancelButtonText: t("cancel"),
+            confirmButtonText: t("ok"),
+            lockScroll: false,
+            type: "warning",
+        }
+    )
         .then(() => performDelete(false))
         .catch(e => {
             if (e !== "cancel") {
@@ -1470,11 +1480,11 @@ const updateAccountHealth = async (account, requestedAction) => {
             const data = await res.json();
             if (!res.ok) throw new Error(data.message ? t(data.message, data) : data.error || `HTTP ${res.status}`);
             if (data.recovered) {
-                ElMessage.success(t("accountsRecheckRecovered", { index: account.index }));
+                ElMessage.success(t("accountsRecheckRecovered", { index: account.displayIndex }));
             } else if (data.needsReauth) {
-                ElMessage.warning(t("accountsRecheckNeedsLogin", { index: account.index }));
+                ElMessage.warning(t("accountsRecheckNeedsLogin", { index: account.displayIndex }));
             } else {
-                ElMessage.info(t("accountsRecheckUnconfirmed", { index: account.index }));
+                ElMessage.info(t("accountsRecheckUnconfirmed", { index: account.displayIndex }));
             }
             await updateContent();
         } catch (error) {
@@ -1522,7 +1532,7 @@ const updateStatus = data => {
     state.forceUrlContextEnabled = isEnabled(data.status.forceUrlContext);
     state.debugModeEnabled = isEnabled(data.status.debugMode);
     state.currentAuthIndex = data.status.currentAuthIndex;
-    state.accountDetails = data.status.accountDetails || [];
+    state.accountDetails = numberAccounts(data.status.accountDetails || []);
     state.activeContextsCount = data.status.activeContextsCount || 0;
     state.cacheStats = data.status.cacheStats || null;
     state.maxContexts = data.status.maxContexts ?? 1;

@@ -79,7 +79,7 @@
 </template>
 <script setup>
 import { computed, inject } from "vue";
-import { account, cacheAnomaly, duration, keyLabel, nonCached, number, status, time } from "./format";
+import { cacheAnomaly, duration, keyLabel, nonCached, number, status, time } from "./format";
 import AttemptTimeline from "./AttemptTimeline.vue";
 import ConversationTag from "./ConversationTag.vue";
 import RequestOutcomeBadge from "./RequestOutcomeBadge.vue";
@@ -91,7 +91,7 @@ const props = defineProps({
     record: { default: null, type: Object },
 });
 const emit = defineEmits(["update:open", "parent", "logs", "conversation"]);
-const { m } = inject("monitor");
+const { account, m } = inject("monitor");
 const isCall = computed(() => props.record?.metricScope === "attempts" || Number.isInteger(props.record?.attemptIndex));
 const onChainToggle = event => {
     if (event.target.open && !props.parent && !props.parentLoading) emit("parent");

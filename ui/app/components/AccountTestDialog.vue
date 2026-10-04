@@ -10,7 +10,7 @@
     >
         <template v-if="account">
             <p class="test-account">
-                <strong>#{{ account.index }} {{ account.name }}</strong>
+                <strong>#{{ account.displayIndex }} {{ account.name }}</strong>
             </p>
             <p class="test-help">{{ t("accountTestExplanation") }}</p>
             <label class="test-model"
@@ -29,7 +29,7 @@
                 <dl>
                     <div>
                         <dt>{{ t("account") }}</dt>
-                        <dd>#{{ result.accountIndex }}</dd>
+                        <dd>#{{ result.accountIndex === account.index ? account.displayIndex : "—" }}</dd>
                     </div>
                     <div>
                         <dt>{{ t("requestModel") }}</dt>

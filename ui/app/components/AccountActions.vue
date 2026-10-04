@@ -12,11 +12,15 @@
         <el-switch
             :model-value="accountEnabled(account)"
             :disabled="isBusy || account.isInvalid"
-            :aria-label="t('accountsEnabledNamed', { index: account.index })"
+            :aria-label="t('accountsEnabledNamed', { index: account.displayIndex })"
             :before-change="toggleEnabled"
         />
         <el-dropdown trigger="click" @command="handleCommand">
-            <button type="button" class="account-more" :aria-label="t('accountsMoreNamed', { index: account.index })">
+            <button
+                type="button"
+                class="account-more"
+                :aria-label="t('accountsMoreNamed', { index: account.displayIndex })"
+            >
                 <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
                     <circle cx="5" cy="12" r="2" />
                     <circle cx="12" cy="12" r="2" />

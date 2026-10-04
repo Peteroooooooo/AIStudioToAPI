@@ -79,7 +79,7 @@
 
 本地真实请求验证：`node scripts/dev/cacheE2eLocal.js` 测 Gemini 多轮及 A→B→A，`node scripts/dev/cacheProtocolLocal.js` 测 Responses 和 Claude 协议，`node scripts/dev/cacheSystemOnlyProbe.js` 测新 session 的共享系统提示。脚本从已忽略的 `data/config.json` 读取密钥，不打印密钥或提示词。运行前确认 `/health/ready` 可用；这些测试会向 Gemini 发送真实请求并建立短期缓存。
 
-推送 `stable` 分支会触发 GitHub Actions 测试；推送 `v*.*.*` 标签才会发布 arm64 镜像。随后在 Portainer 中把镜像标签改为新版本并更新 Stack。
+推送 `stable` 分支会触发 GitHub Actions 测试；推送 `P.*` 标签会发布 arm64 镜像，例如 `P.18`，后续递增为 `P.19`、`P.20`。随后在 Portainer 中把镜像标签改为新版本并更新 Stack。
 
 ### 网页热更新配置
 
@@ -115,7 +115,7 @@ docker run -d \
   -e WEB_CONSOLE_PASSWORD=your-console-password \
   -e TZ=Asia/Shanghai \
   --restart unless-stopped \
-  ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.6
+  ghcr.io/peteroooooooo/aistudio-to-api:P.18
 ```
 
 参数说明：
@@ -135,7 +135,7 @@ name: aistudio-to-api
 
 services:
   app:
-    image: ghcr.io/peteroooooooo/aistudio-to-api:v1.3.5-peter.6
+    image: ghcr.io/peteroooooooo/aistudio-to-api:P.18
     container_name: aistudio-to-api
     ports:
       # API 服务器端口（如果使用反向代理，强烈建议改成 127.0.0.1:7860）
