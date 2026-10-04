@@ -118,7 +118,7 @@
 </template>
 <script setup>
 import { inject, ref, watch } from "vue";
-import { account, duration, keyLabel, number, shortError, status, time } from "./format";
+import { duration, keyLabel, number, shortError, status, time } from "./format";
 import ConversationTag from "./ConversationTag.vue";
 import RequestOutcomeBadge from "./RequestOutcomeBadge.vue";
 import TokenUsageDisplay from "./TokenUsageDisplay.vue";
@@ -133,7 +133,7 @@ defineProps({
     total: { default: 0, type: Number },
 });
 defineEmits(["open", "next", "previous", "retry", "activity", "conversation"]);
-const { m } = inject("monitor");
+const { account, m } = inject("monitor");
 let preferences;
 try {
     preferences = JSON.parse(localStorage.getItem("monitor-table") || "{}");

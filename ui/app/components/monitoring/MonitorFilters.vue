@@ -177,7 +177,7 @@
 </template>
 <script setup>
 import { computed, inject, ref } from "vue";
-import { account, conversationLabel, keyLabel } from "./format";
+import { conversationLabel, keyLabel } from "./format";
 const props = defineProps({
     invalid: Boolean,
     options: { default: () => ({}), type: Object },
@@ -186,7 +186,7 @@ const props = defineProps({
     scopeLocked: Boolean,
 });
 const emit = defineEmits(["change", "reset", "shortcut"]);
-const { m } = inject("monitor");
+const { account, m } = inject("monitor");
 const expanded = ref(false);
 const ranges = [
     ["24h", "last24h"],

@@ -137,7 +137,7 @@
 </template>
 <script setup>
 import { computed, inject, ref, watch } from "vue";
-import { account, number, percent, shortError, status, time } from "./format";
+import { number, percent, shortError, status, time } from "./format";
 import AccountStatusBadge from "./AccountStatusBadge.vue";
 import AccountTestResult from "../AccountTestResult.vue";
 import RecentOutcomes from "./RecentOutcomes.vue";
@@ -150,7 +150,7 @@ const props = defineProps({
     stale: Boolean,
 });
 const emit = defineEmits(["requests", "manage", "expand", "account-model"]);
-const { m, t } = inject("monitor");
+const { account, m, t } = inject("monitor");
 const expanded = ref("");
 watch(
     () => props.details,

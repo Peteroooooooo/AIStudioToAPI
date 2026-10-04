@@ -26,11 +26,6 @@ export const conversationLabel = (record, m, currentYear = new Date().getFullYea
     const prefix = Number(year) === currentYear ? `${month}/${day}` : `${year}/${month}/${day}`;
     return `${m('conversation')} ${prefix}-${String(number).padStart(2, '0')}`;
 };
-export const account = record => {
-    const index = record.finalAuthIndex ?? record.authIndex;
-    const name = record.finalAccountName || record.accountName;
-    return index == null ? name || '—' : `#${index} ${name || '—'}`;
-};
 export const keyLabel = value =>
     !value || value === 'unknown' ? '—' : value.length > 16 ? `${value.slice(0, 12)}…` : value;
 export const status = (record, m) => {

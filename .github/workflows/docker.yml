@@ -3,7 +3,7 @@ name: Verify and publish arm64 image
 on:
   push:
     branches: [stable]
-    tags: ["v*.*.*"]
+    tags: ["P.*", "v*.*.*"]
   workflow_dispatch:
 
 permissions:

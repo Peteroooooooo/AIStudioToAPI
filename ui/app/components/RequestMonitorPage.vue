@@ -118,6 +118,7 @@
 <script setup>
 import { computed, provide, watch } from "vue";
 import I18n from "../utils/i18n";
+import { accountDisplayLabel } from "../utils/accountNumbers";
 import MonitorToolbar from "./monitoring/MonitorToolbar.vue";
 import MonitorFilters from "./monitoring/MonitorFilters.vue";
 import MonitorSummary from "./monitoring/MonitorSummary.vue";
@@ -144,7 +145,7 @@ const t = (key, options) => {
     props.languageVersion;
     return I18n.t(key, options);
 };
-provide("monitor", { m, t });
+provide("monitor", { account: record => accountDisplayLabel(record, props.runtimeAccounts), m, t });
 const monitor = useMonitor(m);
 const { query, tab, scope, overview } = monitor;
 const views = ["requests", "accounts", "models", "apiKeys"];

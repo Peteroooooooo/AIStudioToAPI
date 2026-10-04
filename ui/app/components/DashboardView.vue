@@ -38,7 +38,7 @@
             </div>
         </div>
 
-        <PoolCapacitySummary :capacity="status.poolCapacity" :t="t" />
+        <PoolCapacitySummary :accounts="status.accountDetails" :capacity="status.poolCapacity" :t="t" />
         <div class="dashboard-metrics">
             <article class="dashboard-metric">
                 <span>{{ t("consoleAvailableAccounts") }}</span>
@@ -77,7 +77,7 @@
                 </div>
                 <div v-if="accounts.length" class="context-list">
                     <div v-for="account in accounts" :key="account.index" class="context-row">
-                        <span class="context-avatar">{{ account.index }}</span>
+                        <span class="context-avatar">{{ account.displayIndex }}</span>
                         <div class="context-identity">
                             <strong>{{ accountLabel(account) }}</strong>
                             <AccountRuntimeState :account="account" :t="t" />
@@ -134,6 +134,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import AccountRuntimeState from "./AccountRuntimeState.vue";
 import PoolCapacitySummary from "./PoolCapacitySummary.vue";
+import { accountDisplayLabel } from "../utils/accountNumbers";
 
 const props = defineProps({
     appVersion: { default: "", type: String },
@@ -203,17 +204,19 @@ const formatTime = value => {
 };
 const shortId = value => (typeof value === "string" && value.length > 13 ? `${value.slice(0, 13)}…` : value || "–");
 const attemptedAccounts = failure => {
-    const indices = (failure.attempts || []).map(attempt => attempt.authIndex).filter(index => Number.isInteger(index));
-    if (indices.length) return [...new Set(indices)].map(index => `#${index}`).join(" → ");
+    const labels = (failure.attempts || []).map(attempt =>
+        accountDisplayLabel(attempt, props.status.accountDetails || [])
+    );
+    if (labels.length) return [...new Set(labels)].join(" → ");
     if (Array.isArray(failure.attempts) && !failure.attempts.length) return props.t("consoleNoUpstreamAttempt");
-    return Number.isInteger(failure.finalAuthIndex) ? `#${failure.finalAuthIndex}` : "–";
+    return accountDisplayLabel(failure, props.status.accountDetails || []);
 };
 const accountLabel = account => {
     const name = account?.name;
-    if (!name) return `#${account?.index ?? "–"}`;
+    if (!name) return `#${account?.displayIndex ?? "–"}`;
     const [local, domain] = name.split("@");
-    if (!domain) return `#${account.index} · ${name}`;
-    return `#${account.index} · ${local.slice(0, 2)}***@${domain}`;
+    if (!domain) return `#${account.displayIndex} · ${name}`;
+    return `#${account.displayIndex} · ${local.slice(0, 2)}***@${domain}`;
 };
 
 const loadOverview = async () => {

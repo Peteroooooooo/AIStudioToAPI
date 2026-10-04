@@ -11,7 +11,7 @@
         </p>
         <ul v-if="blockedAccounts.length">
             <li v-for="account in blockedAccounts" :key="account.authIndex">
-                #{{ account.authIndex }} ·
+                #{{ accountDisplayIndex(accounts, account.authIndex) }} ·
                 {{ t(account.state === "stalled" ? "accountNote_connectionError" : "accountNote_connecting") }}
                 <template v-if="account.nextRetryAt">
                     · {{ t("accountRetryAt", { time: formatTime(account.nextRetryAt) }) }}</template
@@ -32,7 +32,9 @@
 </template>
 <script setup>
 import { computed } from "vue";
+import { accountDisplayIndex } from "../utils/accountNumbers";
 const props = defineProps({
+    accounts: { default: () => [], type: Array },
     capacity: { default: null, type: Object },
     stale: { default: false, type: Boolean },
     t: { required: true, type: Function },

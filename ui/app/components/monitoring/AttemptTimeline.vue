@@ -21,9 +21,9 @@
 </template>
 <script setup>
 import { inject } from "vue";
-import { account, duration, status, time } from "./format";
+import { duration, status, time } from "./format";
 import TokenUsageDisplay from "./TokenUsageDisplay.vue";
 import RequestOutcomeBadge from "./RequestOutcomeBadge.vue";
 defineProps({ items: { default: () => [], type: Array } });
-const { m } = inject("monitor");
+const { account, m } = inject("monitor");
 </script>

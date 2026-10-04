@@ -29,7 +29,7 @@ class VersionChecker {
         // Fall back to package.json
         try {
             const packageJson = require("../../package.json");
-            return packageJson.version;
+            return packageJson.releaseName || packageJson.version;
         } catch {
             return "unknown";
         }
@@ -41,6 +41,8 @@ class VersionChecker {
      * @returns {number[]} Array of version parts [major, minor, patch]
      */
     parseVersion(version) {
+        const releaseNumber = version.match(/^P\.(\d+)$/i);
+        if (releaseNumber) return [0, 0, 0, Number(releaseNumber[1])];
         const cleaned = version.replace(/^v/, "");
         const parts = cleaned.split(".").map(p => parseInt(p, 10) || 0);
         const forkRevision = Number(cleaned.match(/-peter\.(\d+)$/)?.[1] || 0);
@@ -52,6 +54,17 @@ class VersionChecker {
      * @returns {number} 1 if a > b, -1 if a < b, 0 if equal
      */
     compareVersions(a, b) {
+        const releaseNumber = version => {
+            const match = version.match(/^(?:P\.(\d+)|v?\d+\.\d+\.\d+-peter\.(\d+))$/i);
+            return match ? Number(match[1] ?? match[2]) : null;
+        };
+        const aRelease = releaseNumber(a);
+        const bRelease = releaseNumber(b);
+        if (aRelease !== null || bRelease !== null) {
+            if (aRelease === null) return -1;
+            if (bRelease === null) return 1;
+            return Math.sign(aRelease - bRelease);
+        }
         const [aMajor, aMinor, aPatch, aRevision] = this.parseVersion(a);
         const [bMajor, bMinor, bPatch, bRevision] = this.parseVersion(b);
 
@@ -138,8 +151,8 @@ class VersionChecker {
 
             const tags = response.data || [];
 
-            // Filter: only v* tags, exclude preview-*
-            const versionTags = tags.filter(tag => tag.name.startsWith("v") && !tag.name.includes("preview"));
+            // This fork uses P.N; retain its earlier releases for migration.
+            const versionTags = tags.filter(tag => /^(?:P\.\d+|v\d+\.\d+\.\d+-peter\.\d+)$/.test(tag.name));
 
             // Sort by version (descending)
             versionTags.sort((a, b) => this.compareVersions(b.name, a.name));

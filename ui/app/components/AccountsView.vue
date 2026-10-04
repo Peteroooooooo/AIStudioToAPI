@@ -30,7 +30,7 @@
         </header>
 
         <p v-if="statusStale" class="accounts-status-stale" role="status">{{ t("accountStatusHelp_stale") }}</p>
-        <PoolCapacitySummary :capacity="poolCapacity" :stale="statusStale" :t="t" />
+        <PoolCapacitySummary :accounts="accounts" :capacity="poolCapacity" :stale="statusStale" :t="t" />
 
         <div class="accounts-toolbar">
             <div class="accounts-toolbar-main">
@@ -139,14 +139,14 @@
                             <td>
                                 <el-checkbox
                                     :model-value="selected.has(account.index)"
-                                    :aria-label="`${t('accountsSelectAccount')} #${account.index}`"
+                                    :aria-label="`${t('accountsSelectAccount')} #${account.displayIndex}`"
                                     :disabled="isBusy"
                                     @change="toggleSelected(account.index)"
                                 />
                             </td>
                             <td class="accounts-name-cell">
                                 <button type="button" class="accounts-name-button" @click="openDetails(account)">
-                                    <span class="accounts-index">#{{ account.index }}</span>
+                                    <span class="accounts-index">#{{ account.displayIndex }}</span>
                                     <strong>{{ displayName(account) }}</strong>
                                 </button>
                                 <div class="accounts-tags">
@@ -219,12 +219,12 @@
                     <div class="accounts-card-top">
                         <el-checkbox
                             :model-value="selected.has(account.index)"
-                            :aria-label="`${t('accountsSelectAccount')} #${account.index}`"
+                            :aria-label="`${t('accountsSelectAccount')} #${account.displayIndex}`"
                             :disabled="isBusy"
                             @change="toggleSelected(account.index)"
                         />
                         <button type="button" class="accounts-name-button" @click="openDetails(account)">
-                            <span class="accounts-index">#{{ account.index }}</span>
+                            <span class="accounts-index">#{{ account.displayIndex }}</span>
                             <strong>{{ displayName(account) }}</strong>
                         </button>
                     </div>
@@ -291,7 +291,7 @@
         <el-drawer
             v-model="detailsOpen"
             :size="'min(100vw, 560px)'"
-            :title="selectedAccount ? `#${selectedAccount.index} ${displayName(selectedAccount)}` : ''"
+            :title="selectedAccount ? `#${selectedAccount.displayIndex} ${displayName(selectedAccount)}` : ''"
         >
             <template v-if="selectedAccount">
                 <AccountRuntimeState :account="selectedAccount" :stale="statusStale" :t="t" expanded />
@@ -312,7 +312,9 @@
                     "
                     class="accounts-detail-note"
                 >
-                    {{ t("duplicateAuthHint", { index: selectedAccount.canonicalIndex }) }}
+                    {{
+                        t("duplicateAuthHint", { index: accountDisplayIndex(accounts, selectedAccount.canonicalIndex) })
+                    }}
                 </p>
                 <div class="accounts-detail-summary">
                     <div>
@@ -433,6 +435,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import AccountActions from "./AccountActions.vue";
 import AccountRuntimeState from "./AccountRuntimeState.vue";
 import AccountTestDialog from "./AccountTestDialog.vue";
+import { accountDisplayIndex } from "../utils/accountNumbers";
 import AccountTestResult from "./AccountTestResult.vue";
 import PoolCapacitySummary from "./PoolCapacitySummary.vue";
 import { accountEnabled, accountStatus } from "../utils/runtimeLabels";
@@ -512,7 +515,7 @@ const filteredAccounts = computed(() => {
     const query = search.value.toLowerCase();
     return props.accounts.filter(account => {
         if (statusFilter.value !== "all" && accountStatus(account).filterState !== statusFilter.value) return false;
-        return !query || `${account.index} ${account.name || ""}`.toLowerCase().includes(query);
+        return !query || `${account.displayIndex} ${account.name || ""}`.toLowerCase().includes(query);
     });
 });
 const selectedIndices = computed(() => [...selected.value].sort((a, b) => a - b));
