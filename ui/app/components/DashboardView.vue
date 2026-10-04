@@ -38,6 +38,7 @@
             </div>
         </div>
 
+        <PoolCapacitySummary :capacity="status.poolCapacity" :t="t" />
         <div class="dashboard-metrics">
             <article class="dashboard-metric">
                 <span>{{ t("consoleAvailableAccounts") }}</span>
@@ -79,11 +80,8 @@
                         <span class="context-avatar">{{ account.index }}</span>
                         <div class="context-identity">
                             <strong>{{ accountLabel(account) }}</strong>
-                            <small>{{ healthLabel(account) }}</small>
+                            <AccountRuntimeState :account="account" :t="t" />
                         </div>
-                        <span class="context-badge" :class="canServe(account) ? 'is-ready' : 'is-idle'">
-                            {{ canServe(account) ? t("consoleWarmed") : t("consoleNotWarmed") }}
-                        </span>
                     </div>
                 </div>
                 <p v-else class="dashboard-empty">{{ t("consoleNoAccounts") }}</p>
@@ -134,6 +132,8 @@
 
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import AccountRuntimeState from "./AccountRuntimeState.vue";
+import PoolCapacitySummary from "./PoolCapacitySummary.vue";
 
 const props = defineProps({
     appVersion: { default: "", type: String },
@@ -149,14 +149,16 @@ let pollTimer = null;
 
 const accounts = computed(() => props.status.accountDetails || []);
 const canServe = account =>
-    account.serving ??
-    (account.isRotation &&
-        !account.isInvalid &&
-        !account.isExpired &&
-        !account.isDuplicate &&
-        account.health?.mode === "active" &&
-        account.hasContext &&
-        (account.isConnected ?? true));
+    account.runtime
+        ? account.runtime.state === "ready" && account.poolMember
+        : (account.serving ??
+          (account.isRotation &&
+              !account.isInvalid &&
+              !account.isExpired &&
+              !account.isDuplicate &&
+              account.health?.mode === "active" &&
+              account.hasContext &&
+              (account.isConnected ?? true)));
 const servingAccounts = computed(() => accounts.value.filter(canServe).length);
 const readyAccounts = computed(
     () =>
@@ -212,24 +214,6 @@ const accountLabel = account => {
     const [local, domain] = name.split("@");
     if (!domain) return `#${account.index} · ${name}`;
     return `#${account.index} · ${local.slice(0, 2)}***@${domain}`;
-};
-const healthLabel = account => {
-    if (account.isInvalid) return props.t("consoleInvalidAccount");
-    if (account.isExpired) return props.t("consoleExpiredAccount");
-    if (account.isDuplicate) return props.t("consoleDuplicateAccount");
-    if (account.health?.probeRequired) {
-        return props.t(account.health.probeInFlight ? "consoleProbing" : "consoleProbeRequired");
-    }
-    switch (account.health?.mode) {
-        case "cooldown":
-            return props.t("consoleCooldown");
-        case "reauth":
-            return props.t("consoleReauth");
-        case "disabled":
-            return props.t("consoleDisabled");
-        default:
-            return props.t("consoleAvailable");
-    }
 };
 
 const loadOverview = async () => {

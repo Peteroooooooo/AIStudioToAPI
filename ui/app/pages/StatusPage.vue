@@ -146,6 +146,8 @@
                 v-if="activeTab === 'accounts'"
                 ref="accountsViewRef"
                 :accounts="state.accountDetails"
+                :pool-capacity="state.poolCapacity"
+                :status-stale="!state.serviceConnected"
                 :is-busy="isBusy"
                 :t="t"
                 @add="addUser"
@@ -171,6 +173,7 @@
                 </header>
 
                 <section class="status-card runtime-config-card" aria-labelledby="runtime-config-title">
+                    <PoolCapacitySummary :capacity="state.poolCapacity" :stale="!state.serviceConnected" :t="t" />
                     <div class="runtime-config-header">
                         <div>
                             <span class="runtime-config-eyebrow">{{ t("runtimeConfigEyebrow") }}</span>
@@ -504,6 +507,10 @@
                     ref="usageAnalyticsRef"
                     :language-version="langVersion"
                     :transfer-busy="isUsageStatsTransferBusy"
+                    :runtime-accounts="state.accountDetails"
+                    :status-stale="!state.serviceConnected"
+                    @manage-account="openAccountFromMonitor"
+                    @logs="openLogsFromMonitor"
                     @import="triggerUsageStatsImport"
                     @export="downloadUsageStats"
                 />
@@ -528,6 +535,7 @@ import ApiKeysSettings from "../components/ApiKeysSettings.vue";
 import DashboardView from "../components/DashboardView.vue";
 import LogsView from "../components/LogsView.vue";
 import ModelsView from "../components/ModelsView.vue";
+import PoolCapacitySummary from "../components/PoolCapacitySummary.vue";
 import UsageAnalytics from "../components/UsageAnalytics.vue";
 import JSZip from "jszip";
 import escapeHtml from "../utils/escapeHtml";
@@ -563,9 +571,18 @@ const openRequestFromDashboard = async requestId => {
     usageAnalyticsRef.value?.focusRequest?.(requestId);
 };
 
+const openAccountFromMonitor = async account => {
+    switchTab("accounts");
+    await nextTick();
+    accountsViewRef.value?.focusAccount?.(account.index);
+};
+const openLogsFromMonitor = requestId => {
+    router.push({ path: route.path, query: { ...route.query, logRequest: requestId, view: "logs" } });
+};
+
 const scheduleUpdate = () => {
     if (!isActive) return;
-    const randomInterval = 4000 + Math.floor(Math.random() * 3000);
+    const randomInterval = activeTab.value === "accounts" ? 2000 : 4000 + Math.floor(Math.random() * 3000);
     updateTimer = setTimeout(async () => {
         const updates = [updateContent()];
         if (activeTab.value === "settings") updates.push(pollRuntimeConfig());
@@ -627,6 +644,7 @@ const state = reactive({
     logs: t("loading"),
     maxContexts: 1,
     maxRetries: 3,
+    poolCapacity: null,
     releaseUrl: null,
     safetySettingsThreshold: "OFF",
     selectedAccounts: new Set(), // Selected account indices
@@ -1043,7 +1061,7 @@ const batchDeleteAccounts = async () => {
     // Helper to perform batch delete
     const performBatchDelete = async (forceDelete = false) => {
         const notification = ElNotification({
-            duration: 0,
+            duration: 5000,
             message: t("operationInProgress"),
             title: t("warningTitle"),
             type: "warning",
@@ -1270,7 +1288,7 @@ const deleteAccountByIndex = async targetIndex => {
     // Helper function to perform the actual deletion
     const performDelete = async (forceDelete = false) => {
         const notification = ElNotification({
-            duration: 0,
+            duration: 5000,
             message: t("operationInProgress"),
             title: t("warningTitle"),
             type: "warning",
@@ -1342,7 +1360,7 @@ const deduplicateAuth = () => {
     })
         .then(async () => {
             const notification = ElNotification({
-                duration: 0,
+                duration: 5000,
                 message: t("operationInProgress"),
                 title: t("warningTitle"),
                 type: "warning",
@@ -1509,6 +1527,7 @@ const updateStatus = data => {
     state.cacheStats = data.status.cacheStats || null;
     state.maxContexts = data.status.maxContexts ?? 1;
     state.accountPool = data.status.accountPool || null;
+    state.poolCapacity = data.status.poolCapacity || null;
     state.maxRetries = data.status.maxRetries ?? 3;
     state.safetySettingsThreshold = data.status.safetySettingsThreshold || "OFF";
 
@@ -1538,7 +1557,7 @@ let isActive = true;
 const updateContent = async () => {
     const dot = document.querySelector(".dot");
     try {
-        const res = await fetch("/api/status");
+        const res = await fetch("/api/status", { signal: AbortSignal.timeout(8000) });
         if (res.redirected) {
             window.location.href = res.url;
             return;
@@ -1578,7 +1597,7 @@ const handleFileUpload = async event => {
 
     // Show notification immediately
     const notification = ElNotification({
-        duration: 0,
+        duration: 5000,
         message: t("operationInProgress"),
         title: t("warningTitle"),
         type: "warning",
@@ -1839,10 +1858,10 @@ const handleFileUpload = async event => {
             notifyTitle = `${t("fileUploadBatchResult")} (✓${successFiles.length} ✗${failedFiles.length})`;
         }
 
-        // Show result notification (keep open)
+        // Allow time to read the result, then dismiss it automatically.
         ElNotification({
             dangerouslyUseHTMLString: true,
-            duration: 0,
+            duration: notifyType === "success" ? 3000 : 6000,
             message: messageHtml,
             position: "top-right",
             title: notifyTitle,
@@ -1959,7 +1978,7 @@ const handleUsageStatsImport = async event => {
 const showUsageStatsImportNotification = ({ message, title, type }) => {
     ElNotification({
         dangerouslyUseHTMLString: true,
-        duration: 0,
+        duration: type === "success" ? 3000 : 6000,
         message: `<div style="max-height: 50vh; overflow-y: auto; word-break: break-word;">${escapeHtml(message)}</div>`,
         position: "top-right",
         title,

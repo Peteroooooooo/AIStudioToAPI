@@ -33,115 +33,145 @@ test("only repeated independent 401 failures require reauthentication", t => {
     assert.equal(health.getStatus(15).mode, "active");
 });
 
-test("429 defaults to five hours, persists and requires one successful business probe", t => {
+test("429 turns the switch off and restores it on the persisted deadline", t => {
     const { clock, filePath, health } = fixture(t);
-    health.recordFailure(2, 429, "r1");
+    health.recordFailure(2, 429, "first");
     const until = clock.value + 5 * 60 * 60_000;
+    assert.equal(health.getStatus(2).enabled, false);
+    assert.equal(health.getStatus(2).disabledBy, "auto");
     assert.equal(health.getStatus(2).until, until);
     const restored = new AccountHealth(logger, filePath, () => clock.value);
-    assert.equal(restored.getStatus(2).mode, "cooldown");
-    restored.recordFailure(2, 429, "r2");
-    assert.equal(restored.getStatus(2).until, until);
-    clock.value = until + 1;
-    assert.equal(restored.getStatus(2).mode, "active");
-    assert.equal(restored.getStatus(2).probeRequired, true);
-    assert.equal(restored.tryAcquireProbe(2, "probe-1"), true);
-    assert.equal(restored.tryAcquireProbe(2, "probe-2"), false);
-    assert.equal(restored.getStatus(2).probeInFlight, true);
-    restored.recordSuccess(2, "r2");
-    assert.equal(restored.getStatus(2).probeRequired, true);
-    restored.recordSuccess(2, "probe-1");
-    assert.equal(restored.getStatus(2).probeRequired, false);
-    restored.setDisabled(2, true);
-    assert.equal(restored.isAvailable(2), false);
-    restored.setDisabled(2, false);
+    assert.equal(restored.getStatus(2).mode, "disabled");
+    clock.value = until;
     assert.equal(restored.isAvailable(2), true);
+    assert.equal(restored.getStatus(2).until, null);
+    assert.equal(restored.getStatus(2).probeRequired, false);
+    assert.equal(new AccountHealth(logger, filePath, () => clock.value).isAvailable(2), true);
 });
 
-test("late 429 and successful requests never shorten or extend a cooldown", t => {
-    const { clock, health } = fixture(t, { rateLimitCooldownSeconds: 45 });
-    health.recordFailure(2, 429, "first");
+test("manual on cancels the old timer, and manual off never automatically enables", t => {
+    const { clock, filePath, health } = fixture(t, { rateLimitCooldownSeconds: 30 });
+    health.recordFailure(2, 429, "quota");
+    health.setDisabled(2, false);
+    assert.equal(health.getStatus(2).enabled, true);
+    assert.equal(health.getStatus(2).until, null);
+    health.setDisabled(2, true);
+    clock.value += 60_000;
+    const restored = new AccountHealth(logger, filePath, () => clock.value);
+    assert.equal(restored.getStatus(2).disabledBy, "manual");
+    assert.equal(restored.isAvailable(2), false);
+    assert.equal(restored.getStatus(2).until, null);
+});
+
+test("late outcomes cannot override manual enable or a timer-based enable", t => {
+    const { clock, health } = fixture(t, { rateLimitCooldownSeconds: 30 });
+    const epoch = health.getEpoch(2);
+    health.recordFailure(2, 429, "first", epoch);
     const until = health.getStatus(2).until;
     clock.value += 10_000;
-    health.recordFailure(2, 429, "late-error");
-    health.recordSuccess(2, "late-success");
+    health.recordFailure(2, 429, "late", epoch);
+    health.recordSuccess(2, "late-success", epoch);
     assert.equal(health.getStatus(2).until, until);
-    assert.equal(health.isAvailable(2), false);
-    clock.value = until + 1;
-    health.recordFailure(2, 429, "very-late-error");
-    health.recordSuccess(2, "very-late-success");
-    assert.equal(health.getStatus(2).until, until);
-    assert.equal(health.getStatus(2).probeRequired, true);
+    clock.value = until;
+    health.recordFailure(2, 429, "very-late", epoch);
+    assert.equal(health.getStatus(2).enabled, true);
+    const current = health.getEpoch(2);
+    health.setDisabled(2, false);
+    health.recordFailure(2, 429, "before-manual", current);
+    assert.equal(health.getStatus(2).enabled, true);
 });
 
-test("a failed probe starts a new configured cooldown without recalculating existing deadlines", t => {
+test("a new 429 after manual enable starts a new configured restore plan", t => {
     const config = { rateLimitCooldownSeconds: 30 };
     const { clock, health } = fixture(t, config);
     health.recordFailure(2, 429, "first");
     const until = health.getStatus(2).until;
     config.rateLimitCooldownSeconds = 90;
     assert.equal(health.getStatus(2).until, until);
-    clock.value = until;
-    assert.equal(health.tryAcquireProbe(2, "probe"), true);
-    health.recordFailure(2, 429, "probe");
+    health.setDisabled(2, false);
+    health.recordFailure(2, 429, "new", health.getEpoch(2));
+    assert.equal(health.getStatus(2).disabledBy, "auto");
     assert.equal(health.getStatus(2).until, clock.value + 90_000);
-    assert.equal(health.getStatus(2).probeInFlight, false);
-    assert.equal(health.tryAcquireProbe(2, "too-early"), false);
 });
 
-test("cancelled and non-quota failed probes permit another probe without opening the account", t => {
-    const { clock, health } = fixture(t, { rateLimitCooldownSeconds: 1 });
-    health.recordFailure(2, 429, "first");
-    clock.value += 1000;
-    health.tryAcquireProbe(2, "cancelled");
-    health.releaseProbe(2, "unrelated");
-    assert.equal(health.getStatus(2).probeInFlight, true);
-    health.releaseProbe(2, "cancelled");
-    assert.equal(health.tryAcquireProbe(2, "failure"), true);
-    health.recordFailure(2, 503, "failure");
-    assert.equal(health.getStatus(2).probeRequired, true);
-    assert.equal(health.tryAcquireProbe(2, "bad-input"), true);
-    health.recordFailure(2, 400, "bad-input");
-    assert.equal(health.tryAcquireProbe(2, "success"), true);
-    health.recordSuccess(2, "success");
-    assert.equal(health.getStatus(2).probeRequired, false);
+test("legacy cooldowns migrate to automatic off without losing remaining time", t => {
+    const { clock, filePath } = fixture(t);
+    fs.writeFileSync(
+        filePath,
+        JSON.stringify({
+            accounts: {
+                2: { lastStatus: 429, mode: "cooldown", until: clock.value + 30_000 },
+                3: { mode: "disabled" },
+            },
+            version: 1,
+        })
+    );
+    const health = new AccountHealth(logger, filePath, () => clock.value);
+    assert.equal(health.getStatus(2).mode, "disabled");
+    assert.equal(health.getStatus(2).disabledBy, "auto");
+    assert.equal(health.getStatus(3).disabledBy, "manual");
+    clock.value += 30_000;
+    assert.equal(health.isAvailable(2), true);
+    assert.equal(health.isAvailable(3), false);
 });
 
-test("restart discards an old in-flight probe while retaining the expired recovery gate", t => {
-    const { clock, filePath, health } = fixture(t, { rateLimitCooldownSeconds: 1 });
-    health.recordFailure(2, 429, "first");
-    clock.value += 1000;
-    health.tryAcquireProbe(2, "old-process");
-    const restored = new AccountHealth(logger, filePath, () => clock.value);
-    assert.equal(restored.getStatus(2).probeRequired, true);
-    assert.equal(restored.getStatus(2).probeInFlight, false);
-    assert.equal(restored.tryAcquireProbe(2, "new-process"), true);
-});
-
-test("transient cooldown during quota recovery retains the required successful probe", t => {
-    const { clock, health } = fixture(t, { rateLimitCooldownSeconds: 1 });
-    health.recordFailure(2, 429, "first");
-    clock.value += 1000;
-    for (const requestId of ["probe-1", "probe-2", "probe-3"]) {
-        assert.equal(health.tryAcquireProbe(2, requestId), true);
-        health.recordFailure(2, 503, requestId);
-    }
-    assert.equal(health.getStatus(2).mode, "cooldown");
-    assert.equal(health.getStatus(2).until, clock.value + 60_000);
-    clock.value += 60_000;
-    assert.equal(health.getStatus(2).probeRequired, true);
-    assert.equal(health.tryAcquireProbe(2, "probe-4"), true);
-    health.recordSuccess(2, "probe-4");
-    assert.equal(health.getStatus(2).probeRequired, false);
-});
-
-test("transient 503 failures need three attempts before cooldown", t => {
+test("testing an off account preserves switch and restore time for success, failure and cancellation", t => {
     const { health } = fixture(t);
-    health.recordFailure(3, 503, "r1");
-    health.recordFailure(3, 503, "r2");
+    health.recordFailure(2, 429, "quota", undefined, { model: "model-1" });
+    const until = health.getStatus(2).until;
+    for (const [requestId, result] of [
+        ["passed", { success: true }],
+        ["failed", { status: 429 }],
+        ["permission-error", { status: 403 }],
+        ["cancelled", {}],
+    ]) {
+        assert.equal(health.beginManualProbe(2, requestId, "model-1"), true);
+        assert.equal(health.tryAcquireProbe(2, requestId), true);
+        assert.equal(health.tryAcquireProbe(2, "ordinary"), false);
+        health.finishManualProbe(2, requestId, result);
+        assert.equal(health.getStatus(2).enabled, false);
+        assert.equal(health.getStatus(2).until, until);
+        assert.equal(health.getStatus(2).disabledStatus, 429);
+    }
+    health.setDisabled(2, true);
+    health.beginManualProbe(2, "manual-off-test", "model-1");
+    health.finishManualProbe(2, "manual-off-test", { success: true });
+    assert.equal(health.getStatus(2).disabledBy, "manual");
+    assert.equal(health.getStatus(2).enabled, false);
+});
+
+test("manual action during a test wins over its eventual failure", t => {
+    const { health } = fixture(t);
+    health.beginManualProbe(2, "test", "model-1");
+    health.setDisabled(2, false);
+    health.finishManualProbe(2, "test", { status: 429 });
+    assert.equal(health.getStatus(2).enabled, true);
+});
+
+test("an expiring restore timer waits for the manual test to release its reservation", t => {
+    const { clock, health } = fixture(t, { rateLimitCooldownSeconds: 1 });
+    health.recordFailure(2, 429, "quota");
+    health.beginManualProbe(2, "test", "model");
+    clock.value += 1000;
+    assert.equal(health.getStatus(2).enabled, false);
+    assert.equal(health.isManualProbe(2, "test"), true);
+    health.finishManualProbe(2, "test", { success: true });
+    assert.equal(health.isAvailable(2), true);
+});
+
+test("three transient failures temporarily turn off, while a successful request resets their streak", t => {
+    const { clock, health } = fixture(t);
+    health.recordFailure(3, 503, "one");
+    health.recordFailure(3, 503, "two");
     assert.equal(health.isAvailable(3), true);
-    health.recordFailure(3, 503, "r3");
-    assert.equal(health.getStatus(3).mode, "cooldown");
+    health.recordSuccess(3, "success");
+    health.recordFailure(3, 503, "three");
+    assert.equal(health.isAvailable(3), true);
+    health.recordFailure(3, 503, "four");
+    health.recordFailure(3, 503, "five");
+    assert.equal(health.getStatus(3).disabledBy, "auto");
+    clock.value = health.getStatus(3).until;
+    assert.equal(health.isAvailable(3), true);
 });
 
 test("backend outcome belongs to its queue account and stale responses are ignored", t => {
@@ -222,7 +252,7 @@ test("late outcomes from the old credential do not quarantine a reauthenticated 
         JSON.stringify({ event_type: "error", request_attempt_id: "new-attempt-1", request_id: "new-1", status: 429 }),
         3
     );
-    assert.equal(health.getStatus(3).mode, "cooldown");
+    assert.equal(health.getStatus(3).mode, "disabled");
 });
 
 test("cache maintenance only quarantines on current-credential 429 and never opens a recovery gate", async t => {
@@ -249,14 +279,14 @@ test("cache maintenance only quarantines on current-credential 429 and never ope
     system._recordBackendOutcome({ ...outcome, status: 429, success: false });
     assert.equal(health.getStatus(2).mode, "active");
     system._recordBackendOutcome({ ...outcome, authCredentialEpoch: 1, status: 429, success: false });
-    assert.equal(health.getStatus(2).mode, "cooldown");
+    assert.equal(health.getStatus(2).mode, "disabled");
     assert.deepEqual(notifications, [2]);
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(rebalances, 1);
     clock.value += 1000;
     assert.equal(health.tryAcquireProbe(2, "business-probe"), true);
     system._recordBackendOutcome({ ...outcome, authCredentialEpoch: 1, success: true });
-    assert.equal(health.getStatus(2).probeRequired, true);
+    assert.equal(health.getStatus(2).probeRequired, false);
     system._recordBackendOutcome({
         ...outcome,
         authCredentialEpoch: 1,
@@ -264,10 +294,10 @@ test("cache maintenance only quarantines on current-credential 429 and never ope
         success: true,
     });
     assert.equal(health.getStatus(2).probeRequired, false);
-    assert.deepEqual(notifications, [2, 2]);
+    assert.deepEqual(notifications, [2]);
 });
 
-test("old maintenance failures cannot quarantine an account after its recovery probe succeeds", async t => {
+test("old maintenance failures cannot quarantine an account after its automatic restore", async t => {
     const { clock, health } = fixture(t, { rateLimitCooldownSeconds: 1 });
     const system = Object.create(ProxyServerSystem.prototype);
     system.authCredentialEpochs = new Map();
@@ -287,7 +317,7 @@ test("old maintenance failures cannot quarantine an account after its recovery p
     clock.value += 1000;
     assert.equal(health.tryAcquireProbe(2, "probe"), true);
     registry.createMessageQueue("probe", 2);
-    assert.equal(registry.messageQueues.get("probe").healthEpoch, 1);
+    assert.equal(registry.messageQueues.get("probe").healthEpoch, 2);
     send("probe", "stream_close");
     assert.equal(health.getEpoch(2), 2);
     assert.equal(health.getStatus(2).probeRequired, false);
@@ -296,7 +326,7 @@ test("old maintenance failures cannot quarantine an account after its recovery p
     assert.equal(health.getEpoch(2), 2);
     registry.createMessageQueue("new-generation", 2);
     send("new-generation", "error", 429);
-    assert.equal(health.getStatus(2).mode, "cooldown");
+    assert.equal(health.getStatus(2).mode, "disabled");
     assert.equal(health.getEpoch(2), 3);
     for (const requestId of [...registry.messageQueues.keys()]) registry.removeMessageQueue(requestId);
     await new Promise(resolve => setImmediate(resolve));

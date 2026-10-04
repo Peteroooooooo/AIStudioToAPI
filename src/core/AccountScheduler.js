@@ -27,11 +27,13 @@ class AccountScheduler {
         this.maxOwners = maxOwners;
         this.maxWaiting = maxWaiting;
         this.owners = new Map();
+        this.sessions = new Map();
         this.prefixes = new Map();
         this.resources = new Map();
         this.requests = new Map();
         this.recovering = new Set();
         this.cursor = -1;
+        this.conversationSequence = 0;
         this.filePath = dataDir ? path.join(dataDir, "conversation-owners.json") : null;
         this.persistChain = Promise.resolve();
         this._load();
@@ -49,13 +51,20 @@ class AccountScheduler {
         try {
             const saved = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
             if (saved.version !== 1) return;
+            this.conversationSequence = Number.isSafeInteger(saved.conversationSequence)
+                ? saved.conversationSequence
+                : 0;
             for (const [key, owner] of (saved.owners || []).slice(-this.maxOwners)) {
                 if (typeof key === "string" && Number.isInteger(owner.authIndex) && owner.authIndex >= 0) {
                     this.owners.set(key, { ...owner, version: Number(owner.version) || 1 });
+                    if (typeof owner.sessionKey === "string") this.sessions.set(owner.sessionKey, key);
+                    const number = Number(owner.conversationId?.match(/^chat_(\d+)$/)?.[1]);
+                    if (Number.isSafeInteger(number))
+                        this.conversationSequence = Math.max(this.conversationSequence, number);
                 }
             }
             for (const [prefix, key] of saved.prefixes || []) {
-                if (this.owners.has(key)) this.prefixes.set(prefix, key);
+                if (key === null || this.owners.has(key)) this.prefixes.set(prefix, key);
             }
             for (const [key, binding] of (saved.resources || []).slice(-this.maxOwners)) {
                 if (Number.isInteger(binding?.authIndex) && binding.authIndex >= 0) this.resources.set(key, binding);
@@ -79,6 +88,7 @@ class AccountScheduler {
 
     flush() {
         const snapshot = JSON.stringify({
+            conversationSequence: this.conversationSequence,
             owners: [...this.owners],
             prefixes: [...this.prefixes],
             resources: [...this.resources],
@@ -112,25 +122,38 @@ class AccountScheduler {
         const contents = Array.isArray(body.contents) ? body.contents : [];
         const prefixHashes = [];
         // Incremental hashing avoids repeatedly serializing a growing history.
-        const digest = crypto.createHash("sha256").update(base);
+        const digest = crypto.createHash("sha256").update(this._hash({ scope }));
+        const legacyDigest = crypto.createHash("sha256").update(base);
+        const legacyPrefixes = [];
         for (const content of contents) {
-            digest.update(canonical(content));
+            const serialized = canonical(content);
+            digest.update(serialized);
+            legacyDigest.update(serialized);
             prefixHashes.push(digest.copy().digest("hex"));
+            legacyPrefixes.push(legacyDigest.copy().digest("hex"));
         }
-        let key = sessionId ? this._hash({ base, sessionId }) : null;
-        if (!key) {
+        const sessionKey = sessionId ? this._hash({ scope, sessionId }) : null;
+        let key = sessionKey ? this.sessions.get(sessionKey) || sessionKey : null;
+        if (sessionKey && !this.owners.has(key)) {
+            const legacyKey = this._hash({ base, sessionId });
+            if (this.owners.has(legacyKey)) key = legacyKey;
+        }
+        // Identical standalone greetings do not establish a client conversation.
+        if (!key && contents.length > 1) {
             for (let index = prefixHashes.length - 1; index >= 0; index--) {
-                const ownerKey = this.prefixes.get(prefixHashes[index]);
+                const ownerKey = this.prefixes.has(prefixHashes[index])
+                    ? this.prefixes.get(prefixHashes[index])
+                    : this.prefixes.get(legacyPrefixes[index]);
+                // A prefix shared by multiple conversations is not a reliable match.
+                if (ownerKey === null) break;
                 if (this.owners.has(ownerKey)) {
                     key = ownerKey;
                     break;
                 }
             }
         }
-        key ||= prefixHashes.length
-            ? prefixHashes[prefixHashes.length - 1]
-            : this._hash({ base, requestId: proxy.request_id });
-        return { body, explicit: Boolean(sessionId), key, prefixHashes };
+        key ||= this._hash({ history: prefixHashes.at(-1), requestId: proxy.request_id, scope });
+        return { base, body, explicit: Boolean(sessionId), key, prefixHashes, sessionKey };
     }
 
     _resourceNames(proxy, body) {
@@ -226,6 +249,37 @@ class AccountScheduler {
         return { conversations, inFlight, waiting };
     }
 
+    getAccountRuntimeState(authIndex) {
+        const request = [...this.requests.values()].find(item => item.lease.authIndex === authIndex && item.running);
+        const load = this.getAccountLoad(authIndex);
+        const health = this.handler.authSource.health.getStatus?.(authIndex);
+        const activity = request ? this.handler.connectionRegistry?.messageQueues?.get(request.lease.requestId) : null;
+        const phase = !request
+            ? "idle"
+            : activity?.localEnded || activity?.outcomeReported
+              ? "finishing"
+              : request.lease.requestId.startsWith("account_test_")
+                ? "testing"
+                : activity?.dispatchedAt
+                  ? "generating"
+                  : "preparing";
+        return {
+            ...load,
+            deadline: request?.deadline || null,
+            lastProgressAt: activity?.lastProgressAt || activity?.dispatchedAt || null,
+            phase,
+            requestId: request?.lease.requestId || null,
+            startedAt: request?.startedAt || null,
+            state: request
+                ? health?.probeInFlight
+                    ? "recovery-probe"
+                    : "busy"
+                : this.recovering.has(authIndex)
+                  ? "reconnecting"
+                  : "idle",
+        };
+    }
+
     getSnapshot() {
         const indices = new Set([
             ...this._readyIndices(),
@@ -269,6 +323,7 @@ class AccountScheduler {
             .sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0];
         if (!oldest) throw schedulerError("Conversation owner registry is busy; retry shortly.");
         this.owners.delete(oldest[0]);
+        if (oldest[1].sessionKey) this.sessions.delete(oldest[1].sessionKey);
         for (const [prefix, key] of this.prefixes) if (key === oldest[0]) this.prefixes.delete(prefix);
     }
 
@@ -297,6 +352,7 @@ class AccountScheduler {
         if (new Set(resourceOwners).size > 1)
             return Promise.reject(schedulerError("Google resources from different accounts cannot be combined.", 409));
         let owner = this.owners.get(identity.key);
+        const conversationReused = Boolean(owner);
         if (owner && !this._sameAccount(owner)) {
             owner.authIndex = -1;
             owner.version++;
@@ -324,15 +380,34 @@ class AccountScheduler {
                 owner.version++;
             }
             owner.lastUsed = this.clock();
-            if (!identity.explicit) {
-                for (const prefix of identity.prefixHashes) {
-                    // Only the complete incoming history identifies this turn; common first
-                    // messages must not collapse independent multi-turn conversations.
-                    if (prefix === identity.prefixHashes.at(-1)) {
-                        this.prefixes.delete(prefix);
-                        this.prefixes.set(prefix, identity.key);
-                    }
+            if (!ephemeral) {
+                const configChanged = Boolean(owner.requestConfigKey && owner.requestConfigKey !== identity.base);
+                owner.requestConfigKey = identity.base;
+                if (identity.sessionKey) {
+                    owner.sessionKey = identity.sessionKey;
+                    this.sessions.set(identity.sessionKey, identity.key);
                 }
+                owner.conversationId ||= `chat_${++this.conversationSequence}`;
+                this.handler._updateTrackedRequest?.(proxy.request_id, {
+                    conversationConfigChanged: configChanged,
+                    conversationId: owner.conversationId,
+                    conversationMatch: conversationReused
+                        ? identity.explicit
+                            ? "session_match"
+                            : "history_match"
+                        : !identity.explicit && identity.body.contents?.some(content => content.role === "model")
+                          ? "history_unmatched"
+                          : "first_seen",
+                    conversationReused,
+                    conversationSource: identity.explicit ? "session" : "history",
+                });
+            }
+            if (!ephemeral && identity.prefixHashes.length) {
+                const prefix = identity.prefixHashes.at(-1);
+                const previous = this.prefixes.get(prefix);
+                const ambiguous = previous === null || (this.owners.has(previous) && previous !== identity.key);
+                this.prefixes.delete(prefix);
+                this.prefixes.set(prefix, ambiguous ? null : identity.key);
                 while (this.prefixes.size > this.maxOwners * 4) this.prefixes.delete(this.prefixes.keys().next().value);
             }
             const lease = {
@@ -366,6 +441,47 @@ class AccountScheduler {
         }
     }
 
+    // Console tests share the generation slot, but never migrate to another account.
+    acquirePinned(proxy, authIndex, { signal, deadline, isReady } = {}) {
+        if (signal?.aborted) return Promise.reject(new UserAbortedError());
+        if (this.requests.has(proxy.request_id)) return Promise.reject(schedulerError("Duplicate request ID."));
+        const available = () =>
+            (this.handler.authSource.health.isAvailable(authIndex) ||
+                this.handler.authSource.health.isManualProbe?.(authIndex, proxy.request_id)) &&
+            !this.handler.authSource.isExpired?.(authIndex) &&
+            !this.handler.authSource.pendingRefreshIndices?.has(authIndex) &&
+            (isReady ? isReady() : this.isAccountAvailable(authIndex));
+        if (!available()) return Promise.reject(schedulerError("Selected account is unavailable.", 409));
+        const key = this._hash({ accountTest: proxy.request_id });
+        const lease = { authIndex, key, requestId: proxy.request_id, version: 1 };
+        this.owners.set(key, {
+            accountKey: this._accountKey(authIndex),
+            authIndex,
+            lastUsed: this.clock(),
+            version: 1,
+        });
+        const request = {
+            available,
+            deadline: deadline || this.clock() + 30000,
+            ephemeral: true,
+            lease,
+            pinned: true,
+            proxy,
+            running: false,
+            signal,
+        };
+        this.requests.set(proxy.request_id, request);
+        proxy.account_lease = lease;
+        if (signal) {
+            request.onAbort = () => this.cancel(proxy.request_id);
+            signal.addEventListener("abort", request.onAbort, { once: true });
+        }
+        return this._waitForSlot(request).catch(error => {
+            this.release(proxy.request_id);
+            throw error;
+        });
+    }
+
     _waitForSlot(request) {
         if (request.signal?.aborted) return Promise.reject(new UserAbortedError());
         if (this.clock() >= request.deadline)
@@ -373,16 +489,21 @@ class AccountScheduler {
         const load = this.getAccountLoad(request.lease.authIndex);
         const health = this.handler.authSource.health;
         if (
-            this.isAccountAvailable(request.lease.authIndex) &&
+            (request.available ? request.available() : this.isAccountAvailable(request.lease.authIndex)) &&
             load.inFlight === 0 &&
             load.waiting === 0 &&
             (health.tryAcquireProbe?.(request.lease.authIndex, request.lease.requestId) ?? true)
         ) {
             request.running = true;
+            request.startedAt = this.clock();
             return Promise.resolve(request.lease);
         }
         if ([...this.requests.values()].filter(item => item.waiter).length >= this.maxWaiting)
             return Promise.reject(schedulerError("Account request queue is full."));
+        this.handler._updateTrackedRequest?.(request.lease.requestId, {
+            initialAuthIndex: request.lease.authIndex,
+            queueState: "queued",
+        });
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(
                 () => {
@@ -431,15 +552,18 @@ class AccountScheduler {
         for (const request of this.requests.values()) {
             if (!request.waiter) continue;
             try {
+                if (request.available && !request.available())
+                    throw schedulerError("Selected account became unavailable; the test was not moved.", 409);
                 const owner = this.owners.get(request.lease.key);
                 if (
-                    !this._ownerCanWait(request.lease.authIndex) ||
-                    owner.authIndex !== request.lease.authIndex ||
-                    owner.version !== request.lease.version
+                    !request.available &&
+                    (!this._ownerCanWait(request.lease.authIndex) ||
+                        owner.authIndex !== request.lease.authIndex ||
+                        owner.version !== request.lease.version)
                 )
                     this._moveOwner(request);
                 const index = request.lease.authIndex;
-                if (!this.isAccountAvailable(index)) continue;
+                if (!(request.available ? request.available() : this.isAccountAvailable(index))) continue;
                 if (
                     this.getAccountLoad(index).inFlight ||
                     !(this.handler.authSource.health.tryAcquireProbe?.(index, request.lease.requestId) ?? true)
@@ -449,6 +573,11 @@ class AccountScheduler {
                 clearTimeout(waiter.timeout);
                 request.waiter = null;
                 request.running = true;
+                request.startedAt = this.clock();
+                this.handler._updateTrackedRequest?.(request.lease.requestId, {
+                    initialAuthIndex: request.lease.authIndex,
+                    queueState: "leased",
+                });
                 waiter.resolve(request.lease);
             } catch (error) {
                 this._rejectWaiter(request, error);
@@ -506,7 +635,9 @@ class AccountScheduler {
         return pending;
     }
 
-    notifyAccountChange() {
+    notifyAccountChange(authIndex) {
+        if (Number.isInteger(authIndex) && !this.handler.authSource.health.isAvailable(authIndex))
+            this.handler.cacheManager?.cancelAccountMaintenance?.(authIndex);
         this._pump();
         this.handler.browserManager
             ?.ensureAccountPoolReady?.()

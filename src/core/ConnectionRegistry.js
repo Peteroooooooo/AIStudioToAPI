@@ -51,6 +51,14 @@ class ConnectionRegistry extends EventEmitter {
 
     addConnection(websocket, clientInfo) {
         const authIndex = clientInfo.authIndex;
+        if (
+            this.browserManager?.isConnectionGenerationCurrent &&
+            !this.browserManager.isConnectionGenerationCurrent(authIndex, clientInfo.contextGeneration)
+        ) {
+            this.logger.warn(`[Server] Rejecting stale context connection for account #${authIndex}.`);
+            this._safeCloseWebSocket(websocket, 1008, "Stale context generation");
+            return;
+        }
 
         // Validate authIndex: must be a valid non-negative integer
         if (authIndex === undefined || authIndex < 0 || !Number.isInteger(authIndex)) {
@@ -264,6 +272,7 @@ class ConnectionRegistry extends EventEmitter {
             }
             const entry = this.messageQueues.get(requestId);
             if (entry) {
+                if (entry.localEnded) return;
                 // Verify that the message comes from the correct authIndex
                 if (messageAuthIndex !== entry.authIndex) {
                     this.logger.warn(
@@ -282,6 +291,10 @@ class ConnectionRegistry extends EventEmitter {
                     return;
                 }
                 parsedMessage.authIndex = entry.authIndex;
+                entry.dispatchedAt ||= entry.createdAt;
+                entry.lastProgressAt = Date.now();
+                if (parsedMessage.event_type === "response_headers")
+                    entry.upstreamStatusCode = Number(parsedMessage.status) || null;
                 if (parsedMessage.event_type === "chunk") {
                     this.emit("backendChunk", {
                         data: parsedMessage.data,
@@ -295,10 +308,16 @@ class ConnectionRegistry extends EventEmitter {
                 ) {
                     this.emit("backendAttemptEvent", {
                         authIndex: entry.authIndex,
+                        errorMessage: parsedMessage.message || null,
                         eventType: parsedMessage.event_type,
                         requestAttemptId: entry.requestAttemptId,
                         requestId,
                         statusCode: parsedMessage.status,
+                        terminationReason: parsedMessage.termination_reason || null,
+                        upstreamStatusCode:
+                            parsedMessage.event_type === "error"
+                                ? Number(parsedMessage.upstream_status) || entry.upstreamStatusCode || null
+                                : entry.upstreamStatusCode || null,
                     });
                 }
                 // The queue owns the source account. Record outcomes here before a concurrent
@@ -311,6 +330,7 @@ class ConnectionRegistry extends EventEmitter {
                     entry.backendFailed = true;
                     if (!entry.backendFailureReported) {
                         entry.backendFailureReported = true;
+                        entry.outcomeReported = true;
                         this.emit("backendOutcome", {
                             authCredentialEpoch: entry.authCredentialEpoch,
                             authIndex: entry.authIndex,
@@ -319,9 +339,18 @@ class ConnectionRegistry extends EventEmitter {
                             requestId,
                             status: Number.isFinite(status) ? status : 500,
                             success: false,
+                            terminationReason: parsedMessage.termination_reason || "upstream_error",
+                            transportFailure: ["browser_timeout", "transport_error"].includes(
+                                parsedMessage.termination_reason
+                            ),
                         });
                     }
-                } else if (parsedMessage.event_type === "stream_close" && !entry.backendFailed) {
+                } else if (
+                    parsedMessage.event_type === "stream_close" &&
+                    !entry.backendFailed &&
+                    !entry.outcomeReported
+                ) {
+                    entry.outcomeReported = true;
                     this.emit("backendOutcome", {
                         authCredentialEpoch: entry.authCredentialEpoch,
                         authIndex: entry.authIndex,
@@ -497,6 +526,13 @@ class ConnectionRegistry extends EventEmitter {
         // This prevents stale queues from lingering when retrying failed requests
         const existingEntry = this.messageQueues.get(requestId);
         if (existingEntry) {
+            this.endRequestAttempt(requestId, {
+                errorMessage: "Replaced by a new upstream attempt.",
+                healthFailure: false,
+                outcome: "error",
+                statusCode: null,
+                terminationReason: "retry_replaced",
+            });
             const existingAuthIndex = existingEntry.authIndex;
             this.logger.debug(
                 `[Registry] Found existing message queue for request ${requestId} (authIndex=${existingEntry.authIndex}), closing it before creating new one`
@@ -533,6 +569,20 @@ class ConnectionRegistry extends EventEmitter {
     removeMessageQueue(requestId, reason = "handler_cleanup") {
         const entry = this.messageQueues.get(requestId);
         if (entry) {
+            const terminal = {
+                account_transport_recovery: ["error", 503, true],
+                client_disconnect: ["aborted", null, false],
+                request_deadline: ["error", 504, true],
+                stale_cleanup: ["error", 504, true],
+            }[reason];
+            if (terminal)
+                this.endRequestAttempt(requestId, {
+                    errorMessage: reason === "request_deadline" ? "Request deadline exceeded." : reason,
+                    healthFailure: terminal[2],
+                    outcome: terminal[0],
+                    statusCode: terminal[1],
+                    terminationReason: reason,
+                });
             const authIndex = entry.authIndex;
             entry.queue.close(reason);
             this.messageQueues.delete(requestId);
@@ -560,6 +610,86 @@ class ConnectionRegistry extends EventEmitter {
         return entry ? entry.requestAttemptId || null : null;
     }
 
+    markRequestDispatched(requestId, authIndex, requestAttemptId) {
+        const entry = this.messageQueues.get(requestId);
+        if (!entry || entry.authIndex !== authIndex || entry.requestAttemptId !== requestAttemptId || entry.localEnded)
+            return false;
+        entry.dispatchedAt ||= Date.now();
+        return true;
+    }
+
+    endRequestAttempt(
+        requestId,
+        {
+            requestAttemptId,
+            authIndex,
+            outcome = "error",
+            statusCode = 503,
+            terminationReason = "transport_error",
+            errorMessage = null,
+            healthFailure = true,
+        } = {}
+    ) {
+        const entry = this.messageQueues.get(requestId);
+        if (
+            !entry ||
+            !entry.dispatchedAt ||
+            entry.localEnded ||
+            entry.outcomeReported ||
+            (requestAttemptId && requestAttemptId !== entry.requestAttemptId) ||
+            (authIndex !== undefined && authIndex !== entry.authIndex)
+        )
+            return false;
+        entry.localEnded = true;
+        entry.outcomeReported = true;
+        this.emit("backendAttemptEvent", {
+            authIndex: entry.authIndex,
+            errorMessage,
+            eventType: "attempt_end",
+            outcome,
+            requestAttemptId: entry.requestAttemptId,
+            requestId,
+            statusCode,
+            terminationReason,
+            upstreamStatusCode: entry.upstreamStatusCode || null,
+        });
+        if (healthFailure && !requestId.startsWith("cache_resource_"))
+            this.emit("backendOutcome", {
+                authCredentialEpoch: entry.authCredentialEpoch,
+                authIndex: entry.authIndex,
+                healthEpoch: entry.healthEpoch,
+                requestAttemptId: entry.requestAttemptId,
+                requestId,
+                status: statusCode || 503,
+                success: false,
+                terminationReason,
+                transportFailure: true,
+            });
+        return true;
+    }
+
+    getAccountActivity(authIndex) {
+        let generation = 0,
+            maintenance = 0,
+            oldestStartedAt = null;
+        const requests = [];
+        for (const [requestId, entry] of this.messageQueues) {
+            if (entry.authIndex !== authIndex || entry.localEnded || entry.outcomeReported) continue;
+            if (requestId.startsWith("cache_resource_")) maintenance++;
+            else {
+                generation++;
+                requests.push({
+                    lastProgressAt: entry.lastProgressAt || null,
+                    requestId,
+                    startedAt: entry.dispatchedAt || entry.createdAt,
+                    state: entry.dispatchedAt ? "generating" : "preparing",
+                });
+            }
+            oldestStartedAt = oldestStartedAt === null ? entry.createdAt : Math.min(oldestStartedAt, entry.createdAt);
+        }
+        return { generation, maintenance, oldestStartedAt, requests, total: generation + maintenance };
+    }
+
     /**
      * Check whether a specific account has any active message queue.
      * @param {number} authIndex - The account index to inspect
@@ -584,6 +714,13 @@ class ConnectionRegistry extends EventEmitter {
         let count = 0;
         for (const [requestId, entry] of this.messageQueues.entries()) {
             if (entry.authIndex === authIndex) {
+                this.endRequestAttempt(requestId, {
+                    errorMessage: `Account connection closed (${reason}).`,
+                    healthFailure: ["page_closed", "grace_period_timeout", "reconnect_cleanup"].includes(reason),
+                    outcome: "error",
+                    statusCode: 503,
+                    terminationReason: reason,
+                });
                 try {
                     entry.queue.close(reason);
                 } catch (e) {
@@ -610,6 +747,12 @@ class ConnectionRegistry extends EventEmitter {
         if (this.messageQueues.size > 0) {
             this.logger.info(`[Registry] Force closing ${this.messageQueues.size} pending message queues...`);
             this.messageQueues.forEach((entry, requestId) => {
+                this.endRequestAttempt(requestId, {
+                    healthFailure: false,
+                    outcome: "aborted",
+                    statusCode: null,
+                    terminationReason: "system_reset",
+                });
                 try {
                     entry.queue.close("system_reset");
                 } catch (e) {
@@ -633,6 +776,11 @@ class ConnectionRegistry extends EventEmitter {
         for (const [requestId, entry] of this.messageQueues.entries()) {
             const age = now - entry.createdAt;
             if (age > maxAgeMs) {
+                this.endRequestAttempt(requestId, {
+                    errorMessage: "Stale upstream attempt timed out.",
+                    statusCode: 504,
+                    terminationReason: "stale_cleanup",
+                });
                 this.logger.warn(
                     `[Registry] Cleaning up stale message queue for request ${requestId} (age: ${Math.round(age / 1000)}s, authIndex: ${entry.authIndex})`
                 );

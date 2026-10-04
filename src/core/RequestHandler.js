@@ -20,6 +20,14 @@ const { QueueClosedError, QueueTimeoutError } = require("../utils/MessageQueue")
 
 const WS_RECONNECT_WAIT_MS = 130000;
 const WS_CONNECTION_READY_TIMEOUT_MS = 10000;
+const CONVERSATION_HEADERS = [
+    "x-conversation-id",
+    "x-thread-id",
+    "x-session-id",
+    "conversation-id",
+    "thread-id",
+    "session-id",
+];
 
 // Default timeout constants (in milliseconds)
 const DEFAULT_TIMEOUTS = {
@@ -128,6 +136,13 @@ class RequestHandler {
             // Registry backend outcomes record the attempt's health and credential
             // epochs before delivery. Replaying that failure here could quarantine
             // an account after its credentials or health state have recovered.
+            this.connectionRegistry.endRequestAttempt?.(requestId, {
+                errorMessage: error.message || "Browser request failed.",
+                healthFailure: [502, 503, 504].includes(Number(error.status || error.statusCode) || 503),
+                statusCode: Number(error.status || error.statusCode) || 503,
+                terminationReason:
+                    Number(error.status || error.statusCode) === 504 ? "execution_timeout" : "transport_error",
+            });
             this.accountScheduler.notifyAccountChange?.();
             return;
         }
@@ -159,6 +174,16 @@ class RequestHandler {
         ].find(key => this.serverSystem?.apiKeyStore?.match(key));
         if (!suppliedKey) return null;
         return crypto.createHmac("sha256", this.config.sessionSecret).update(suppliedKey).digest("hex");
+    }
+
+    _getConversationSessionId(req) {
+        // Client-independent contract: explicitly named conversation fields only.
+        // User IDs, request IDs and cache affinity keys do not identify a conversation.
+        const candidates = [
+            ...CONVERSATION_HEADERS.map(name => req.headers?.[name]),
+            ...["conversation_id", "thread_id", "session_id"].map(name => req.body?.metadata?.[name]),
+        ];
+        return candidates.find(value => typeof value === "string" && value.trim())?.trim() || null;
     }
 
     _extractModelFromPath(pathValue) {
@@ -232,12 +257,23 @@ class RequestHandler {
         const usageStatsService = this._getUsageStatsService();
         if (!usageStatsService) return;
 
+        // Admission can fail before conversion or account selection. Preserve the
+        // requested model here so those failures still appear under its filter.
+        const rawModel = this._extractModelFromPath(req.path) || req.body?.model;
+        let model = typeof rawModel === "string" ? rawModel.trim().replace(/^models\//, "") : null;
+        if (model) {
+            model = FormatConverter.parseModelBuiltInToolSuffixes(model).cleanModelName;
+            model = FormatConverter.parseModelStreamingModeSuffix(model).cleanModelName;
+            model = FormatConverter.parseModelThinkingLevel(model).cleanModelName;
+        }
+
         usageStatsService.startRequest(requestId, {
             apiKeyId: this._getCallerApiKeyId(req),
             clientIp: this._getClientIp(req),
             initialAccountName: null,
             initialAuthIndex: null,
             method: req.method,
+            model,
             path: req.path,
             ...meta,
         });
@@ -251,9 +287,9 @@ class RequestHandler {
 
     _finalizeTrackedRequest(requestId, res, overrides = {}) {
         clearTimeout(res.__accountDeadlineTimer);
-        this.accountScheduler?.release(requestId);
+        if (res.__proxyRequestFinalized) return;
+        res.__proxyRequestFinalized = true;
         const usageStatsService = this._getUsageStatsService();
-        if (!usageStatsService) return;
 
         let outcome = overrides.outcome;
         if (!outcome) {
@@ -276,6 +312,25 @@ class RequestHandler {
             overrides.errorMessage ??
             res.__usageTrackingErrorMessage ??
             (outcome === "error" ? "Request failed" : null);
+
+        const entry = this.connectionRegistry.messageQueues?.get(requestId);
+        if (entry?.dispatchedAt && !entry.localEnded && !entry.outcomeReported)
+            this._cancelBrowserRequest(requestId, entry.authIndex, entry.requestAttemptId);
+        this.connectionRegistry.endRequestAttempt?.(requestId, {
+            errorMessage,
+            healthFailure: outcome === "error" && [502, 503, 504].includes(statusCode),
+            outcome,
+            statusCode: outcome === "success" ? null : statusCode,
+            terminationReason:
+                outcome === "aborted"
+                    ? "client_disconnect"
+                    : outcome === "success"
+                      ? "response_complete"
+                      : "request_failed",
+        });
+        this.connectionRegistry.removeMessageQueue(requestId, "response_complete");
+        this.accountScheduler?.release(requestId);
+        if (!usageStatsService) return;
 
         usageStatsService.finishRequest(requestId, {
             errorMessage,
@@ -1310,6 +1365,28 @@ class RequestHandler {
         return req.method === "POST" && req.path.includes("/upload/") && command.includes("start");
     }
 
+    async createOpenAIProxyRequest(body, requestId) {
+        const {
+            googleRequest,
+            cleanModelName: model,
+            modelStreamingMode,
+        } = await this.formatConverter.translateOpenAIToGoogle(body);
+        const effectiveStreamMode = modelStreamingMode || this.config.streamingMode;
+        const useRealStream = body.stream === true && effectiveStreamMode === "real";
+        const proxyRequest = {
+            body: JSON.stringify(googleRequest),
+            headers: { "Content-Type": "application/json" },
+            is_generative: true,
+            method: "POST",
+            path: `/v1beta/models/${model}:${useRealStream ? "streamGenerateContent" : "generateContent"}`,
+            query_params: useRealStream ? { alt: "sse" } : {},
+            request_id: requestId,
+            streaming_mode: useRealStream ? "real" : "fake",
+        };
+        this._initializeProxyRequestAttempt(proxyRequest);
+        return { model, proxyRequest, useRealStream };
+    }
+
     // Process OpenAI format requests
     async processOpenAIRequest(req, res) {
         const requestId = this._generateRequestId();
@@ -1328,15 +1405,9 @@ class RequestHandler {
             }
 
             const isOpenAIStream = req.body.stream === true;
-            const systemStreamMode = this.config.streamingMode;
-
-            // Translate OpenAI format to Google format (also handles model name suffix parsing)
-            let googleBody, model, modelStreamingMode;
+            let model, proxyRequest, useRealStream;
             try {
-                const result = await this.formatConverter.translateOpenAIToGoogle(req.body);
-                googleBody = result.googleRequest;
-                model = result.cleanModelName;
-                modelStreamingMode = result.modelStreamingMode || null;
+                ({ model, proxyRequest, useRealStream } = await this.createOpenAIProxyRequest(req.body, requestId));
             } catch (error) {
                 this.logger.error(
                     `❌ [Adapter] OpenAI request translation failed: ${error.message}, request ID: ${requestId}`
@@ -1349,20 +1420,6 @@ class RequestHandler {
                 );
             }
 
-            const effectiveStreamMode = modelStreamingMode || systemStreamMode;
-            const useRealStream = isOpenAIStream && effectiveStreamMode === "real";
-            const googleEndpoint = useRealStream ? "streamGenerateContent" : "generateContent";
-            const proxyRequest = {
-                body: JSON.stringify(googleBody),
-                headers: { "Content-Type": "application/json" },
-                is_generative: true,
-                method: "POST",
-                path: `/v1beta/models/${model}:${googleEndpoint}`,
-                query_params: useRealStream ? { alt: "sse" } : {},
-                request_id: requestId,
-                streaming_mode: useRealStream ? "real" : "fake",
-            };
-            this._initializeProxyRequestAttempt(proxyRequest);
             res.__proxyResponseStreamMode = isOpenAIStream ? (useRealStream ? "real" : "fake") : null;
             this.cacheManager.attachResponse(res, proxyRequest);
             const selectedAuthIndex = await this._selectServingAccount(proxyRequest, req, res);
@@ -1406,11 +1463,6 @@ class RequestHandler {
                             skipFinalFailureSwitch = true;
                             break;
                         }
-                        this._getUsageStatsService()?.recordAttempt(
-                            proxyRequest.request_id,
-                            currentQueueAuthIndex,
-                            this._getAccountNameForIndex(currentQueueAuthIndex)
-                        );
                         this._forwardRequest(proxyRequest, currentQueueAuthIndex);
                         initialMessage = await currentQueue.dequeue();
 
@@ -1834,11 +1886,6 @@ class RequestHandler {
                             skipFinalFailureSwitch = true;
                             break;
                         }
-                        this._getUsageStatsService()?.recordAttempt(
-                            proxyRequest.request_id,
-                            currentQueueAuthIndex,
-                            this._getAccountNameForIndex(currentQueueAuthIndex)
-                        );
                         this._forwardRequest(proxyRequest, currentQueueAuthIndex);
                         initialMessage = await currentQueue.dequeue();
 
@@ -2236,11 +2283,6 @@ class RequestHandler {
                             skipFinalFailureSwitch = true;
                             break;
                         }
-                        this._getUsageStatsService()?.recordAttempt(
-                            proxyRequest.request_id,
-                            currentQueueAuthIndex,
-                            this._getAccountNameForIndex(currentQueueAuthIndex)
-                        );
                         this._forwardRequest(proxyRequest, currentQueueAuthIndex);
                         initialMessage = await currentQueue.dequeue();
 
@@ -3218,12 +3260,6 @@ class RequestHandler {
                 skipFinalFailureSwitch = true;
                 break;
             }
-            // Record attempt before forwarding, so failed attempts are also counted
-            this._getUsageStatsService()?.recordAttempt(
-                proxyRequest.request_id,
-                currentQueueAuthIndex,
-                this._getAccountNameForIndex(currentQueueAuthIndex)
-            );
             this._forwardRequest(proxyRequest, currentQueueAuthIndex);
             headerMessage = await currentQueue.dequeue();
 
@@ -3615,11 +3651,6 @@ class RequestHandler {
                 authIndex = this._getRequestAuthIndex(requestId);
                 const remaining = this._scheduledDeadline(requestId) - Date.now();
                 if (remaining <= 0) throw Object.assign(new Error("Request deadline exceeded."), { status: 504 });
-                this._getUsageStatsService()?.recordAttempt(
-                    requestId,
-                    authIndex,
-                    this._getAccountNameForIndex(authIndex)
-                );
                 this._forwardRequest(proxyRequest, authIndex);
                 const message = await currentQueue.dequeue(Math.min(timeout, remaining));
                 if (message.event_type === "timeout")
@@ -3717,13 +3748,6 @@ class RequestHandler {
         const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
 
         while (retryAttempt <= maxRetries) {
-            // Record attempt at the start of each retry, before forwarding.
-            // This ensures failed attempts (e.g. 429 before any response) are also counted.
-            this._getUsageStatsService()?.recordAttempt(
-                proxyRequest.request_id,
-                currentQueueAuthIndex,
-                this._getAccountNameForIndex(currentQueueAuthIndex)
-            );
             try {
                 this._forwardRequest(proxyRequest, currentQueueAuthIndex);
 
@@ -4299,6 +4323,8 @@ class RequestHandler {
 
         // Check if this is a client disconnect - if so, just log and return
         if (this._isConnectionResetError(error)) {
+            // Cleanup after a server timeout must preserve the original failure.
+            if (res.writableEnded && res.__usageTrackingOutcome === "error") return;
             const isClientDisconnect = error.reason === "client_disconnect" || !this._isResponseWritable(res);
             if (isClientDisconnect) {
                 this._markTrackedClientAbort(res, errorMsg);
@@ -4567,14 +4593,26 @@ class RequestHandler {
         res.__accountDeadlineTimer = setTimeout(
             () => {
                 if (res.writableEnded) return;
+                const entry = this.connectionRegistry.messageQueues.get(proxyRequest.request_id);
+                const hasRecentProgress =
+                    entry?.upstreamStatusCode === 200 &&
+                    entry.lastProgressAt &&
+                    Date.now() - entry.lastProgressAt < this.timeouts.STREAM_CHUNK;
+                this.connectionRegistry.endRequestAttempt?.(proxyRequest.request_id, {
+                    errorMessage: "Request deadline exceeded.",
+                    healthFailure: !hasRecentProgress,
+                    requestAttemptId: proxyRequest.request_attempt_id,
+                    statusCode: 504,
+                    terminationReason: "request_deadline",
+                });
+                const index = this.accountScheduler.getLease(proxyRequest.request_id)?.authIndex;
+                if (Number.isInteger(index))
+                    this._cancelBrowserRequest(proxyRequest.request_id, index, proxyRequest.request_attempt_id);
                 this._handleRequestError(
                     Object.assign(new Error("Request deadline exceeded."), { statusCode: 504 }),
                     res,
                     proxyRequest.request_id
                 );
-                const index = this.accountScheduler.getLease(proxyRequest.request_id)?.authIndex;
-                if (Number.isInteger(index))
-                    this._cancelBrowserRequest(proxyRequest.request_id, index, proxyRequest.request_attempt_id);
                 this.connectionRegistry.removeMessageQueue(proxyRequest.request_id, "request_deadline");
                 res.__accountAbortController.abort();
             },
@@ -4588,11 +4626,12 @@ class RequestHandler {
             .update(caller)
             .digest("hex");
         let lease;
+        this._updateTrackedRequest(proxyRequest.request_id, { queueState: "waiting" });
         try {
             lease = await this.accountScheduler.acquire(proxyRequest, {
                 deadline,
                 scope,
-                sessionId: typeof req.headers?.["x-session-id"] === "string" ? req.headers["x-session-id"] : null,
+                sessionId: this._getConversationSessionId(req),
                 signal: res.__accountAbortController.signal,
             });
         } catch (error) {
@@ -4602,6 +4641,7 @@ class RequestHandler {
         this._updateTrackedRequest(proxyRequest.request_id, {
             initialAccountName: this._getAccountNameForIndex(lease.authIndex),
             initialAuthIndex: lease.authIndex,
+            queueState: "leased",
         });
         return lease.authIndex;
     }
@@ -4609,6 +4649,7 @@ class RequestHandler {
     _setupClientDisconnectHandler(res, requestId) {
         if (res.__proxyDisconnectRegistered) return;
         res.__proxyDisconnectRegistered = true;
+        res.once("finish", () => this._finalizeTrackedRequest(requestId, res));
         res.on("close", () => {
             if (!res.writableEnded) {
                 this._markTrackedClientAbort(res);
@@ -4617,14 +4658,26 @@ class RequestHandler {
                 // Dynamically look up the current authIndex from the connection registry
                 // This ensures we cancel on the correct account even after retries switch accounts
                 const targetAuthIndex =
-                    this.connectionRegistry.getAuthIndexForRequest(requestId) ?? this.currentAuthIndex;
+                    this.connectionRegistry.getAuthIndexForRequest(requestId) ??
+                    this.accountScheduler?.getLease(requestId)?.authIndex;
                 const requestAttemptId = this.connectionRegistry.getRequestAttemptIdForRequest(requestId);
 
-                this._cancelBrowserRequest(requestId, targetAuthIndex, requestAttemptId);
+                this.connectionRegistry.endRequestAttempt?.(requestId, {
+                    authIndex: targetAuthIndex,
+                    errorMessage: "Client disconnected.",
+                    healthFailure: false,
+                    outcome: "aborted",
+                    requestAttemptId,
+                    statusCode: null,
+                    terminationReason: "client_disconnect",
+                });
+                if (Number.isInteger(targetAuthIndex))
+                    this._cancelBrowserRequest(requestId, targetAuthIndex, requestAttemptId);
                 // Close and remove the message queue to unblock any waiting dequeue() calls
                 this.connectionRegistry.removeMessageQueue(requestId, "client_disconnect");
                 res.__accountAbortController?.abort();
                 this.accountScheduler?.cancel(requestId);
+                this._finalizeTrackedRequest(requestId, res);
             }
         });
     }
@@ -4637,13 +4690,17 @@ class RequestHandler {
                 `[Request] Cancelling request #${requestId} on account #${targetAuthIndex}` +
                     (requestAttemptId ? ` (attempt ${requestAttemptId})` : "")
             );
-            connection.send(
-                JSON.stringify({
-                    event_type: "cancel_request",
-                    request_attempt_id: requestAttemptId,
-                    request_id: requestId,
-                })
-            );
+            try {
+                connection.send(
+                    JSON.stringify({
+                        event_type: "cancel_request",
+                        request_attempt_id: requestAttemptId,
+                        request_id: requestId,
+                    })
+                );
+            } catch (error) {
+                this.logger.warn(`[Request] Could not cancel request #${requestId}: ${error.message}`);
+            }
         } else {
             this.logger.warn(
                 `[Request] Unable to send cancel instruction: No available WebSocket connection for account #${targetAuthIndex}.`
@@ -4658,6 +4715,14 @@ class RequestHandler {
             );
             return;
         }
+        this.connectionRegistry.endRequestAttempt?.(proxyRequest.request_id, {
+            authIndex: currentQueueAuthIndex,
+            errorMessage: "Replaced by a retry.",
+            healthFailure: false,
+            requestAttemptId: proxyRequest.request_attempt_id,
+            statusCode: null,
+            terminationReason: "retry_replaced",
+        });
         this._cancelBrowserRequest(proxyRequest.request_id, currentQueueAuthIndex, proxyRequest.request_attempt_id);
     }
 
@@ -4672,6 +4737,14 @@ class RequestHandler {
             const authIndex = this.connectionRegistry.getAuthIndexForRequest(requestId);
             const requestAttemptId = this.connectionRegistry.getRequestAttemptIdForRequest(requestId);
             if (authIndex !== null) {
+                this.connectionRegistry.endRequestAttempt?.(requestId, {
+                    authIndex,
+                    errorMessage: "Timed out waiting for browser response.",
+                    healthFailure: true,
+                    requestAttemptId,
+                    statusCode: 504,
+                    terminationReason: "execution_timeout",
+                });
                 this.logger.debug(
                     `[Request] Queue timeout for request #${requestId}, notifying browser on account #${authIndex} to cancel`
                 );
@@ -4952,10 +5025,23 @@ class RequestHandler {
                     cache_scope: undefined,
                     headers: Object.fromEntries(
                         Object.entries(wireRequest.headers || {}).filter(
-                            ([name]) => name.toLowerCase() !== "x-session-id"
+                            ([name]) => !CONVERSATION_HEADERS.includes(name.toLowerCase())
                         )
                     ),
                 })
+            );
+            this.connectionRegistry.markRequestDispatched?.(
+                proxyRequest.request_id,
+                authIndex,
+                proxyRequest.request_attempt_id
+            );
+            this._updateTrackedRequest(proxyRequest.request_id, { queueState: "dispatched" });
+            this._getUsageStatsService()?.recordAttempt(
+                proxyRequest.request_id,
+                authIndex,
+                this._getAccountNameForIndex(authIndex),
+                proxyRequest.request_attempt_id,
+                this.cacheManager.describeAttempt?.(proxyRequest)
             );
         } else {
             throw new Error(`Unable to forward request: No WebSocket connection found for authIndex=${authIndex}`);

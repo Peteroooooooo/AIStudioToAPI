@@ -141,7 +141,8 @@ test("scheduled 429 cools A and migrates the conversation to B without global sw
         sent.map(item => item.authIndex),
         [1, 2]
     );
-    assert.equal(health.getStatus(1).mode, "cooldown");
+    assert.equal(health.getStatus(1).mode, "disabled");
+    assert.equal(health.getStatus(1).disabledBy, "auto");
     assert.ok(health.getStatus(1).until >= Date.now() + 17_990_000);
     handler.accountScheduler.release("r");
     const followup = await request("r-next");

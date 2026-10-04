@@ -38,25 +38,26 @@ function request(id, text = id) {
     };
 }
 
-test("one expired account admits one probe while another new conversation runs elsewhere", async t => {
+test("an automatically enabled account takes one slot while a new conversation runs elsewhere", async t => {
     const { clock, health, scheduler } = fixture(t);
     health.recordFailure(0, 429, "old-failure");
     clock.value += 1000;
     const first = await scheduler.acquire(request("probe"), { sessionId: "conversation-A" });
     assert.equal(first.authIndex, 0);
-    assert.equal(health.getStatus(0).probeInFlight, true);
+    assert.equal(health.getStatus(0).enabled, true);
+    assert.equal(scheduler.getAccountLoad(0).inFlight, 1);
     const second = await scheduler.acquire(request("parallel"), { sessionId: "conversation-B" });
     assert.equal(second.authIndex, 1);
     assert.equal(scheduler.getSnapshot().inFlight, 2);
     health.recordSuccess(0, "late-old-success");
-    assert.equal(health.getStatus(0).probeRequired, true);
+    assert.equal(health.getStatus(0).probeRequired, false);
     health.recordSuccess(0, "probe");
     assert.equal(health.getStatus(0).probeRequired, false);
     scheduler.release("probe");
     scheduler.release("parallel");
 });
 
-test("a same-conversation request waits behind the probe then keeps its recovered owner", async t => {
+test("a same-conversation request waits behind the running request then keeps its enabled owner", async t => {
     const { clock, health, scheduler } = fixture(t, [0]);
     health.recordFailure(0, 429, "old-failure");
     clock.value += 1000;
@@ -80,7 +81,7 @@ test("a same-conversation request waits behind the probe then keeps its recovere
     scheduler.release("next");
 });
 
-test("a failed quota probe migrates its queued conversation and preserves the new cooldown", async t => {
+test("a fresh quota failure after automatic enable migrates its queued conversation and preserves the new timer", async t => {
     const { clock, health, scheduler } = fixture(t);
     health.recordFailure(0, 429, "old-failure");
     clock.value += 1000;
@@ -92,7 +93,8 @@ test("a failed quota probe migrates its queued conversation and preserves the ne
     const migrated = await queued;
     assert.equal(migrated.authIndex, 1);
     assert.equal(health.getStatus(0).probeRequired, false);
-    assert.equal(health.getStatus(0).mode, "cooldown");
+    assert.equal(health.getStatus(0).mode, "disabled");
+    assert.equal(health.getStatus(0).disabledBy, "auto");
     health.recordSuccess(0, "old-success");
     health.recordFailure(0, 429, "old-second-failure");
     assert.equal(health.getStatus(0).until, until);
@@ -100,7 +102,7 @@ test("a failed quota probe migrates its queued conversation and preserves the ne
     scheduler.release("next");
 });
 
-test("cancelled recovery probe releases both account slot and probe reservation", async t => {
+test("cancelling a request after automatic enable releases its slot for the queued continuation", async t => {
     const { clock, health, scheduler } = fixture(t, [0]);
     health.recordFailure(0, 429, "old-failure");
     clock.value += 1000;
@@ -108,9 +110,9 @@ test("cancelled recovery probe releases both account slot and probe reservation"
     const queued = scheduler.acquire(request("replacement"), { sessionId: "same" });
     scheduler.cancel("cancelled");
     assert.equal((await queued).authIndex, 0);
-    assert.equal(health.getStatus(0).probeInFlight, true);
+    assert.equal(scheduler.getAccountLoad(0).inFlight, 1);
     health.recordSuccess(0, "cancelled");
-    assert.equal(health.getStatus(0).probeRequired, true);
+    assert.equal(health.getStatus(0).enabled, true);
     health.recordSuccess(0, "replacement");
     scheduler.release("replacement");
     assert.equal(health.getStatus(0).probeRequired, false);

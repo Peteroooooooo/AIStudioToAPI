@@ -139,7 +139,11 @@ class ConnectionManager extends EventTarget {
         }
 
         // Add authIndex to WebSocket URL for server-side identification
-        const wsUrl = this.authIndex >= 0 ? `${this.endpoint}?authIndex=${this.authIndex}` : this.endpoint;
+        const contextGeneration = window.chrome?._contextGeneration;
+        const wsUrl =
+            this.authIndex >= 0
+                ? `${this.endpoint}?authIndex=${this.authIndex}${contextGeneration !== undefined ? `&contextGeneration=${encodeURIComponent(contextGeneration)}` : ""}`
+                : this.endpoint;
         Logger.output("Connecting to server:", wsUrl);
         return new Promise((resolve, reject) => {
             try {
@@ -210,6 +214,17 @@ class RequestProcessor {
         return `${operationId}::${this._normalizeAttemptId(operationId, requestAttemptId)}`;
     }
 
+    waitForOperation(pending, signal) {
+        if (signal.aborted)
+            return Promise.reject(signal.reason || new DOMException("Operation cancelled.", "AbortError"));
+        let onAbort;
+        const cancelled = new Promise((_, reject) => {
+            onAbort = () => reject(signal.reason || new DOMException("Operation cancelled.", "AbortError"));
+            signal.addEventListener("abort", onAbort, { once: true });
+        });
+        return Promise.race([pending, cancelled]).finally(() => signal.removeEventListener("abort", onAbort));
+    }
+
     execute(requestSpec, operationId) {
         const requestAttemptId = this._normalizeAttemptId(operationId, requestSpec.request_attempt_id);
         const attemptKey = this._getAttemptKey(operationId, requestAttemptId);
@@ -244,8 +259,8 @@ class RequestProcessor {
                     const error = new Error(
                         `Timeout: ${IDLE_TIMEOUT_DURATION / 1000} seconds without receiving any data`
                     );
-                    abortController.abort();
                     reject(error);
+                    abortController.abort(error);
                 }, IDLE_TIMEOUT_DURATION);
             });
 
@@ -289,7 +304,13 @@ class RequestProcessor {
             // Silently ignore - the timeout error is already being handled
         });
 
-        const responsePromise = Promise.race([attemptPromise, startIdleTimeout()]);
+        const responsePromise = this.waitForOperation(
+            Promise.race([attemptPromise, startIdleTimeout()]),
+            abortController.signal
+        ).catch(error => {
+            cancelTimeout();
+            throw error;
+        });
 
         return { abortController, attemptKey, cancelTimeout, requestAttemptId, responsePromise };
     }
@@ -796,7 +817,10 @@ class ProxySystem extends EventTarget {
                     readPromise.catch(() => {
                         // Silently ignore - the timeout error is already being handled
                     });
-                    const { done, value } = await Promise.race([readPromise, timeoutPromise]);
+                    const { done, value } = await this.requestProcessor.waitForOperation(
+                        Promise.race([readPromise, timeoutPromise]),
+                        abortController.signal
+                    );
                     clearTimeout(chunkTimeoutId);
                     chunkTimeoutId = null;
 
@@ -828,7 +852,7 @@ class ProxySystem extends EventTarget {
                     // If timeout occurred, cancel the reader to stop background processing
                     if (timeoutOccurred || errorMessage.includes("Chunk read timeout")) {
                         try {
-                            await reader.cancel();
+                            await this._cancelReader(reader);
                         } catch (cancelError) {
                             Logger.debug(`Failed to cancel reader: ${cancelError.message}`);
                         }
@@ -890,7 +914,7 @@ class ProxySystem extends EventTarget {
             // Always cancel reader to stop background stream processing
             if (reader && typeof reader.cancel === "function") {
                 try {
-                    await reader.cancel();
+                    await this._cancelReader(reader);
                 } catch (e) {
                     // Only log unexpected errors, ignore "already closed" errors
                     if (e.name !== "TypeError" && !e.message.includes("closed")) {
@@ -908,6 +932,20 @@ class ProxySystem extends EventTarget {
                 // Only delete from cancelledAttempts if we own the operation
                 this.requestProcessor.cancelledAttempts.delete(attemptKey);
             }
+        }
+    }
+
+    async _cancelReader(reader) {
+        let timer;
+        try {
+            await Promise.race([
+                Promise.resolve().then(() => reader.cancel()),
+                new Promise(resolve => {
+                    timer = setTimeout(resolve, 1000);
+                }),
+            ]);
+        } finally {
+            clearTimeout(timer);
         }
     }
 
@@ -967,6 +1005,12 @@ class ProxySystem extends EventTarget {
             request_attempt_id: requestAttemptId,
             request_id: operationId,
             status: error.status || 504,
+            termination_reason: Number.isInteger(error.status)
+                ? "upstream_error"
+                : /timeout/i.test(error.message || "")
+                  ? "browser_timeout"
+                  : "transport_error",
+            upstream_status: Number.isInteger(error.status) ? error.status : null,
         });
         // --- Core modification: Use different log wording based on error type ---
         if (error.name === "AbortError") {

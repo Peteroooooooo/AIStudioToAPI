@@ -1,7 +1,16 @@
 <template>
     <div class="account-actions">
+        <el-button
+            class="account-test-button"
+            size="small"
+            :disabled="testDisabled"
+            :title="testTitle"
+            @click="testAccount"
+        >
+            {{ t(testLabel) }}
+        </el-button>
         <el-switch
-            :model-value="account.health?.mode !== 'disabled'"
+            :model-value="accountEnabled(account)"
             :disabled="isBusy || account.isInvalid"
             :aria-label="t('accountsEnabledNamed', { index: account.index })"
             :before-change="toggleEnabled"
@@ -20,13 +29,6 @@
                     <el-dropdown-item v-if="canRetry" command="retry" :disabled="isBusy">
                         {{ t("accountsRetryWithoutReauth") }}
                     </el-dropdown-item>
-                    <el-dropdown-item
-                        v-if="account.health?.mode === 'cooldown' && !account.isInvalid"
-                        command="reset"
-                        :disabled="isBusy"
-                    >
-                        {{ t("accountsClearCooldown") }}
-                    </el-dropdown-item>
                     <el-dropdown-item v-if="canReauthenticate" command="reauth" :disabled="isBusy">
                         {{ t("accountsReauthenticate") }}
                     </el-dropdown-item>
@@ -44,20 +46,48 @@
 
 <script setup>
 import { computed } from "vue";
+import { accountEnabled } from "../utils/runtimeLabels";
 
 const props = defineProps({
     account: { required: true, type: Object },
     isBusy: { default: false, type: Boolean },
     t: { required: true, type: Function },
 });
-const emit = defineEmits(["delete", "details", "download", "health", "reauth"]);
+const emit = defineEmits(["delete", "details", "download", "health", "reauth", "test"]);
 const canReauthenticate = computed(
     () => !props.account.isInvalid && (props.account.isExpired || props.account.health?.mode === "reauth")
 );
 const canRetry = computed(() => canReauthenticate.value && props.account.health?.mode !== "disabled");
+const testDisabled = computed(
+    () =>
+        props.isBusy ||
+        props.account.isInvalid ||
+        props.account.lastTest?.status === "running" ||
+        Boolean(
+            props.account.inFlight ||
+            props.account.waiting ||
+            props.account.activity?.generation ||
+            props.account.activity?.maintenance
+        )
+);
+const testLabel = computed(() =>
+    canReauthenticate.value
+        ? "accountUpdateAuth"
+        : props.account.lastTest?.status === "running"
+          ? "accountTestCompact_running"
+          : "accountTestButton"
+);
+const testTitle = computed(() =>
+    props.account.inFlight || props.account.waiting || props.account.activity?.generation
+        ? props.t("accountTestBusyShort")
+        : ""
+);
+const testAccount = () => {
+    if (!testDisabled.value) emit(canReauthenticate.value ? "reauth" : "test", props.account.index);
+};
 const toggleEnabled = () => {
     if (!props.isBusy && !props.account.isInvalid) {
-        emit("health", props.account, props.account.health?.mode === "disabled" ? "enable" : "disable");
+        emit("health", props.account, accountEnabled(props.account) ? "disable" : "enable");
     }
     // The server response updates the switch; failed requests keep its previous value.
     return false;

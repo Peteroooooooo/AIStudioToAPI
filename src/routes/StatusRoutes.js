@@ -13,6 +13,7 @@ const LoggingService = require("../utils/LoggingService");
 const { sanitizeStatusLogs } = require("../utils/LogSanitizer");
 const UsageStatsService = require("../core/UsageStatsService");
 const { parseUsageQuery, UsageQueryError } = require("../core/UsageAnalytics");
+const AccountTestService = require("../core/AccountTestService");
 
 /**
  * Status Routes Manager
@@ -25,6 +26,7 @@ class StatusRoutes {
         this.config = serverSystem.config;
         this.distIndexPath = serverSystem.distIndexPath;
         this.versionChecker = new VersionChecker(this.logger);
+        this.accountTestService = new AccountTestService(serverSystem);
         this.allowedSafetyThresholds = new Set([
             "HARM_BLOCK_THRESHOLD_UNSPECIFIED",
             "BLOCK_LOW_AND_ABOVE",
@@ -251,6 +253,37 @@ class StatusRoutes {
             }
         });
 
+        app.get("/api/usage-stats/active", isAuthenticated, (req, res) => {
+            try {
+                const query = parseUsageQuery(req.query, Date.now());
+                res.json(this.serverSystem.usageStatsService.getActive(query));
+            } catch (error) {
+                if (error instanceof UsageQueryError)
+                    return res.status(400).json({ error: error.message, message: "invalidUsageStatsQuery" });
+                return res.status(500).json({ message: "usageStatsQueryFailed" });
+            }
+        });
+
+        app.get("/api/usage-stats/request/:requestId", isAuthenticated, (req, res) => {
+            const record = this.serverSystem.usageStatsService.getRequest(req.params.requestId);
+            if (!record) return res.status(404).json({ message: "usageStatsRequestNotFound" });
+            res.json({ ...record, metricScope: "requests" });
+        });
+
+        app.get("/api/usage-stats/export", isAuthenticated, (req, res) => {
+            try {
+                const query = parseUsageQuery(req.query, Date.now());
+                const records = this.serverSystem.usageStatsService.exportRecords(query);
+                res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+                res.setHeader("Content-Disposition", 'attachment; filename="usage-calls.jsonl"');
+                res.send(records.map(record => JSON.stringify(record)).join("\n") + (records.length ? "\n" : ""));
+            } catch (error) {
+                if (error instanceof UsageQueryError)
+                    return res.status(400).json({ error: error.message, message: "invalidUsageStatsQuery" });
+                return res.status(500).json({ message: "usageStatsQueryFailed" });
+            }
+        });
+
         app.get("/api/usage-stats/download", isAuthenticated, async (req, res) => {
             try {
                 const usageStatsService = this.serverSystem.usageStatsService;
@@ -313,6 +346,29 @@ class StatusRoutes {
             } catch (error) {
                 this.logger.error(`[WebUI] Failed to import usage stats: ${error.message}`);
                 res.status(500).json({ error: error.message, message: "usageStatsImportFailed" });
+            }
+        });
+
+        app.post("/api/accounts/:index/test", isAuthenticated, async (req, res) => {
+            res.set("Cache-Control", "no-store");
+            const index = /^\d+$/.test(req.params.index) ? Number(req.params.index) : NaN;
+            const controller = new AbortController();
+            const abort = () => {
+                if (!res.writableEnded) controller.abort();
+            };
+            res.once("close", abort);
+            try {
+                const result = await this.accountTestService.test(index, req.body?.model, {
+                    recovery: req.body?.recovery === true,
+                    signal: controller.signal,
+                });
+                if (!res.destroyed)
+                    res.status(result.status === "not_tested" ? result.statusCode || 409 : 200).json(result);
+            } catch (error) {
+                this.logger.error(`[AccountTest] Test failed: ${error.message}`);
+                if (!res.destroyed) res.status(500).json({ error: "Account test failed." });
+            } finally {
+                res.removeListener("close", abort);
             }
         });
 
@@ -1056,6 +1112,8 @@ class StatusRoutes {
         const allLogs = this.logger.logBuffer || [];
         const displayLogs = allLogs.slice(-limit);
         const accountNameMap = authSource.accountNameMap;
+        const poolMembers = new Set(browserManager.getReadyAccountIndices?.() || []);
+        const observedAt = Date.now();
         const accountDetails = initialIndices.map(index => {
             const isInvalid = invalidIndices.includes(index);
             const name = isInvalid ? null : accountNameMap.get(index) || null;
@@ -1074,7 +1132,11 @@ class StatusRoutes {
                 inFlight: 0,
                 waiting: 0,
             };
+            const runtime = browserManager.getAccountRuntimeState?.(index) || null;
+            const activity = this.serverSystem.connectionRegistry.getAccountActivity?.(index) || null;
+            const slot = requestHandler.accountScheduler?.getAccountRuntimeState?.(index) || null;
             return {
+                activity,
                 canonicalIndex,
                 hasContext,
                 health,
@@ -1083,11 +1145,46 @@ class StatusRoutes {
                 isExpired,
                 isInvalid,
                 isRotation,
+                lastTest: this.accountTestService.getResult(index),
                 name,
+                observedAt,
+                poolMember: poolMembers.has(index),
+                runtime,
                 serving,
+                slot,
+                testRunning: this.accountTestService.running.has(index),
                 ...load,
             };
         });
+        const poolSnapshot = browserManager.getPoolSnapshot?.();
+        const enabledAccounts = accountDetails.filter(
+            account =>
+                !account.isInvalid &&
+                !account.isExpired &&
+                !account.isDuplicate &&
+                !["disabled", "reauth"].includes(account.health.mode) &&
+                (authSource.rotationIndices?.includes(account.index) ?? account.isRotation)
+        ).length;
+        const target = Math.min(poolSnapshot?.target || enabledAccounts, enabledAccounts);
+        const poolCapacity = poolSnapshot
+            ? {
+                  ...poolSnapshot,
+                  busy: accountDetails.filter(account => account.poolMember && account.inFlight > 0).length,
+                  configuredTarget: poolSnapshot.target,
+                  enabled: enabledAccounts,
+                  idle: accountDetails.filter(
+                      account =>
+                          account.poolMember &&
+                          account.runtime?.state === "ready" &&
+                          !account.inFlight &&
+                          !account.activity?.maintenance
+                  ).length,
+                  maintenance: accountDetails.reduce((sum, account) => sum + (account.activity?.maintenance || 0), 0),
+                  shortfall: Math.max(0, target - poolSnapshot.ready - poolSnapshot.verifying),
+                  target,
+                  waiting: accountDetails.reduce((sum, account) => sum + (account.waiting || 0), 0),
+              }
+            : null;
 
         const currentAuthIndex = requestHandler.currentAuthIndex;
         const currentAccountName = accountNameMap.get(currentAuthIndex) || "N/A";
@@ -1140,6 +1237,7 @@ class StatusRoutes {
                 logMaxCount: limit,
                 maxContexts: config.maxContexts,
                 maxRetries: config.maxRetries,
+                poolCapacity,
                 rotationIndicesRaw: rotationIndices,
                 safetySettingsThreshold: config.safetySettingsThreshold,
                 streamingMode: config.streamingMode,

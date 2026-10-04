@@ -130,6 +130,7 @@
 
 <script setup>
 import { computed, nextTick, ref, watch } from "vue";
+import { useRoute } from "vue-router";
 
 import I18n from "../utils/i18n";
 
@@ -143,7 +144,14 @@ const t = (key, options) => {
     return I18n.t(key, options);
 };
 
-const search = ref("");
+const route = useRoute();
+const search = ref(typeof route.query.logRequest === "string" ? route.query.logRequest : "");
+watch(
+    () => route.query.logRequest,
+    value => {
+        search.value = typeof value === "string" ? value : "";
+    }
+);
 const level = ref("all");
 const fromTime = ref("");
 const toTime = ref("");

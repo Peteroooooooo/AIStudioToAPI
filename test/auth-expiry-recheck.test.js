@@ -66,6 +66,8 @@ function healthOnlyRecheck(t, page) {
 
     const health = Object.create(AccountHealth.prototype);
     health.accounts = {};
+    health.manualProbes = new Map();
+    health.epochs = new Map();
     health.logger = logger;
     health.now = Date.now;
     health._save = () => {};
