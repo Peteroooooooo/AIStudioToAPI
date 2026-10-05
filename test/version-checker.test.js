@@ -5,15 +5,16 @@ const VersionChecker = require("../src/utils/VersionChecker");
 
 test("P releases migrate from the previous fork series and compare numerically", () => {
     const checker = new VersionChecker();
-    assert.equal(checker.getCurrentVersion(), "P.18");
+    assert.equal(checker.getCurrentVersion(), process.env.VERSION || require("../package.json").releaseName);
     assert.equal(checker.compareVersions("P.18", "v1.3.5-peter.17"), 1);
     assert.equal(checker.compareVersions("P.18", "v1.3.5-peter.18"), 0);
     assert.equal(checker.compareVersions("P.100", "P.99"), 1);
     assert.equal(checker.compareVersions("P.18", "P.19"), -1);
 });
 
-test("update discovery selects the newest published fork image and ignores unrelated upstream tags", async () => {
+test("update discovery selects the newest published fork image and ignores unrelated upstream tags", async t => {
     const checker = new VersionChecker();
+    t.mock.method(checker, "getCurrentVersion", () => "P.18");
     const get = axios.get;
     axios.get = async () => ({
         data: [
