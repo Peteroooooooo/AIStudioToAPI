@@ -93,7 +93,7 @@ docker run -d \
   -e WEB_CONSOLE_PASSWORD=your-console-password \
   -e TZ=America/New_York \
   --restart unless-stopped \
-  ghcr.io/peteroooooooo/aistudio-to-api:P.18
+  ghcr.io/peteroooooooo/aistudio-to-api:P.19
 ```
 
 Parameters:
@@ -113,7 +113,7 @@ name: aistudio-to-api
 
 services:
   app:
-    image: ghcr.io/peteroooooooo/aistudio-to-api:P.18
+    image: ghcr.io/peteroooooooo/aistudio-to-api:P.19
     container_name: aistudio-to-api
     ports:
       # API server port (if using a reverse proxy, strongly consider `127.0.0.1:7860`)

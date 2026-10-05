@@ -6,6 +6,7 @@ const os = require("node:os");
 const path = require("node:path");
 
 const GeminiCacheManager = require("../src/core/GeminiCacheManager");
+const FormatConverter = require("../src/core/FormatConverter");
 
 function googleRequest(messages, system = "shared system instructions") {
     return {
@@ -142,6 +143,55 @@ async function seed(manager, request, authIndex, prefixLength, name) {
         tokenCount: 200,
     });
 }
+
+test("Responses continuation preserves answers with cache disabled, hits and pre-fix cache entries", async () => {
+    const dataDir = tempDirectory();
+    const { config, manager } = fixture(dataDir);
+    const converter = new FormatConverter({ debug() {}, error() {}, info() {}, warn() {} }, { config: {} });
+    const input = [];
+    const expected = [];
+    let previousRequest;
+    try {
+        for (const [question, answer] of [
+            ["Question A", "Answer B"],
+            ["Question C", "Answer D"],
+            ["Question E", "Answer F"],
+        ]) {
+            input.push({ content: [{ text: question, type: "input_text" }], role: "user", type: "message" });
+            expected.push({ parts: [{ text: question }], role: "user" });
+            const { googleRequest: body } = await converter.translateOpenAIResponseToGoogle({
+                input,
+                model: "gemini-3.8-flash",
+            });
+            config.cacheEnabled = false;
+            assert.deepEqual(JSON.parse(manager.prepare(proxyRequest(body), 0).body).contents, expected);
+            config.cacheEnabled = true;
+            if (previousRequest) {
+                await seed(manager, previousRequest, 0, previousRequest.contents.length, `cachedContents/${question}`);
+                if (question === "Question E") {
+                    // Old resources omit assistant answers; they must not match the repaired history.
+                    const brokenHistory = {
+                        ...body,
+                        contents: body.contents.filter(content => content.role === "user"),
+                    };
+                    await seed(manager, brokenHistory, 0, 2, "cachedContents/pre-fix");
+                }
+                const request = proxyRequest(body);
+                const wire = JSON.parse(manager.prepare(request, 0).body);
+                assert.equal(wire.cachedContent, `cachedContents/${question}`);
+                assert.deepEqual(wire.contents, expected.slice(-2));
+                assert.deepEqual([...previousRequest.contents, ...wire.contents], expected);
+                assert.deepEqual(JSON.parse(request.body).contents, expected);
+            }
+            previousRequest = body;
+            input.push({ content: [{ text: answer, type: "output_text" }], role: "assistant", type: "message" });
+            expected.push({ parts: [{ text: answer }], role: "model" });
+        }
+    } finally {
+        await manager.close();
+        fs.rmSync(dataDir, { force: true, recursive: true });
+    }
+});
 
 test("longer upstream TTL remains capped and rejected cache falls back without dropping request history", async () => {
     const dataDir = tempDirectory();

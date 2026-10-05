@@ -69,6 +69,99 @@ test("Responses API primitive function output becomes an object", async () => {
     assert.deepEqual(response, { result: true });
 });
 
+for (const streaming of [false, true]) {
+    test(`Responses ${streaming ? "streaming" : "non-streaming"} answers survive three full-history turns`, async () => {
+        const input = [];
+        const expectedContents = [];
+        for (const [question, answer] of [
+            ["Question A", "Answer B"],
+            ["Question C", "Answer D"],
+            ["Question E", "Answer F"],
+        ]) {
+            input.push({ content: [{ text: question, type: "input_text" }], role: "user", type: "message" });
+            expectedContents.push({ parts: [{ text: question }], role: "user" });
+            const { googleRequest } = await converter.translateOpenAIResponseToGoogle({
+                input,
+                model: "gemini-3.8-flash",
+            });
+            assert.deepEqual(googleRequest.contents, expectedContents);
+
+            const googleResponse = {
+                candidates: [{ content: { parts: [{ text: answer }], role: "model" }, finishReason: "STOP" }],
+            };
+            let output;
+            if (streaming) {
+                const frames = converter.translateGoogleToResponseAPIStream(
+                    JSON.stringify(googleResponse),
+                    "gemini-3.8-flash",
+                    {}
+                );
+                output = frames
+                    .split("\n\n")
+                    .filter(Boolean)
+                    .map(frame => JSON.parse(frame.split("\ndata: ")[1]))
+                    .filter(event => event.type === "response.output_item.done")
+                    .map(event => event.item);
+            } else {
+                output = converter.convertGoogleToResponseAPINonStream(googleResponse, "gemini-3.8-flash").output;
+            }
+            assert.equal(output[0].content[0].type, "output_text");
+            input.push(...output);
+            expectedContents.push({ parts: [{ text: answer }], role: "model" });
+        }
+        const { googleRequest } = await converter.translateOpenAIResponseToGoogle({
+            input,
+            model: "gemini-3.8-flash",
+        });
+        assert.deepEqual(googleRequest.contents, expectedContents);
+    });
+}
+
+test("Responses preserves mixed assistant text formats around a tool call without promoting history to instructions", async () => {
+    const { googleRequest } = await converter.translateOpenAIResponseToGoogle({
+        input: [
+            { content: [{ text: "Developer rules", type: "input_text" }], role: "developer" },
+            { content: "Question A", role: "user" },
+            {
+                content: [
+                    { text: "Answer B", type: "output_text" },
+                    { text: "Legacy text", type: "text" },
+                    { text: "Legacy input", type: "input_text" },
+                ],
+                phase: "commentary",
+                role: "assistant",
+                type: "message",
+            },
+            { arguments: '{"key":"A"}', call_id: "call-1", name: "lookup", type: "function_call" },
+            { call_id: "call-1", output: "Tool result", type: "function_call_output" },
+            { content: [{ text: "Final answer B", type: "output_text" }], phase: "final_answer", role: "assistant" },
+            { content: [{ text: "Question C", type: "input_text" }], role: "user" },
+        ],
+        instructions: "System rules",
+        model: "gemini-3.8-flash",
+    });
+    assert.deepEqual(googleRequest.systemInstruction.parts, [{ text: "System rules\nDeveloper rules" }]);
+    assert.deepEqual(googleRequest.contents, [
+        { parts: [{ text: "Question A" }], role: "user" },
+        { parts: [{ text: "Answer B" }, { text: "Legacy text" }, { text: "Legacy input" }], role: "model" },
+        {
+            parts: [
+                {
+                    functionCall: { args: { key: "A" }, name: "lookup" },
+                    thoughtSignature: FormatConverter.DUMMY_THOUGHT_SIGNATURE,
+                },
+            ],
+            role: "model",
+        },
+        {
+            parts: [{ functionResponse: { name: "lookup", response: { unparsed_output: "Tool result" } } }],
+            role: "user",
+        },
+        { parts: [{ text: "Final answer B" }], role: "model" },
+        { parts: [{ text: "Question C" }], role: "user" },
+    ]);
+});
+
 test("Responses allowed_tools preserves selected function schemas and maps auto/required modes", async () => {
     const spawnAgent = {
         description: "Start a child agent",
