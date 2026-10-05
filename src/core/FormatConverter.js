@@ -3433,7 +3433,13 @@ class FormatConverter {
                         } else if (Array.isArray(item.content)) {
                             // Multi-modal content
                             for (const contentPart of item.content) {
-                                if (contentPart.type === "text" || contentPart.type === "input_text") {
+                                // Responses output items are replayed as input on later turns.
+                                // Preserve assistant output_text so full-history requests keep answers.
+                                if (
+                                    contentPart.type === "text" ||
+                                    contentPart.type === "input_text" ||
+                                    contentPart.type === "output_text"
+                                ) {
                                     googleParts.push({ text: contentPart.text });
                                 } else if (contentPart.type === "image_url" || contentPart.type === "input_image") {
                                     const imageUrl = this.normalizeImageUrl(contentPart.image_url);
