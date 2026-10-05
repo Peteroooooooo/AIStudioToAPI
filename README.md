@@ -115,7 +115,7 @@ docker run -d \
   -e WEB_CONSOLE_PASSWORD=your-console-password \
   -e TZ=Asia/Shanghai \
   --restart unless-stopped \
-  ghcr.io/peteroooooooo/aistudio-to-api:P.19
+  ghcr.io/peteroooooooo/aistudio-to-api:P.20
 ```
 
 参数说明：
@@ -135,7 +135,7 @@ name: aistudio-to-api
 
 services:
   app:
-    image: ghcr.io/peteroooooooo/aistudio-to-api:P.19
+    image: ghcr.io/peteroooooooo/aistudio-to-api:P.20
     container_name: aistudio-to-api
     ports:
       # API 服务器端口（如果使用反向代理，强烈建议改成 127.0.0.1:7860）
